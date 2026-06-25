@@ -37,6 +37,7 @@
 #endif
 #include "mc2/dispatch_ffn_combine/dispatch_ffn_combine_torch_adpt.h"
 #include "mc2/dispatch_gmm_combine_decode/dispatch_gmm_combine_decode_torch_adpt.h"
+#include "mc2/allto_all_attn_update_all_gather/allto_all_attn_update_all_gather_torch_adpt.h"
 #include "gmm/grouped_matmul_swiglu_quant_weight_nz_tensor_list/grouped_matmul_swiglu_quant_torch_adpt.h"
 #include "gmm/grouped_matmul_swiglu_quant_v2/grouped_matmul_swiglu_quant_v2_torch_adpt.h"
 #include "attention/lightning_indexer/lightning_indexer_torch_adpt.h"
@@ -2817,5 +2818,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                     float beta=1.0, "
         "                     float threshold=20.0) -> (Tensor g, Tensor beta_output)");
     ops.impl("npu_fused_gdn_gating", torch::kPrivateUse1, &vllm_ascend::npu_fused_gdn_gating);
+
+    // MC2 fused AlltoAll + LSE-weighted attention update + AllGather (inplace on attn/lse)
+    ops.def(
+        "npu_allto_all_attn_update_all_gather(Tensor(a!) attn, Tensor(b!) lse, Tensor mask_num, str group, int group_size) -> ()"
+    );
+    ops.impl("npu_allto_all_attn_update_all_gather", torch::kPrivateUse1, &vllm_ascend::npu_allto_all_attn_update_all_gather);
 }
 #endif

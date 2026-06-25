@@ -1627,7 +1627,19 @@ void store_kv_block(
 {
     return;
 
-} 
+}
+
+// MC2 fused AlltoAll + LSE-weighted attention update + AllGather (inplace on attn/lse)
+// Pure inplace operator: Meta just returns, no output tensors to create
+void npu_allto_all_attn_update_all_gather_meta(
+    at::Tensor &attn,
+    at::Tensor &lse,
+    const at::Tensor &mask_num,
+    c10::string_view group,
+    int64_t group_size)
+{
+    return;
+}
 
 } // namespace meta
 } // namespace vllm_ascend
@@ -1742,6 +1754,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("store_kv_block", &vllm_ascend::meta::store_kv_block);
     // npu_fused_gdn_gating
     ops.impl("npu_fused_gdn_gating", &vllm_ascend::meta::npu_fused_gdn_gating_meta);
+    // MC2 AlltoAll + Attn update + AllGather (inplace)
+    ops.impl("npu_allto_all_attn_update_all_gather", &vllm_ascend::meta::npu_allto_all_attn_update_all_gather_meta);
 }
 }
 #endif

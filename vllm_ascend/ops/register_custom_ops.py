@@ -296,3 +296,116 @@ direct_register_custom_op(
     mutates_args=[],
     dispatch_key="PrivateUse1",
 )
+
+
+# ===== MC2 AlltoAll + Attn Update + AllGather (inplace on attn/lse) =====
+
+
+def _allto_all_attn_update_all_gather_impl(
+    attn: torch.Tensor,
+    lse: torch.Tensor,
+    mask_num: torch.Tensor,
+    group: str,
+    group_size: int,
+) -> None:
+    """Inplace: fused AlltoAll + LSE-weighted attention update + AllGather."""
+    torch.ops._C_ascend.npu_allto_all_attn_update_all_gather(
+        attn, lse, mask_num, group, group_size
+    )
+
+
+def _allto_all_attn_update_all_gather_fake(
+    attn: torch.Tensor,
+    lse: torch.Tensor,
+    mask_num: torch.Tensor,
+    group: str,
+    group_size: int,
+) -> None:
+    # Inplace operator: fake impl returns None
+    return
+
+
+direct_register_custom_op(
+    op_name="allto_all_attn_update_all_gather",
+    op_func=_allto_all_attn_update_all_gather_impl,
+    fake_impl=_allto_all_attn_update_all_gather_fake,
+    mutates_args=["attn", "lse"],
+    dispatch_key="PrivateUse1",
+)
+
+
+# ===== Functionalization for torch.compile support =====
+# Inplace operators must be functionalized so torch.compile can capture them
+# into a side-effect-free FX graph. The functional version clones the inputs,
+# calls the inplace op on the clones, and returns the results. The
+# Functionalize dispatch then copies the results back to the original tensors.
+
+def _allto_all_attn_update_all_gather_functional(
+    attn: torch.Tensor,
+    lse: torch.Tensor,
+    mask_num: torch.Tensor,
+    group: str,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Non-inplace functional version for torch.compile functionalization."""
+    attn_clone = attn.clone()
+    lse_clone = lse.clone()
+    torch.ops._C_ascend.npu_allto_all_attn_update_all_gather(
+        attn_clone, lse_clone, mask_num, group, group_size
+    )
+    return attn_clone, lse_clone
+
+
+def _allto_all_attn_update_all_gather_functional_fake(
+    attn: torch.Tensor,
+    lse: torch.Tensor,
+    mask_num: torch.Tensor,
+    group: str,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(attn), torch.empty_like(lse)
+
+
+_vllm_lib = None
+
+
+def _get_vllm_lib():
+    global _vllm_lib
+    if _vllm_lib is None:
+        from vllm.utils.torch_utils import vllm_lib as _lib
+        _vllm_lib = _lib
+    return _vllm_lib
+
+
+def _register_functionalization():
+    """Register Functionalize dispatch for the inplace op so torch.compile
+    can convert it to a pure-function call during FX graph construction."""
+    lib = _get_vllm_lib()
+
+    # Define the functional (non-inplace) variant
+    lib.define(
+        "allto_all_attn_update_all_gather_functional("
+        "Tensor attn, Tensor lse, Tensor mask_num, str group, int group_size"
+        ") -> (Tensor, Tensor)"
+    )
+    lib.impl(
+        "allto_all_attn_update_all_gather_functional",
+        _allto_all_attn_update_all_gather_functional,
+        dispatch_key="PrivateUse1",
+    )
+    lib._register_fake(
+        "allto_all_attn_update_all_gather_functional",
+        _allto_all_attn_update_all_gather_functional_fake,
+    )
+
+    # Register Functionalize dispatch: converts inplace call to functional + copy
+    @torch.library.impl(lib, "allto_all_attn_update_all_gather", "Functionalize")
+    def _allto_all_attn_update_all_gather_functionalize(attn, lse, mask_num, group, group_size):
+        attn_out, lse_out = torch.ops.vllm.allto_all_attn_update_all_gather_functional(
+            attn, lse, mask_num, group, group_size
+        )
+        attn.copy_(attn_out)
+        lse.copy_(lse_out)
+
+
+_register_functionalization()

@@ -3,20 +3,20 @@
 
 For a grouped MTP decode batch (g queries per request, g = spec tokens + 1)
 this replaces the per-query full-prefix indexer scan with one shared
-mean-proxy scan plus a per-query top-k refine over the returned candidates:
+mean-proxy coarse screen plus a per-query top-k refine over the candidates:
 
   1. mean proxy  q_bar = mean(q[group])          (torch, graph-safe)
-  2. proxy scan  C = npu_lightning_indexer(q_bar, ...) -- the native call
-                 shape reused verbatim (R single-query requests, sparse_count
-                 = 2048, key lens = seq_lens = L + g)
+  2. coarse      C = top-4096 proxy scores over each prefix, computed in
+     screen      torch (not the native op, so the superset can be 4096 --
+                 the paper's number -- instead of the native 2048 limit)
   3. refine      broadcast C to each query row, score with the native
                  formula, top-k (k = 2048)
 
-Lossless contract: with L + g <= 2048 the proxy scan returns the whole
-prefix, so refine reproduces the dense per-query top-k and the output
-matches the native indexer exactly. k is fixed at 2048 (the native
-sparse_count); there is deliberately no k knob -- shrinking k below the
-native budget is what dropped keys (and garbled output) in earlier tries.
+Lossless contract: with L + g <= 2048 the refine output reproduces the whole
+prefix exactly; with L + g <= 4096 the coarse screen still returns the whole
+prefix, so refine only drops keys past 2048 by score. k is fixed at 2048 (the
+native sparse_count consumed by npu_sparse_flash_attention); there is
+deliberately no k knob.
 
 BF16 only: enable_sparse_li_c8 falls back to the native indexer.
 
@@ -26,13 +26,16 @@ derived from the token/request counts without any device-side sync.
 """
 
 import torch
-import torch_npu
 
 from vllm.logger import logger
 
-# Native indexer hard limit (sparse_count passed by the native path); the
-# proxy scan reuses it verbatim so the lossless window matches.
-_CANDIDATE_BUDGET = 2048
+# PIVOT-Refine budget split. The proxy screen returns a _COARSE_BUDGET
+# candidate superset (4096, the paper's number); per-query refine narrows to
+# _REFINE_BUDGET top-k (2048, the native sparse_count consumed by
+# npu_sparse_flash_attention). The superset is 2x the refine width so the
+# mean-proxy approximation still covers each query's true top-k.
+_COARSE_BUDGET = 4096
+_REFINE_BUDGET = 2048
 
 
 def _capturing() -> bool:
@@ -88,25 +91,16 @@ class PivotIndexer:
         q_bar = q_dq.view(R, g, H, D).mean(dim=1)  # [R, H, D]
         w_bar = weights[:N].view(R, g, H).mean(dim=1)  # [R, H]
 
-        # ---- 2. proxy scan: native call shape, R rows ---------------------
-        # Byte-consistent with the native BF16 dispatch
-        # (BaseDeviceAdaptor.indexer_select_post_process): same op, layout,
-        # sparse_count and sparse_mode; the only deltas are query count N->R
-        # and weights->group mean. R single-query requests is exactly the
-        # plain-decode shape the op runs in production.
-        topk_candidates, _ = torch_npu.npu_lightning_indexer(
-            query=q_bar,
-            key=kv_cache[2],
-            weights=w_bar,
-            actual_seq_lengths_query=torch.arange(1, R + 1, dtype=torch.int32, device=device),
-            actual_seq_lengths_key=seq_lens.to(torch.int32),
-            block_table=attn_metadata.block_table,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=_CANDIDATE_BUDGET,
-            sparse_mode=3,
+        # ---- 2. coarse screen: torch proxy scan, R rows -> 4096 ----------
+        # Done in torch (not the native npu_lightning_indexer) so the
+        # candidate superset is _COARSE_BUDGET (4096, the paper's number)
+        # rather than the native 2048 sparse_count hard limit. Same score
+        # formula (sum_h w_bar * relu(q_bar . k)) over the full [0, L+g)
+        # prefix; the SFA attention kernel applies causality downstream.
+        C = _coarse_screen(
+            q_bar, w_bar, kv_cache, attn_metadata.block_table,
+            attn_metadata.block_size, seq_lens,
         )
-        C = topk_candidates[:, 0, :]  # [R, budget], 0-based, -1 padded
 
         # ---- 3. refine: broadcast C, score, top-k -------------------------
         req_ids = torch.repeat_interleave(torch.arange(R, device=device), g)  # [N]
@@ -155,6 +149,55 @@ class PivotIndexer:
         return topk_indices
 
 
+def _coarse_screen(
+    q_bar: torch.Tensor,
+    w_bar: torch.Tensor,
+    kv_cache: tuple,
+    block_table: torch.Tensor,
+    block_size: int,
+    seq_lens: torch.Tensor,
+) -> torch.Tensor:
+    """Torch proxy screen: per-proxy top-4096 over its full prefix.
+
+    Replaces the native npu_lightning_indexer proxy scan so the candidate
+    superset is _COARSE_BUDGET (4096, the paper's number) rather than the
+    native 2048 sparse_count hard limit. Score formula matches the BF16
+    indexer: score[r, p] = sum_h w_bar[r, h] * relu(q_bar[r, h] . k[r, p])
+    over p in [0, seq_lens[r]) (= L + g, the full prefix; causality is left
+    to the SFA attention kernel). Returns [R, _COARSE_BUDGET] 0-based
+    positions, -1 padded where the prefix is shorter than the budget.
+    """
+    device = q_bar.device
+    R = q_bar.shape[0]
+    k_cache = kv_cache[2]  # [B, S, 1, D] BF16 (PA_BSND)
+    kc = k_cache.view(-1, k_cache.shape[-1])  # [B*S, D]
+
+    # int32 max() is unsupported on NPU; lift seq_lens to int64 first. The
+    # Python int() is a scalar device->CPU sync, acceptable in the eager
+    # decode path (no graph capture under --enforce-eager).
+    seq_i64 = seq_lens.to(torch.int64)
+    L_max = int(seq_i64.max())
+
+    pos = torch.arange(L_max, dtype=torch.int64, device=device)  # [L_max]
+    # slot for key position p of request r: block_table[r, p//bs] * bs + p%bs
+    slots = block_table[:, pos // block_size] * block_size + pos % block_size
+    k_all = kc[slots.reshape(-1)].view(R, L_max, -1)  # [R, L_max, D]
+
+    score = torch.relu(torch.bmm(q_bar, k_all.transpose(1, 2)))  # [R, H, L_max]
+    score = (score * w_bar.unsqueeze(-1)).sum(dim=1)  # [R, L_max]
+
+    beyond = pos.unsqueeze(0) >= seq_i64.unsqueeze(1)  # [R, L_max]
+    score = score.masked_fill(beyond, float("-inf"))
+
+    if L_max < _COARSE_BUDGET:
+        pad = score.new_full((R, _COARSE_BUDGET - L_max), float("-inf"))
+        score = torch.cat([score, pad], dim=-1)  # [R, _COARSE_BUDGET]
+
+    vals, cols = torch.topk(score, _COARSE_BUDGET, dim=-1)  # [R, _COARSE_BUDGET]
+    cols = cols.masked_fill(vals == float("-inf"), -1)
+    return cols  # [R, _COARSE_BUDGET], 0-based, -1 padded
+
+
 def _refine_topk(
     q_dq: torch.Tensor,
     weights: torch.Tensor,
@@ -199,11 +242,11 @@ def _refine_topk(
 
     invalid = C_n < 0
     score = score.masked_fill(invalid, float("-inf"))
-    vals, cols = torch.topk(score, _CANDIDATE_BUDGET, dim=-1)
+    vals, cols = torch.topk(score, _REFINE_BUDGET, dim=-1)
     true_pos = C_n.gather(1, cols)
     true_pos = true_pos.masked_fill(vals == float("-inf"), -1)
 
-    return true_pos.view(N, 1, _CANDIDATE_BUDGET).to(torch.int32)
+    return true_pos.view(N, 1, _REFINE_BUDGET).to(torch.int32)
 
 
 def _report(
@@ -218,7 +261,8 @@ def _report(
 
     Three checks, each narrowing the failure location:
       1. entry shape (gate/group geometry),
-      2. proxy-scan contract (the REAL op's per-row valid count vs expected),
+      2. proxy-scan contract (the coarse screen's per-row valid count vs
+         expected, 4096 wide),
       3. lossless self-check (rows with L+g <= 2048 must reproduce the full
          prefix, i.e. the exact dense key set).
     """
@@ -226,16 +270,17 @@ def _report(
     sl_min, sl_max = int(seq.min()), int(seq.max())
     logger.info(
         "PIVOT[dbg] entry: N=%d R=%d g=%d budget=%d seq_lens=[%d..%d]",
-        N, R, g, _CANDIDATE_BUDGET, sl_min, sl_max,
+        N, R, g, _COARSE_BUDGET, sl_min, sl_max,
     )
 
     # Proxy-scan contract: valid per-row counts vs expected, out-of-range.
-    # npu_lightning_indexer outputs int32; NPU max()/clamp() reject int32
-    # (DT_INT32 is not in aclnnMaxDim's supported list), so lift to int64.
+    # Keep int64 here: NPU max()/clamp() reject int32 (DT_INT32 is not in
+    # aclnnMaxDim's supported list). torch.topk already returns int64, so the
+    # .to() is a defensive no-op.
     C_i64 = C.to(torch.int64)
     valid = C_i64 >= 0
     valid_per_row = valid.sum(-1)  # [R]
-    expected = torch.clamp(seq, max=_CANDIDATE_BUDGET)
+    expected = torch.clamp(seq, max=_COARSE_BUDGET)
     mismatch = (valid_per_row != expected).sum()
     out_of_range = (C_i64.clamp(min=0).max(-1).values >= seq).sum()
     logger.info(
@@ -252,7 +297,7 @@ def _report(
     first = None
     for r in range(R):
         Lg = int(seq[r])
-        if Lg > _CANDIDATE_BUDGET:
+        if Lg > _REFINE_BUDGET:
             continue
         for i in range(g):
             n = r * g + i
@@ -271,5 +316,5 @@ def _report(
     else:
         logger.info(
             "PIVOT[dbg] lossless self-check: PASS (%d rows, L+g<=%d)",
-            N, _CANDIDATE_BUDGET,
+            N, _REFINE_BUDGET,
         )

@@ -110,6 +110,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to enable PIVOT-Refine indexer (group mean-proxy scan + torch
+    # refine) on the native SFA decode path. Only grouped MTP decode batches
+    # (attn_state DecodeOnly/SpecDecoding, g >= 2) take this path; everything
+    # else falls back to the native per-query indexer. BF16 indexer only.
+    "VLLM_ASCEND_ENABLE_PIVOT_REFINE": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_PIVOT_REFINE", "0"))),
 }
 
 # end-env-vars-definition

@@ -20,12 +20,14 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.utils import select_common_block_size
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
 from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE, MLAPO_MAX_SUPPORTED_TOKENS
+from vllm_ascend.attention.pivot_indexer import PivotIndexer
 from vllm_ascend.attention.utils import (
     SFA_QSFA_TILE_SIZE,
     AscendCommonAttentionMetadata,
@@ -1551,6 +1553,25 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
 
         record_attention_compute_start()
+        if envs.VLLM_ASCEND_ENABLE_PIVOT_REFINE and attn_metadata.attn_state in (
+            AscendAttentionState.DecodeOnly,
+            AscendAttentionState.SpecDecoding,
+        ):
+            # Grouped MTP decode batch: PIVOT-Refine replaces the per-query
+            # full-prefix indexer scan with one mean-proxy scan + torch
+            # refine. select_topk returns None for ungrouped / C8 batches,
+            # which then fall through to the native indexer below.
+            topk_indices = PivotIndexer.select_topk(
+                self,
+                q_li,
+                q_li_scale,
+                q_li_shape_ori,
+                weights,
+                kv_cache,
+                attn_metadata,
+            )
+            if topk_indices is not None:
+                return topk_indices
         return DeviceOperator.indexer_select_post_process(
             self,
             q_li,

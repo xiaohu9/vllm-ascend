@@ -146,7 +146,10 @@ class PivotIndexer:
                 topk_indices = torch.cat([topk_indices, pad], dim=-1)
 
         if not _capturing():
-            _report(seq_lens, C, topk_indices, N, R, g)
+            try:
+                _report(seq_lens, C, topk_indices, N, R, g)
+            except Exception as e:  # diagnostics must never take down the decode path
+                logger.warning("PIVOT[dbg] _report failed: %s", e)
 
         logger.debug("PIVOT refine: N=%d R=%d g=%d", N, R, g)
         return topk_indices
@@ -227,11 +230,14 @@ def _report(
     )
 
     # Proxy-scan contract: valid per-row counts vs expected, out-of-range.
-    valid = C >= 0
+    # npu_lightning_indexer outputs int32; NPU max()/clamp() reject int32
+    # (DT_INT32 is not in aclnnMaxDim's supported list), so lift to int64.
+    C_i64 = C.to(torch.int64)
+    valid = C_i64 >= 0
     valid_per_row = valid.sum(-1)  # [R]
     expected = torch.clamp(seq, max=_CANDIDATE_BUDGET)
     mismatch = (valid_per_row != expected).sum()
-    out_of_range = (torch.where(valid, C, torch.zeros_like(C)).max(-1).values >= seq).sum()
+    out_of_range = (C_i64.clamp(min=0).max(-1).values >= seq).sum()
     logger.info(
         "PIVOT[dbg] proxy-scan contract: valid_per_row=[%d..%d] expected=[%d..%d] "
         "mismatch_rows=%d out_of_range_rows=%d",

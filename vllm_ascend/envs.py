@@ -110,6 +110,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to enable PIVOT-Refine indexer (query-group mean-proxy scan + torch
+    # refine with joint C∪W_t scoring) on the native SFA decode path.
+    # Design doc: docs/source/developer_guide/Design_Documents/pivot_indexer.md
+    "VLLM_ASCEND_ENABLE_PIVOT_REFINE": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_PIVOT_REFINE", "0"))),
+    # Output width k of the refine top-k (per query). The window W and the
+    # C∪W budget are derived, not configured: W = g (draft_num + 1), budget
+    # = 2048 (native op limit, module constant in pivot_indexer.py).
+    "VLLM_ASCEND_PIVOT_TOPK": lambda: int(os.getenv("VLLM_ASCEND_PIVOT_TOPK", "512")),
 }
 
 # end-env-vars-definition

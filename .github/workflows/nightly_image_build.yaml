@@ -26,7 +26,7 @@ on:
       vllm_ascend_branch:
         description: 'Branch to nightly test'
         required: true
-        default: 'releases/v0.22.1rc'
+        default: 'main'
         type: choice
         options:
           - main
@@ -51,3 +51,13 @@ jobs:
       HW_USERNAME: ${{ secrets.HW_USERNAME }}
       HW_TOKEN: ${{ secrets.HW_TOKEN }}
       GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+
+  build-a5:
+    uses: ./.github/workflows/_nightly_image_build.yaml
+    with:
+      target: a5
+    secrets:
+      HW_USERNAME: ${{ secrets.HW_USERNAME }}
+      HW_TOKEN: ${{ secrets.HW_TOKEN }}
+      GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+      

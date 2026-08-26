@@ -19,7 +19,10 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashListWithBlockSize,
     KVCacheBlock,
 )
-from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
+from vllm.v1.core.single_type_kv_cache_manager import (
+    SingleTypeKVCacheManager,
+    SlidingWindowManager,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -102,13 +105,12 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 self.scheduler_block_size,
                 kv_cache_config,
             )
-
         self.block_pool = BlockPool(
-            kv_cache_config.num_blocks,
-            enable_caching,
-            hash_block_size,
-            enable_kv_cache_events,
-            metrics_collector,
+            num_gpu_blocks=kv_cache_config.num_blocks,
+            enable_caching=enable_caching,
+            hash_block_size=hash_block_size,
+            enable_kv_cache_events=enable_kv_cache_events,
+            metrics_collector=metrics_collector,
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
@@ -144,6 +146,15 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 for g in kv_cache_config.kv_cache_groups
             ), "block_size must be divisible by hash_block_size"
         self.verify_and_split_kv_cache_groups()
+
+        # Align the WRITE-path mask granularity (reachable_block_mask) with the
+        # READ-path hit granularity (find_longest_cache_hit) so SlidingWindowManager
+        # only caches blocks that land on a boundary where future cache hits can
+        # actually be matched.
+        # TODO (Csrayz): Consider unified all single_type_managers to simplify logic.
+        for mgr in self.single_type_managers:
+            if isinstance(mgr, SlidingWindowManager):
+                mgr.scheduler_block_size = self.lcm_block_size
 
         self.use_eagle = use_eagle
 
@@ -195,6 +206,28 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             for i, (_, group_ids, _) in enumerate(self.attention_groups)
             if any(gid in self.eagle_group_ids for gid in group_ids)
         }
+
+        # Propagate the eagle bit to every manager in an eagle-containing
+        # attention group, mirroring upstream
+        # HybridKVCacheCoordinator.verify_and_split_kv_cache_groups. Managers
+        # default to ``use_eagle=False`` ("initialized lazily by the
+        # coordinator", see SingleTypeKVCacheManager.__init__).
+        #
+        # Required for prefix-cache correctness on DeepSeek-V4 + MTP/EAGLE: the
+        # SWA write path (``cache_blocks`` -> ``reachable_block_mask``) keys the
+        # retained checkpoint tail on ``manager.use_eagle``, while the read path
+        # (``find_longest_cache_hit``) applies ``drop_eagle_block`` to every gid
+        # merged into the eagle attention group (and ``get_cached_block``
+        # requires the block cached for *all* of them). If any such manager
+        # keeps the default False, its retained tail ends one block short of the
+        # eagle "peek" boundary the read looks at, the SWA group never hits, and
+        # the min-over-groups hybrid hit collapses to 0%. Note the upstream
+        # ``_annotate_eagle_groups_deepseek_v4`` flags only the single group
+        # holding the MTP layer, so iterating ``eagle_group_ids`` alone would
+        # miss its same-spec siblings.
+        for idx in self.eagle_attn_group_indices:
+            for gid in self.attention_groups[idx][1]:
+                self.single_type_managers[gid].use_eagle = True
 
         # The LCM of the block sizes of all attention types.
         # The cache hit length must be a multiple of the LCM of the block sizes
@@ -267,8 +300,9 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 use_eagle = idx in self.eagle_attn_group_indices and idx not in eagle_verified
 
                 _max_length = curr_hit_length
-                if use_eagle:
-                    # Eagle needs to match one more block and then pop the last.
+                if use_eagle and not isinstance(spec, MambaSpec):
+                    # Mamba finders do not drop the EAGLE lookahead block, so
+                    # allowing a margin here could grow the hybrid hit length.
                     _max_length = min(curr_hit_length + spec.block_size, max_cache_hit_length)
                 eagle_kwarg = {"drop_eagle_block": use_eagle}
                 hit_blocks = manager_cls.find_longest_cache_hit(
@@ -369,8 +403,9 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 use_eagle = idx in self.eagle_attn_group_indices and idx not in eagle_verified
 
                 _max_length = curr_hit_length
-                if use_eagle:
-                    # Eagle needs to match one more block and then pop the last.
+                if use_eagle and not isinstance(spec, MambaSpec):
+                    # Mamba finders do not drop the EAGLE lookahead block, so
+                    # allowing a margin here could grow the hybrid hit length.
                     _max_length = min(curr_hit_length + spec.block_size, max_cache_hit_length)
                 eagle_kwarg = {"drop_eagle_block": use_eagle}
                 hit_blocks = manager_cls.find_longest_cache_hit(

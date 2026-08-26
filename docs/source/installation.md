@@ -4,18 +4,41 @@ This document describes how to install vllm-ascend manually.
 
 ## Requirements
 
+:::::{tab-set}
+::::{tab-item} Atlas A2/A3/950DT inference products
+
 - OS: Linux
 - Python: >= 3.10, < 3.13
 - Hardware with Ascend NPUs. It's usually the Atlas 800 A2 series.
+- Atlas 300I DUO.
 - Software:
 
     | Software      | Supported version                | Note                                      |
     |---------------|----------------------------------|-------------------------------------------|
-    | Ascend HDK    | Refer to the documentation [CANN 9.0.0](https://www.hiascend.com/document/detail/zh/canncommercial/900/releasenote/releasenote_0000.html) | Required for CANN |
-    | CANN          | == 9.0.0                        | Required for vllm-ascend and torch-npu    |
-    | torch-npu     | == 2.10.0                       | Required for vllm-ascend, No need to install manually, it will be auto installed in below steps |
-    | torch         | == 2.10.0                       | Required for torch-npu and vllm, No need to install manually, it will be auto installed in below steps |
-    | NNAL          | == 9.0.0                        | Required for libatb.so, enables advanced tensor operations |
+    | Ascend HDK    | Refer to the [CANN 9.1.0 Release Notes](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910/softwareinst/releasenote/9.1.0/release-notes.md) | Required for CANN |
+    | CANN          | == 9.1.0                        | Required for vllm-ascend and TorchNPU    |
+    | TorchNPU      | == 2.10.0.post4                 | Required for vllm-ascend, No need to install manually, it will be auto installed in below steps |
+    | torch         | == 2.10.0                       | Required for TorchNPU and vllm, No need to install manually, it will be auto installed in below steps |
+    | NNAL          | == 9.1.0                        | Required for libatb.so, enables advanced tensor operations |
+
+```{note}
+Atlas 300I DUO uses its platform-specific CANN 9.1.0 package; refer to the 310P table below for its requirements.
+```
+
+::::
+::::{tab-item} Atlas 300I DUO
+
+ | Software      | Supported version                | Note                                      |
+ |---------------|----------------------------------|-------------------------------------------|
+ | Ascend HDK    | Refer to the [CANN 9.1.0 Release Notes](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910/softwareinst/releasenote/9.1.0/release-notes.md) | Required for CANN |
+ | CANN          | == 9.1.0                | Required for vllm-ascend and TorchNPU    |
+ | TorchNPU      | == 2.10.0.post4         | Required for vllm-ascend, No need to install manually, it will be auto installed in below steps |
+ | torch         | == 2.10.0               | Required for TorchNPU and vllm, No need to install manually, it will be auto installed in below steps |
+ | NNAL          | == 9.1.0                 | Required for libatb.so, enables advanced tensor operations |
+ | triton / triton-ascend | Not supported          | Uninstalled in `Dockerfile.310p` |
+
+::::
+:::::
 
 There are two installation methods:
 
@@ -24,7 +47,7 @@ There are two installation methods:
 
 ## Configure Ascend CANN environment
 
-Before installation, you need to make sure firmware/driver, and CANN are installed correctly, refer to [Ascend Environment Setup Guide](https://www.hiascend.com/cann/download?versionId=735&ids=d806%2Ch0501%2Ch0601%2Ch0702) for more details.
+Before installation, you need to make sure firmware/driver, and CANN are installed correctly, refer to [CANN Installation](https://www.hiascend.com/cann/download?versionId=735&ids=d806%2Ch0501%2Ch0601%2Ch0702) for more details.
 
 ### Configure hardware environment
 
@@ -34,7 +57,7 @@ To verify that the Ascend NPU firmware and driver were correctly installed, run:
 npu-smi info
 ```
 
-Refer to [Ascend Environment Setup Guide](https://ascend.github.io/docs/sources/ascend/quick_install.html) for more details.
+Refer to [CANN Installation](https://www.hiascend.com/cann/download?versionId=735&ids=d806%2Ch0501%2Ch0601%2Ch0702) for more details.
 
 ### Configure software environment
 
@@ -91,20 +114,17 @@ python -m pip install --upgrade pip
 pip3 install attrs numpy decorator sympy cffi pyyaml pathlib2 psutil protobuf scipy requests absl-py wheel typing_extensions
 
 # Download and install the CANN package.
-wget --header="Referer: https://www.hiascend.com/" https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.0.0/Ascend-cann-toolkit_9.0.0_linux-"$(uname -i)".run
-chmod +x ./Ascend-cann-toolkit_9.0.0_linux-"$(uname -i)".run
-./Ascend-cann-toolkit_9.0.0_linux-"$(uname -i)".run --full
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
+wget --header="Referer: https://www.hiascend.com/" https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.1.0/Ascend-cann-toolkit_9.1.0_linux-"$(uname -i)".run
+chmod +x ./Ascend-cann-toolkit_9.1.0_linux-"$(uname -i)".run
+./Ascend-cann-toolkit_9.1.0_linux-"$(uname -i)".run --full
 
-wget --header="Referer: https://www.hiascend.com/" https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.0.0/Ascend-cann-910b-ops_9.0.0_linux-"$(uname -i)".run
-chmod +x ./Ascend-cann-910b-ops_9.0.0_linux-"$(uname -i)".run
-./Ascend-cann-910b-ops_9.0.0_linux-"$(uname -i)".run --install
+wget --header="Referer: https://www.hiascend.com/" https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.1.0/Ascend-cann-910b-ops_9.1.0_linux-"$(uname -i)".run
+chmod +x ./Ascend-cann-910b-ops_9.1.0_linux-"$(uname -i)".run
+./Ascend-cann-910b-ops_9.1.0_linux-"$(uname -i)".run --install
 
-wget --header="Referer: https://www.hiascend.com/" https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.0.0/Ascend-cann-nnal_9.0.0_linux-"$(uname -i)".run
-chmod +x ./Ascend-cann-nnal_9.0.0_linux-"$(uname -i)".run
-./Ascend-cann-nnal_9.0.0_linux-"$(uname -i)".run --install
-
-source /usr/local/Ascend/nnal/atb/set_env.sh
+wget --header="Referer: https://www.hiascend.com/" https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.1.0/Ascend-cann-nnal_9.1.0_linux-"$(uname -i)".run
+chmod +x ./Ascend-cann-nnal_9.1.0_linux-"$(uname -i)".run
+./Ascend-cann-nnal_9.1.0_linux-"$(uname -i)".run --install
 ```
 
 :::
@@ -133,10 +153,10 @@ apt-get update -y && apt-get install -y gcc g++ cmake libnuma-dev wget git curl 
 pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 ```
 
-**[Optional]** Then configure the extra-index of `pip` if you are working on an x86 machine or using torch-npu dev version:
+**[Optional]** Then configure the extra-index of `pip` if you are working on an x86 machine or using TorchNPU dev version:
 
 ```bash
-# For torch-npu dev version or x86 machine
+# For TorchNPU dev version or x86 machine
 pip config set global.extra-index-url "https://download.pytorch.org/whl/cpu/"
 ```
 
@@ -156,7 +176,8 @@ pip install vllm==|pip_vllm_version|
 
 # Install vllm-project/vllm-ascend.
 pip install \
---extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi/variant https://mirrors.huaweicloud.com/ascend/repos/pypi  \
+--extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi/variant \
+--extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi \
 vllm-ascend==|pip_vllm_ascend_version|
 
 ```
@@ -182,7 +203,8 @@ pip install vllm==|pip_vllm_version|
 
 # Install vllm-project/vllm-ascend from wheelnext index.
 uv pip install --system \
---extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi/variant   \
+--extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi/variant \
+--extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi \
 --index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple \
 vllm-ascend==|pip_vllm_ascend_version|
 
@@ -204,7 +226,7 @@ or build from **source code**:
 ```{note}
 To install `triton-ascend`, run:
 
-pip install triton-ascend==3.2.1 --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
+pip install triton-ascend==3.2.2 --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
 
 If you are installing via `uv`, make sure to install `triton-ascend` **last**, after all other packages have been installed, to avoid dependency resolution conflicts.
 ```
@@ -229,16 +251,25 @@ cd ..
 If you are building custom operators for Atlas A3, you should run `git submodule update --init --recursive` manually, or ensure your environment has internet access.
 :::
 
+:::{note}
+Atlas 300I DUO does not support `triton` or `triton-ascend`. Source installations can pull these packages as dependencies; remove them before running on Atlas 300I DUO:
+
+```bash
+pip uninstall -y triton-ascend triton
+```
+
+:::
+
 ```{note}
-To build custom operators, gcc/g++ higher than 8 and C++17 or higher are required. If you are using `pip install -e .` and encounter a torch-npu version conflict, please install with `pip install --no-build-isolation -e .` to build on system env.
+To build custom operators, gcc/g++ higher than 8 and C++17 or higher are required. If you are using `pip install -e .` and encounter a TorchNPU version conflict, please install with `pip install --no-build-isolation -e .` to build on system env.
 If you encounter other problems during compiling, it is probably because an unexpected compiler is being used, you may export `CXX_COMPILER` and `C_COMPILER` in the environment to specify your g++ and gcc locations before compiling.
 
 If you are building in a CPU-only environment where `npu-smi` is unavailable, you need to set `SOC_VERSION` before `pip install -e .` so the build can target the correct chip. You can refer to `Dockerfile*` defaults, for example:
 
 - Atlas A2: `export SOC_VERSION=ascend910b1`
 - Atlas A3: `export SOC_VERSION=ascend910_9391`
-- Atlas 300I: `export SOC_VERSION=ascend310p1`
-- Ascend 950 Products: `export SOC_VERSION=<value starting with "ascend950">`
+- Atlas 300I DUO: `export SOC_VERSION=ascend310p1`
+- Atlas 950DT: `export SOC_VERSION=ascend950dt_9582`
 ```
 
 ```{note}
@@ -253,13 +284,15 @@ For usage guidance on the batch invariance feature, see <https://github.com/vllm
 Supported images as following.
 
 | image name | Hardware | OS |
-|-|-|-|
+| - | - | - |
 | vllm-ascend:{{ vllm_ascend_version }} | Atlas A2 | Ubuntu |
 | vllm-ascend:{{ vllm_ascend_version }}-openeuler | Atlas A2 | openEuler |
 | vllm-ascend:{{ vllm_ascend_version }}-a3 | Atlas A3 | Ubuntu |
 | vllm-ascend:{{ vllm_ascend_version }}-a3-openeuler | Atlas A3 | openEuler |
-| vllm-ascend:{{ vllm_ascend_version }}-310p | Atlas 300I | Ubuntu |
-| vllm-ascend:{{ vllm_ascend_version }}-310p-openeuler | Atlas 300I | openEuler |
+| vllm-ascend:{{ vllm_ascend_version }}-310p | Atlas 300I DUO | Ubuntu |
+| vllm-ascend:{{ vllm_ascend_version }}-310p-openeuler | Atlas 300I DUO | openEuler |
+| vllm-ascend:{{ vllm_ascend_version }}-a5 | Atlas 950DT | Ubuntu |
+| vllm-ascend:{{ vllm_ascend_version }}-a5-openeuler | Atlas 950DT | openEuler |
 
 :::{dropdown} Click here to see "Build from Dockerfile"
 or build IMAGE from **source code**:
@@ -272,10 +305,13 @@ docker build -t vllm-ascend-dev-image:latest -f ./Dockerfile .
 
 :::
 
+:::::{tab-set}
+::::{tab-item} A2/A3
+
 ```{code-block} bash
    :substitutions:
 
-# Update --device according to your device (Atlas A2: /dev/davinci[0-7] Atlas A3:/dev/davinci[0-15]).
+# Update --device according to your device (Atlas A2: /dev/davinci[0-7] Atlas A3:/dev/davinci[0-15] Atlas 950DT: /dev/davinci[0-7]).
 # Update the vllm-ascend image according to your environment.
 # Note you should download the weight to /root/.cache in advance.
 export IMAGE=quay.io/ascend/vllm-ascend:|vllm_ascend_version|
@@ -303,6 +339,81 @@ docker run --rm \
     -v /root/.cache:/root/.cache \
     -it $IMAGE bash
 ```
+
+::::
+
+::::{tab-item} Atlas 300I DUO
+
+Adjust `/dev/davinci0` to the NPU you want to use.
+
+```{code-block} bash
+   :substitutions:
+
+export DEVICE=/dev/davinci0
+export IMAGE=quay.io/ascend/vllm-ascend:|vllm_ascend_version|-310p
+
+docker run --rm \
+    --name vllm-ascend \
+    --shm-size=1g \
+    --device $DEVICE \
+    --device /dev/davinci_manager \
+    --device /dev/devmm_svm \
+    --device /dev/hisi_hdc \
+    -v /usr/local/dcmi:/usr/local/dcmi \
+    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+    -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+    -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+    -v /etc/ascend_install.info:/etc/ascend_install.info \
+    -v /root/.cache:/root/.cache \
+    -p 8000:8000 \
+    -it $IMAGE bash
+```
+
+::::
+
+::::{tab-item} Atlas 200I Pro
+
+Atlas 200I Pro requires additional device nodes, driver libraries, and configuration files so that `npu-smi` and other driver commands work inside the container. Adjust `/dev/davinci0` to the NPU you want to use.
+
+```{code-block} bash
+   :substitutions:
+
+export IMAGE=quay.io/ascend/vllm-ascend:|vllm_ascend_version|-310p
+
+docker run --rm \
+    --privileged \
+    --name vllm-ascend \
+    --shm-size=10g \
+    --device=/dev/davinci0:/dev/davinci0 \
+    --device=/dev/davinci_manager \
+    --device=/dev/ascend_manager \
+    --device=/dev/user_config \
+    -v /etc/sys_version.conf:/etc/sys_version.conf \
+    -v /etc/ld.so.conf.d/mind_so.conf:/etc/ld.so.conf.d/mind_so.conf \
+    -v /etc/hdcBasic.cfg:/etc/hdcBasic.cfg \
+    -v /var/dmp_daemon:/var/dmp_daemon \
+    -v /usr/lib64/libmmpa.so:/usr/lib64/libmmpa.so \
+    -v /usr/lib64/libcrypto.so.1.1:/usr/lib64/libcrypto.so.1.1 \
+    -v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi \
+    -v /usr/lib64/libstackcore.so:/usr/lib64/libstackcore.so \
+    -v /usr/lib/aarch64-linux-gnu/libyaml-0.so.2:/usr/lib64/libyaml-0.so.2 \
+    -v /etc/slog.conf:/etc/slog.conf \
+    -v /var/slogd:/var/slogd \
+    -v /usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64 \
+    -v /usr/lib64/libtensorflow.so:/usr/lib64/libtensorflow.so \
+    -v /root/.cache:/root/.cache \
+    -p 8000:8000 \
+    -it $IMAGE bash
+```
+
+For openEuler, keep the same command structure and make the following substitutions:
+
+- Set `IMAGE` to `quay.io/ascend/vllm-ascend:|vllm_ascend_version|-310p-openeuler`.
+- Add `-v /usr/lib64/libsemanage.so.2:/usr/lib64/libsemanage.so.2`.
+- Replace the `libyaml` mount with `-v /usr/lib64/libyaml-0.so.2.0.9:/usr/lib64/libyaml-0.so.2`.
+
+::::
+:::::
 
 The default workdir is `/workspace`, vLLM and vLLM Ascend code are placed in `/vllm-workspace` and installed in [development mode](https://setuptools.pypa.io/en/latest/userguide/development_mode.html) (`pip install -e`) to help developers immediately make changes without requiring a new installation.
 
@@ -349,6 +460,16 @@ pip install modelscope
 python example.py
 ```
 
+```{note}
+If you encounter custom-op security verification errors while running inference on Atlas 950DT, refer to [Pooling enables UB and UBoE for 950DT and 950PR](https://gitcode.com/Ascend/memcache/wiki/%E6%B1%A0%E5%8C%96%E4%BD%BF%E8%83%BD950DT%E5%92%8C950PR%E7%9A%84UB%E5%92%8CUBoE.md) and run the following commands:
+
+> Each NPU will prompt for confirmation when running the first command. You must manually enter `Y` for all of them.
+
+```bash
+for i in {0..7}; do npu-smi set -t custom-op-secverify-enable -i $i -d 1; done;
+for i in {0..7}; do npu-smi set -t custom-op-secverify-mode -i $i -d 0; done;
+```
+
 This section shows ascend platform is successfully detected in vllm:
 
 ```bash
@@ -367,7 +488,7 @@ Prompt: 'The capital of France is', Generated text: ' a city. What is the capita
 Prompt: 'The future of AI is', Generated text: ' a topic that is being discussed in various contexts. In the business world, AI'
 ```
 
-This section shows process exits after offline inference, and is does not affect actual inference:
+This section shows process exits after offline inference, and does not affect actual inference:
 
 ```bash
 (EngineCore pid=970) INFO 05-12 11:36:00 [core.py:1201] Shutdown initiated (timeout=0)
@@ -384,7 +505,7 @@ First, check physical layer connectivity, then verify each node, and finally ver
 
 #### Physical Layer Requirements
 
-- The physical machines must be located on the same WLAN, with network connectivity.
+- The physical machines must be located on the same LAN, with network connectivity.
 - All NPUs are connected with optical modules, and the connection status must be normal.
 
 #### Each Node Verification
@@ -432,6 +553,25 @@ Execute the following commands on each node in sequence. The results must all be
 ```
 
 ::::
+::::{tab-item} 950DT series
+:sync: 950DT
+
+```bash
+ # Check the remote switch ports
+ for i in {0..7}; do hccn_tool -i $i -lldp -g | grep Ifname; done 
+ # Get the link status of the Ethernet ports (UP or DOWN)
+ for i in {0..7}; do hccn_tool -i $i -link -g ; done
+ # Check the network health status
+ for i in {0..7}; do hccn_tool -i $i -net_health -g ; done
+ # View the network detected IP configuration
+ for i in {0..7}; do hccn_tool -i $i -netdetect -g ; done
+ # View gateway configuration
+ for i in {0..7}; do hccn_tool -i $i -gateway -g ; done
+ # View NPU network configuration
+ cat /etc/hccn.conf
+```
+
+::::
 :::::
 
 #### Interconnect Verification
@@ -457,6 +597,14 @@ for i in {0..15}; do hccn_tool -i $i -ip -g | grep ipaddr; done
 ```
 
 ::::
+::::{tab-item} 950DT series
+:sync: 950DT
+
+```bash
+for i in {0..7}; do hccn_tool -i $i -ip -g | grep ipaddr; done
+```
+
+::::
 :::::
 
 ##### 2. Cross-Node PING Test
@@ -465,6 +613,14 @@ for i in {0..15}; do hccn_tool -i $i -ip -g | grep ipaddr; done
 # Execute on the target node (replace with actual IP)
 hccn_tool -i 0 -ping -g address x.x.x.x
 ```
+
+### Atlas 950 Series Server Pre-check
+
+This pre-check applies only to Atlas 950 series servers. Other server series can skip it.
+
+- **Prepare HiXLEP configuration paths**
+
+    When deploying an inference service on Atlas 950 series servers, verify on each server that `/lib/route.conf`, `/etc/hccl_rootinfo.json`, and the `/etc/hixlep` directory (which describes the UB link topology) exist and are configured correctly. If any of them are missing or incorrect, follow the [HiXLEP configuration file generation guide](https://gitcode.com/cann/hixl/wiki/A5%20LocalCommRes%E9%85%8D%E7%BD%AE%E6%8C%87%E5%8D%97.md) to generate the required content. When generating `/etc/hixlep`, use the "D2D scenario".
 
 ### Run Container In Each Node
 
@@ -551,6 +707,47 @@ docker run --rm \
 --device /dev/davinci13 \
 --device /dev/davinci14 \
 --device /dev/davinci15 \
+--device /dev/davinci_manager \
+--device /dev/devmm_svm \
+--device /dev/hisi_hdc \
+-v /usr/local/dcmi:/usr/local/dcmi \
+-v /usr/local/Ascend/driver/tools/hccn_tool:/usr/local/Ascend/driver/tools/hccn_tool \
+-v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+-v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+-v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /root/.cache:/root/.cache \
+-it $IMAGE bash
+```
+
+::::
+::::{tab-item} 950DT series
+:sync: 950DT
+
+```{code-block} bash
+    :substitutions:
+# Update the vllm-ascend image
+# openEuler:
+# export IMAGE=quay.io/ascend/vllm-ascend:|vllm_ascend_version|-a5-openeuler
+# Ubuntu:
+# export IMAGE=quay.io/ascend/vllm-ascend:|vllm_ascend_version|-a5
+export IMAGE=quay.io/ascend/vllm-ascend:|vllm_ascend_version|-a5
+
+# Run the container using the defined variables
+# Note if you are running bridge network with docker, Please expose available ports
+# for multiple nodes communication in advance
+docker run --rm \
+--name vllm-ascend \
+--net=host \
+--shm-size=1g \
+--device /dev/davinci0 \
+--device /dev/davinci1 \
+--device /dev/davinci2 \
+--device /dev/davinci3 \
+--device /dev/davinci4 \
+--device /dev/davinci5 \
+--device /dev/davinci6 \
+--device /dev/davinci7 \
 --device /dev/davinci_manager \
 --device /dev/devmm_svm \
 --device /dev/hisi_hdc \

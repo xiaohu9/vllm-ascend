@@ -29,6 +29,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler imp
     LookupKeyClient,
     get_zmq_rpc_path_lookup,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
+    KVPoolWorker,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -128,6 +131,12 @@ class TestKVPoolScheduler(unittest.TestCase):
         self.assertEqual(need, 32)  # 48 - 16
         self.assertFalse(is_async)
         self.assertIn("r1", scheduler.load_specs)
+        mock_client_cls.return_value.lookup.assert_called_once_with(
+            64,
+            request.block_hashes,
+            [0],
+            hbm_hit_tokens=16,
+        )
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_get_num_new_matched_tokens_all_hit(self, mock_client_cls):
@@ -144,6 +153,20 @@ class TestKVPoolScheduler(unittest.TestCase):
 
         need, _ = scheduler.get_num_new_matched_tokens(request, 0)
         self.assertEqual(need, 63)
+        self.assertEqual(scheduler.load_specs["r1"].kvpool_cached_tokens, 63)
+        self.assertEqual(scheduler.load_specs["r1"].kvpool_store_skip_tokens, 64)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_get_num_new_matched_tokens_full_hbm_hit_skips_external_lookup(self, mock_client_cls):
+        scheduler = KVPoolScheduler(self._make_config(block_size=16), use_layerwise=False)
+        request = MagicMock()
+        request.prompt_token_ids = list(range(64))
+        request.num_tokens = 64
+        request.request_id = "r1"
+        request.block_hashes = [b"h"] * 4
+
+        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 64), (0, False))
+        mock_client_cls.return_value.lookup.assert_not_called()
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_get_num_new_matched_tokens_less_than_computed(self, mock_client_cls):
@@ -424,9 +447,15 @@ class TestLookupKeyClient(unittest.TestCase):
         mock_socket.recv.return_value = (32).to_bytes(4, "big")
 
         client = LookupKeyClient(config)
-        result = client.lookup(64, [b"\xaa\xbb"])
+        # Replace the concrete encoder so multipart framing can be asserted deterministically.
+        mock_encoder = MagicMock()
+        mock_encoder.encode.side_effect = [[b"hashes"], [b"groups"]]
+        client.encoder = mock_encoder
+        result = client.lookup(64, [b"\xaa\xbb"], hbm_hit_tokens=16)
         self.assertEqual(result, 32)
         mock_socket.send_multipart.assert_called_once()
+        frames = mock_socket.send_multipart.call_args.args[0]
+        self.assertEqual(int.from_bytes(frames[2], "big"), 16)
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.make_zmq_socket")
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.zmq")
@@ -1113,6 +1142,31 @@ class TestKVPoolSchedulerGetLayerwiseGvaHitTokens(unittest.TestCase):
         request.block_hashes = [b"\xaa", b"\xbb"]
         result = scheduler._get_layerwise_gva_hit_tokens(request, 32, 0)
         self.assertEqual(result, 32)
+
+    def test_gva_hit_check_includes_all_parallel_ranks(self):
+        scheduler = object.__new__(KVPoolScheduler)
+        scheduler.model_name = "llama-7b"
+        scheduler.tp_size = 2
+        scheduler.put_step = 2
+        scheduler.pcp_size = 2
+        scheduler.dcp_size = 2
+        scheduler.pp_size = 2
+        worker = object.__new__(KVPoolWorker)
+        worker.model_name = scheduler.model_name
+
+        for num_groups, group_id in ((1, 0), (2, 1)):
+            scheduler.kv_cache_group_ids = list(range(num_groups))
+            worker.num_kv_cache_groups = num_groups
+            keys = scheduler._make_layerwise_gva_keys_for_hit_check(group_id, "deadbeef")
+            expected_key_count = (
+                scheduler.pcp_size * scheduler.dcp_size * (scheduler.tp_size // scheduler.put_step) * scheduler.pp_size
+            )
+            self.assertEqual(len(keys), expected_key_count)
+            for worker.pcp_rank in range(scheduler.pcp_size):
+                for worker.dcp_rank in range(scheduler.dcp_size):
+                    for worker.head_or_tp_rank in range(scheduler.tp_size // scheduler.put_step):
+                        for worker.pp_rank in range(scheduler.pp_size):
+                            self.assertIn(worker._make_layerwise_gva_key(group_id, "deadbeef"), keys)
 
     def test_partial_hit(self):
         scheduler = self._make_scheduler()

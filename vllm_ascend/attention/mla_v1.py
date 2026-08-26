@@ -17,7 +17,7 @@ from vllm.v1.attention.backend import (
     MLAAttentionImpl,
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID  # type: ignore
-from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -43,6 +43,7 @@ from vllm_ascend.compilation.acl_graph import (
     update_draft_graph_params_workspaces,
     update_graph_params_workspaces,
 )
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.ops.layer_shard_linear import (
@@ -238,7 +239,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
 
     def __init__(
         self,
-        kv_cache_spec: MLAAttentionSpec,
+        kv_cache_spec: AscendMLAAttentionSpec,
         layer_names: list[str],
         vllm_config: VllmConfig,
         device: torch.device,
@@ -749,7 +750,6 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
         ascend_config = get_ascend_config()
-        self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
         self.enable_kv_nz = ascend_config.enable_kv_nz
 
         self.ring_mla_mask_size = 512
@@ -1222,11 +1222,13 @@ class AscendMLAImpl(MLAAttentionImpl):
                 key = torch.cat((k_nope, k_pe), dim=-1)
             else:
                 common_kwargs["query_rope"] = q_pe
-                common_kwargs["key_rope"] = k_pe
+                common_kwargs["key_rope"] = k_pe.contiguous()
                 query = q_nope
                 key = k_nope
 
-            chunk_out, chunk_lse = torch_npu.npu_fused_infer_attention_score(query, key, v, **common_kwargs)
+            chunk_out, chunk_lse = torch_npu.npu_fused_infer_attention_score(
+                query, key.contiguous(), v.contiguous(), **common_kwargs
+            )
 
             if chunk_lse.dim() == 2:
                 chunk_lse = chunk_lse.transpose(0, 1).unsqueeze(-1)
@@ -1291,10 +1293,12 @@ class AscendMLAImpl(MLAAttentionImpl):
             key = torch.cat((k_nope, k_pe), dim=-1)
         else:
             common_kwargs["query_rope"] = q_pe
-            common_kwargs["key_rope"] = k_pe
+            common_kwargs["key_rope"] = k_pe.contiguous()
             query, key = q_nope, k_nope
 
-        attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(query, key, value, **common_kwargs)
+        attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(
+            query, key.contiguous(), value.contiguous(), **common_kwargs
+        )
 
         attn_output, attn_lse = self._compute_prefill_context(
             q_nope, q_pe, kv_c_and_k_pe_cache, self.qk_rope_head_dim, attn_metadata, attn_output, attn_lse

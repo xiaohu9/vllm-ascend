@@ -7,10 +7,70 @@ import torch.nn.functional as F
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group, is_v1_kv_transfer_group
 from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
-from vllm_ascend.utils import AscendDeviceType, get_ascend_config, get_ascend_device_type
+from vllm_ascend.device.utils import FIA_TND_LARGE_HEAD_FALLBACK_HEAD_SIZE
+from vllm_ascend.utils import (
+    AscendDeviceType,
+    get_ascend_config,
+    get_ascend_device_type,
+    is_pd_decode_recompute_scheduler_enabled,
+)
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
+
+SFA_QSFA_TILE_SIZE = 128
+
+
+def get_sfa_qsfa_packed_head_dim(
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    tile_size: int = SFA_QSFA_TILE_SIZE,
+) -> int:
+    if kv_lora_rank % tile_size != 0:
+        raise ValueError(
+            f"kv_lora_rank must be divisible by tile_size for SFA QSFA packed cache, "
+            f"got {kv_lora_rank=} and {tile_size=}."
+        )
+    scale_metadata_bytes = (kv_lora_rank // tile_size) * get_dtype_size(torch.float32)
+    return kv_lora_rank + qk_rope_head_dim * get_dtype_size(torch.bfloat16) + scale_metadata_bytes
+
+
+def cache_graph_workspace(
+    graph_params,
+    num_tokens: int,
+    candidate_workspace: torch.Tensor,
+    *,
+    use_max_workspace: bool,
+) -> torch.Tensor:
+    # Most models keep the original first-workspace cache behavior. Models with
+    # mixed attention layer shapes may need the largest workspace for a graph
+    # size because layers can require different FIA workspace sizes.
+    current_workspace = graph_params.workspaces.get(num_tokens)
+    if use_max_workspace:
+        if current_workspace is None or (
+            candidate_workspace.numel() * candidate_workspace.element_size()
+            > current_workspace.numel() * current_workspace.element_size()
+        ):
+            graph_params.workspaces[num_tokens] = candidate_workspace
+    elif current_workspace is None:
+        graph_params.workspaces[num_tokens] = candidate_workspace
+    return graph_params.workspaces[num_tokens]
+
+
+@lru_cache(maxsize=1)
+def needs_layer_aware_fia_graph_replay() -> bool:
+    vllm_config = get_current_vllm_config()
+    model_config = vllm_config.model_config
+    hf_config = getattr(model_config, "hf_config", None)
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    text_config = getattr(hf_config, "text_config", None)
+    model_types = (
+        getattr(hf_config, "model_type", None),
+        getattr(hf_text_config, "model_type", None),
+        getattr(text_config, "model_type", None),
+    )
+    return any(model_type in {"gemma4", "gemma4_text"} for model_type in model_types)
 
 
 def ascend_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
@@ -41,11 +101,16 @@ def ascend_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
     return chunked_prefill_workspace_size
 
 
-def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig) -> bool:
+def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig, head_size: int | None = None) -> bool:
     if vllm_config.speculative_config is not None:
         return False
     if get_ascend_device_type() == AscendDeviceType.A5:
         return False
+    # TODO: Remove this fallback when A2/A3 FIA TND supports Gemma4's
+    # 512-dim global attention heads. Decode can use PA directly; prefill is
+    # handled by the device adaptor.
+    if head_size == FIA_TND_LARGE_HEAD_FALLBACK_HEAD_SIZE:
+        return True
     from vllm.config.compilation import CUDAGraphMode
 
     cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
@@ -123,6 +188,9 @@ class AscendPrefillContextParallelMetadata:
     # when entering from linear-attention to attention
     pcp_enter_fa_restore_idx: torch.Tensor = None
 
+    # restore the original FA padded layout without boolean-mask scatter
+    pcp_fa_padding_restore_idx: torch.Tensor = None
+
     # scatter the full sequence across all pcp ranks
     # when exiting from attention to linear-attention
     pcp_exit_fa_scatter_idx: torch.Tensor = None
@@ -174,9 +242,6 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     positions: torch.Tensor = None
     positions_cpu: torch.Tensor = None
 
-    # CPU tensor of slot mapping for host-side operations.
-    slot_mapping_cpu: torch.Tensor = None
-
     # Current attention state (e.g., ChunkedPrefill, DecodeOnly).
     attn_state: Any = None
 
@@ -212,7 +277,6 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             # This is really strange since vLLM slices them as well
             block_table_tensor=self.block_table_tensor,
             slot_mapping=self.slot_mapping,
-            slot_mapping_cpu=self.slot_mapping_cpu,
             causal=self.causal,
             actual_seq_lengths_q=self.actual_seq_lengths_q[:num_actual_tokens],
             positions=self.positions,
@@ -313,6 +377,11 @@ def split_decodes_and_prefills(
 
     num_tokens = common_attn_metadata.num_actual_tokens
     query_start_loc = common_attn_metadata.query_start_loc_cpu
+
+    # PD D + RecomputeScheduler: num_computed may be N-1 after KV recv while
+    # this step is MTP decode (max_query_len <= threshold).
+    if is_pd_decode_recompute_scheduler_enabled():
+        treat_short_extends_as_decodes = True
 
     if (
         max_query_len <= decode_threshold

@@ -237,7 +237,7 @@ class ProfilingChunkScheduler(Scheduler):
     # Modified sections are marked with ">>> PROFILING CHUNK" comments.
     # ------------------------------------------------------------------
 
-    def schedule(self) -> SchedulerOutput:  # noqa: C901
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:  # noqa: C901
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -358,6 +358,9 @@ class ProfilingChunkScheduler(Scheduler):
                     )
 
                     if new_blocks is not None:
+                        break
+
+                    if self._disable_preemption:
                         break
 
                     if self.policy == SchedulingPolicy.PRIORITY:

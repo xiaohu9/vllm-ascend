@@ -161,7 +161,7 @@ There are several arguments that you should update according to your environment
 - `path`: Update to your model weight path.
 - `model`: Update to your model name in vLLM.
 - `host_ip` and `host_port`: Update to your vLLM server ip and port.
-- `max_out_len`: Note `max_out_len` + LLM input length should be less than `max_model_len`(config in your vllm server), `32768` will be suitable for most datasets.
+- `max_out_len`: Note `max_out_len` + LLM input length should be less than `max_model_len` (config in your vllm server), `32768` will be suitable for most datasets.
 - `batch_size`: Update according to your dataset.
 - `temperature`: Update inference argument.
 
@@ -219,6 +219,9 @@ ais_bench --models vllm_api_general_chat --datasets livecodebench_code_generate_
 # run AIME 2024 dataset
 ais_bench --models vllm_api_general_chat --datasets aime2024_gen_0_shot_chat_prompt.py --mode all --dump-eval-details --merge-ds
 
+# run GSM8K dataset
+ais_bench --models vllm_api_general_chat --datasets gsm8k_gen_0_shot_cot_chat_prompt.py --mode all --dump-eval-details --merge-ds
+
 ```
 
 After each dataset execution, you can get the result from saved files such as `outputs/default/20250628_151326`, there is an example as follows:
@@ -268,6 +271,9 @@ ais_bench --models vllm_api_general_chat --datasets livecodebench_code_generate_
 
 # run AIME 2024 dataset
 ais_bench --models vllm_api_general_chat --datasets aime2024_gen_0_shot_chat_prompt.py --summarizer default_perf --mode perf
+
+# run GSM8K dataset
+ais_bench --models vllm_api_general_chat --datasets gsm8k_gen_0_shot_cot_str_perf.py --summarizer default_perf --mode perf
 ```
 
 Multi-modal benchmarks (text + images):

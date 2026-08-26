@@ -18,12 +18,23 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
+# isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+import torch
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import config_data
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
+    ChunkedTokenDatabase,
+    KeyMetadata,
     LoadSpec,
     ReqMeta,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import (
+    AscendStoreCoordinator,
+)
+# isort: on
 
 
 class TestKVPoolWorkerHelpers(unittest.TestCase):
@@ -50,28 +61,189 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         result = cls.check_all_layers_exists(None, [0, 0, 0], 3)
         self.assertEqual(result, [0])
 
-    def test_find_max_hit_index_found(self):
+    def test_find_all_continuous_hit_positions_found(self):
         cls = self._make_worker_class()
         arr = [[1, 1, 0], [1, 0, 1]]
-        result = cls.find_max_hit_index(None, arr, 3)
-        self.assertEqual(result, 0)
+        result = cls.find_all_continuous_hit_positions(arr, [16, 32, 48], 3, 48, 16)
+        self.assertEqual(result, [16])
 
-    def test_find_max_hit_index_all_one(self):
+    def test_find_all_continuous_hit_positions_all_one(self):
         cls = self._make_worker_class()
         arr = [[1, 1, 1], [1, 1, 1]]
-        result = cls.find_max_hit_index(None, arr, 3)
-        self.assertEqual(result, 2)
+        result = cls.find_all_continuous_hit_positions(arr, [16, 32, 48], 3, 48, 16)
+        self.assertEqual(result, [16, 32, 48])
 
-    def test_find_max_hit_index_first_pos(self):
+    def test_find_all_continuous_hit_positions_first_pos(self):
         cls = self._make_worker_class()
         arr = [[0, 1], [1, 0]]
-        result = cls.find_max_hit_index(None, arr, 3)
-        self.assertEqual(result, -1)
+        result = cls.find_all_continuous_hit_positions(arr, [16, 32], 2, 48, 16)
+        self.assertEqual(result, [])
 
-    def test_find_max_hit_index_empty(self):
+    def test_find_all_continuous_hit_positions_empty(self):
         cls = self._make_worker_class()
-        result = cls.find_max_hit_index(None, [], 0)
-        self.assertEqual(result, -1)
+        result = cls.find_all_continuous_hit_positions([], [], 0, 48, 16)
+        self.assertEqual(result, [])
+
+    def test_find_all_discontinuous_hit_positions_all_tp_hits(self):
+        cls = self._make_worker_class()
+        arr = [[0, 0, 1, 0, 0, 1], [0, 0, 1, 0, 0, 1]]
+        result = cls.find_all_discontinuous_hit_positions(arr, [16, 32, 48, 64, 80, 96], 6, 128, 16)
+        self.assertEqual(result, [48, 96])
+
+    def test_find_all_discontinuous_hit_positions_some_tp_hits(self):
+        cls = self._make_worker_class()
+        arr = [[0, 0, 1, 0, 0, 1], [0, 0, 1, 0, 0, 0]]
+        result = cls.find_all_discontinuous_hit_positions(arr, [16, 32, 48, 64, 80, 96], 6, 128, 16)
+        self.assertEqual(result, [48])
+
+    def test_find_all_discontinuous_hit_positions_all_tp_hits_with_limits(self):
+        cls = self._make_worker_class()
+        arr = [[0, 0, 1, 0, 0, 1], [0, 0, 1, 0, 0, 1]]
+        result = cls.find_all_discontinuous_hit_positions(arr, [16, 32, 48, 64, 80, 96], 6, 64, 16)
+        self.assertEqual(result, [48])
+
+    def test_max_intersection_hit_position_single_group(self):
+        cls = self._make_worker_class()
+        hits = [[16, 32, 48]]
+        self.assertEqual(48, cls._max_intersection_hit_position(hits))
+
+    def test_max_intersection_hit_position_empty_group(self):
+        cls = self._make_worker_class()
+        hits: list[list[int]] = []
+        self.assertEqual(0, cls._max_intersection_hit_position(hits))
+
+    def test_max_intersection_hit_position_multi_group(self):
+        cls = self._make_worker_class()
+        hits = [[16, 32, 48], [32, 48], [16, 32], [32, 48, 64]]
+        self.assertEqual(32, cls._max_intersection_hit_position(hits))
+
+    def test_external_coordinator_lookup_uses_only_lookup_mask(self):
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        worker.num_kv_cache_groups = 1
+        worker.cache_coordinator = MagicMock()
+        worker.cache_coordinator.lcm_block_size = 128
+        worker.cache_coordinator.lookup_mask.return_value = ([True],)
+        worker.cache_coordinator.store_mask.return_value = ([False],)
+        worker.cache_coordinator.find_longest_cache_hit.return_value = ((), 128)
+        worker.m_store = MagicMock()
+        worker.m_store.exists.return_value = [1]
+
+        worker.token_database = MagicMock()
+        worker.token_database.get_block_size.return_value = 128
+        worker.token_database.group_cache_families = {"kv": {0: "default"}}
+        worker.token_database.process_token_key_strings.side_effect = (
+            lambda *args, chunk_filter, **kwargs: [(0, 128, "key", "ab" * 32)] if chunk_filter(0) else []
+        )
+
+        hit = worker._lookup_with_coordinator(
+            128,
+            [b"h0"],
+            [0],
+            use_layerwise=False,
+            include_all_ranks=False,
+            grouped_hash_cache={},
+        )
+
+        self.assertEqual(hit, 128)
+        worker.cache_coordinator.lookup_mask.assert_called_once_with(128)
+        worker.cache_coordinator.store_mask.assert_not_called()
+        worker.m_store.exists.assert_called_once_with(["key"])
+        worker.cache_coordinator.find_longest_cache_hit.assert_called_once()
+        self.assertFalse(worker.cache_coordinator.find_longest_cache_hit.call_args.kwargs["apply_eagle"])
+        worker.token_database.process_tokens.assert_not_called()
+
+    def test_lookup_reuses_grouped_hashes_for_hit_resolution(self):
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        worker.num_kv_cache_groups = 1
+        worker.cache_coordinator = AscendStoreCoordinator(
+            [
+                KVCacheGroupSpec(
+                    ["layer.0"],
+                    FullAttentionSpec(
+                        block_size=16,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                    ),
+                )
+            ],
+            scheduler_block_size=16,
+            hash_block_size=8,
+            group_block_sizes=[16],
+            group_cache_families=["c1"],
+        )
+        worker.token_database = ChunkedTokenDatabase(
+            [KeyMetadata("model", 0, 0, 0, 0)],
+            block_size=[16],
+            partitions=None,
+            hash_block_size=8,
+        )
+        worker.m_store = MagicMock()
+        worker.m_store.exists.return_value = [1, 1]
+        block_hashes = [b"h0", b"h1", b"h2", b"h3"]
+
+        with patch.object(
+            config_data,
+            "_rehash_block_hash_group",
+            wraps=config_data._rehash_block_hash_group,
+        ) as rehash:
+            hit = worker.lookup(32, block_hashes, [0])
+
+        self.assertEqual(hit, 32)
+        self.assertEqual(rehash.call_count, 2)
+
+    def test_registered_layer_layout_includes_mtp_multi_group_and_pp(self):
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        worker.num_layers = 2
+        worker.hf_config = MagicMock(num_hidden_layers=4)
+        caches = [MagicMock(), MagicMock(), MagicMock()]
+        for address, cache in zip((1000, 2000, 3000), caches):
+            cache.data_ptr.return_value = address
+        worker.kv_caches = {
+            "model.layers.2.self_attn": (caches[0],),
+            "model.layers.3.self_attn": (caches[1],),
+            "model.mtp.0.self_attn": (caches[2],),
+        }
+        worker._get_cache_block_metadata = MagicMock(return_value=(160, 160, 160, 1))
+        worker.group_kv_caches_base_addr = {}
+        worker.group_block_len = {}
+        worker.group_block_stride = {}
+        worker.group_num_layers = {}
+
+        worker._infer_cache_group_metadata(0, list(worker.kv_caches))
+        self.assertEqual(worker.group_kv_caches_base_addr[0], [1000, 2000, 3000])
+        self.assertEqual(worker.group_num_layers[0], 3)
+        worker.layer_load_tasks = [[], []]
+        worker.layer_save_tasks = [[], []]
+
+        worker._configure_registered_layerwise_layers(
+            [
+                (
+                    0,
+                    [
+                        "model.layers.2.self_attn",
+                        "model.layers.3.self_attn",
+                        "model.mtp.0.self_attn",
+                    ],
+                ),
+                (1, ["model.layers.2.indexer", "model.layers.3.indexer"]),
+            ]
+        )
+
+        self.assertEqual(worker.num_layers, 3)
+        self.assertEqual(
+            worker.local_layer_to_group_layers,
+            {
+                0: [(0, 0), (1, 0)],
+                1: [(0, 1), (1, 1)],
+                2: [(0, 2)],
+            },
+        )
+        self.assertEqual(worker._extract_physical_layer_index("model.layers.4.self_attn"), 4)
+        self.assertEqual(len(worker.layer_load_tasks), 3)
 
 
 class TestKVPoolWorkerInit(unittest.TestCase):
@@ -84,6 +256,7 @@ class TestKVPoolWorkerInit(unittest.TestCase):
         config.model_config.hf_text_config = MagicMock(spec=[])  # no index_topk
         config.model_config.get_num_layers.return_value = 32
         config.model_config.get_total_num_kv_heads.return_value = 8
+        config.model_config.max_model_len = 1024
         config.parallel_config.data_parallel_rank = 0
         config.parallel_config.rank = 0
         config.parallel_config.pipeline_parallel_size = 1
@@ -420,6 +593,7 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         config.model_config.model = "org/llama-7b"
         config.model_config.use_mla = False
         config.model_config.hf_text_config = MagicMock(spec=[])
+        config.model_config.max_model_len = 1024
         config.model_config.get_num_layers.return_value = 2
         config.model_config.get_total_num_kv_heads.return_value = 1
         config.parallel_config.data_parallel_rank = 0
@@ -460,6 +634,19 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         self.assertEqual(len(worker.group_kv_caches_base_addr[0]), 2)
         worker.m_store.register_buffer.assert_called_once()
 
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.threading.Event")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.KVCacheStoreRecvingThread")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.KVCacheStoreSendingThread")
+    def test_transfer_threads_use_grouped_block_sizes(self, mock_send_thread, mock_recv_thread, mock_event):
+        worker = self._make_worker(kv_role="kv_both", extra_config={"backend": "mooncake", "load_async": True})
+        worker.grouped_block_size = [128, 8, 32]
+
+        worker._start_kv_transfer_threads()
+
+        self.assertEqual(mock_send_thread.call_args.args[2], [128, 8, 32])
+        self.assertEqual(mock_recv_thread.call_args.args[2], [128, 8, 32])
+        mock_event.return_value.wait.assert_called()
+
     def test_start_load_kv_sync(self):
         worker = self._make_worker()
         worker.m_store.get = MagicMock()
@@ -479,6 +666,28 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         worker.start_load_kv(meta)
         worker.m_store.get.assert_called_once()
 
+    def test_start_load_kv_sync_uses_tail_block_id(self):
+        worker = self._make_worker()
+        worker.m_store.get = MagicMock()
+        worker.token_database.set_group_buffers({0: [1000]}, {0: [160]})
+
+        load_spec = LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=64, can_load=True, token_len=64)
+        req = ReqMeta(
+            req_id="r1",
+            token_len_chunk=64,
+            block_ids=[99],
+            block_hashes=["h0", "h1", "h2", "h3"],
+            load_spec=load_spec,
+        )
+        meta = AscendConnectorMetadata(set(), set())
+        meta.add_request(req)
+
+        worker.start_load_kv(meta)
+
+        _, addrs, sizes = worker.m_store.get.call_args.args
+        self.assertEqual(addrs, [[1000 + 99 * 160]])
+        self.assertEqual(sizes, [[160]])
+
     def test_start_load_kv_no_load(self):
         worker = self._make_worker()
         req = ReqMeta(
@@ -493,7 +702,32 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         worker.start_load_kv(meta)
         # No get called since no load_spec
 
-    def test_wait_for_save(self):
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.KVCacheStoreRecvingThread")
+    def test_async_recv_thread_shares_invalid_block_state(self, mock_recv_thread_cls):
+        worker = self._make_worker(
+            kv_role="kv_consumer",
+            extra_config={"backend": "mooncake", "load_async": True},
+        )
+        recv_thread = MagicMock()
+
+        def create_recv_thread(*args, **kwargs):
+            args[6].set()
+            return recv_thread
+
+        mock_recv_thread_cls.side_effect = create_recv_thread
+
+        worker._start_kv_transfer_threads()
+
+        kwargs = mock_recv_thread_cls.call_args.kwargs
+        self.assertIs(kwargs["invalid_block_ids"], worker._invalid_block_ids)
+        self.assertIs(
+            kwargs["invalid_block_ids_lock"],
+            worker._invalid_block_ids_lock,
+        )
+        kwargs["invalid_block_ids"].add(7)
+        self.assertEqual(worker.get_block_ids_with_load_errors(), {7})
+
+    def test_wait_for_save_waits_for_save(self):
         worker = self._make_worker()
         worker.kv_send_thread = MagicMock()
 
@@ -509,6 +743,7 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         worker.wait_for_save(meta)
         worker.kv_send_thread.add_stored_request.assert_called_with("r1")
         worker.kv_send_thread.add_request.assert_called_once()
+        worker.kv_send_thread.request_queue.join.assert_called_once()
 
     def test_wait_for_save_skip_non_save(self):
         worker = self._make_worker()
@@ -525,6 +760,7 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         meta.add_request(req)
         worker.wait_for_save(meta)
         worker.kv_send_thread.add_stored_request.assert_not_called()
+        worker.kv_send_thread.request_queue.join.assert_not_called()
 
     def test_get_finished_producer(self):
         worker = self._make_worker(kv_role="kv_producer")
@@ -813,115 +1049,6 @@ class TestKVPoolWorkerGetGroupTpSize(unittest.TestCase):
         worker.group_uses_align_state = [False]
         # _get_group_num_kv_heads returns 1 for MLA
         self.assertEqual(worker.get_group_tp_size(0), 1)
-
-
-class TestKVPoolWorkerLookupGateGroupIds(unittest.TestCase):
-    """Test _get_lookup_gate_group_ids and _is_lookup_gate_group."""
-
-    def _make_worker(self):
-        patches = {
-            "tp_rank": patch(
-                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_tensor_model_parallel_rank",
-                return_value=0,
-            ),
-            "tp_size": patch(
-                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_tensor_model_parallel_world_size",
-                return_value=1,
-            ),
-            "pcp_group": patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_pcp_group"),
-            "dcp_ws": patch(
-                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_decode_context_model_parallel_world_size",
-                return_value=1,
-            ),
-            "dcp_rank": patch(
-                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_decode_context_model_parallel_rank",
-                return_value=0,
-            ),
-            "importlib": patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.importlib"),
-        }
-        mocks = {}
-        for name, p in patches.items():
-            mocks[name] = p.start()
-        pcp_group = MagicMock()
-        pcp_group.world_size = 1
-        mocks["pcp_group"].return_value = pcp_group
-        mocks["importlib"].import_module.return_value = MagicMock()
-
-        config = MagicMock()
-        config.model_config.model = "org/llama-7b"
-        config.model_config.use_mla = False
-        config.model_config.hf_text_config = MagicMock(spec=[])
-        config.model_config.get_num_layers.return_value = 2
-        config.model_config.get_total_num_kv_heads.return_value = 1
-        config.parallel_config.data_parallel_rank = 0
-        config.parallel_config.rank = 0
-        config.parallel_config.pipeline_parallel_size = 1
-        config.kv_transfer_config.kv_role = "kv_producer"
-        config.kv_transfer_config.kv_connector_extra_config = {"backend": "mooncake"}
-        config.cache_config.block_size = 16
-        config.kv_events_config = None
-
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
-
-        worker = KVPoolWorker(config, use_layerwise=False)
-        self._patches = patches
-        return worker
-
-    def tearDown(self):
-        for p in self._patches.values():
-            p.stop()
-
-    def test_is_lookup_gate_group_c128_family(self):
-        worker = self._make_worker()
-        worker.kv_cache_group_families = ["c128"]
-        worker.group_uses_align_state = [False]
-        self.assertFalse(worker._is_lookup_gate_group(0))
-
-    def test_is_lookup_gate_group_c4_family(self):
-        worker = self._make_worker()
-        worker.kv_cache_group_families = ["c4"]
-        worker.group_uses_align_state = [False]
-        self.assertFalse(worker._is_lookup_gate_group(0))
-
-    def test_is_lookup_gate_group_c1_family_matching_block_size(self):
-        worker = self._make_worker()
-        worker.kv_cache_group_families = ["c1"]
-        worker.group_uses_align_state = [False]
-        worker.grouped_block_size = [16]
-        worker.block_size = 16
-        self.assertTrue(worker._is_lookup_gate_group(0))
-
-    def test_is_lookup_gate_group_c1_family_wrong_block_size(self):
-        worker = self._make_worker()
-        worker.kv_cache_group_families = ["c1"]
-        worker.group_uses_align_state = [False]
-        worker.grouped_block_size = [8]
-        worker.block_size = 16
-        self.assertFalse(worker._is_lookup_gate_group(0))
-
-    def test_is_lookup_gate_group_align_state(self):
-        worker = self._make_worker()
-        worker.kv_cache_group_families = ["default"]
-        worker.group_uses_align_state = [True]
-        self.assertFalse(worker._is_lookup_gate_group(0))
-
-    def test_get_lookup_gate_group_ids_no_gate_groups(self):
-        worker = self._make_worker()
-        worker.kv_cache_group_families = ["c128"]
-        worker.group_uses_align_state = [False]
-        # No gate groups -> return original
-        result = worker._get_lookup_gate_group_ids([0])
-        self.assertEqual(result, [0])
-
-    def test_get_lookup_gate_group_ids_with_gate_groups(self):
-        worker = self._make_worker()
-        worker.kv_cache_group_families = ["c1", "c128"]
-        worker.group_uses_align_state = [False, False]
-        worker.grouped_block_size = [16, 16]
-        worker.block_size = 16
-        result = worker._get_lookup_gate_group_ids([0, 1])
-        # Only group 0 is a gate group (c1 + matching block_size)
-        self.assertEqual(result, [0])
 
 
 class TestKVPoolWorkerBuildConnectorWorkerMeta(unittest.TestCase):

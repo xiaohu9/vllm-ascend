@@ -219,6 +219,7 @@ class RecomputeScheduler(Scheduler):
                 # they are all rejected.
                 and request.num_computed_tokens + 2 - request.num_output_placeholders
                 >= request.num_prompt_tokens + request.max_tokens
+                or request.num_computed_tokens >= self.max_model_len
             ):
                 # Async scheduling: Avoid scheduling an extra step when we are sure that
                 # the previous step has reached request.max_tokens. We don't schedule
@@ -484,6 +485,7 @@ class RecomputeScheduler(Scheduler):
                     # Get locally-cached tokens.
                     if (
                         self.connector is not None
+                        and not self.is_kv_producer
                         and self.has_mamba_layers
                         and isinstance(
                             self.kv_cache_manager.coordinator,
@@ -900,10 +902,12 @@ class RecomputeScheduler(Scheduler):
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
+            request = self.requests.get(req_id)
+            if request is not None:
+                request.num_in_flight_tokens -= num_tokens_scheduled
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
                 continue
-            request = self.requests.get(req_id)
             if request is None or request.is_finished():
                 # The request is already finished. This can happen if the
                 # request is aborted while the model is executing it (e.g.,

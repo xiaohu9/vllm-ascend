@@ -1,16 +1,20 @@
-# Prefill-Decode Disaggregation (Deepseek)
+# Prefill-Decode Disaggregation (DeepSeek)
 
 ## Getting Started
 
 vLLM-Ascend now supports prefill-decode (PD) disaggregation with EP (Expert Parallel) options. This guide takes one-by-one steps to verify these features with constrained resources.
 
-Take the Deepseek-r1-w8a8 model as an example, use 4 Atlas 800T A3 servers to deploy the "2P1D" architecture. Assume the IP of the prefiller server is 192.0.0.1 (prefill 1) and 192.0.0.2 (prefill 2), and the decoder servers are 192.0.0.3 (decoder 1) and 192.0.0.4 (decoder 2). On each server, use 8 NPUs and 16 chips to deploy one service instance.
+Take the DeepSeek-r1-w8a8 model as an example, use 4 Atlas 800T A3 servers to deploy the "2P1D" architecture. Assume the IP of the prefiller server is 192.0.0.1 (prefill 1) and 192.0.0.2 (prefill 2), and the decoder servers are 192.0.0.3 (decoder 1) and 192.0.0.4 (decoder 2). On each server, use 8 NPUs and 16 chips to deploy one service instance.
+
+```{warning}
+This limitation applies to models with a DeepSeek-V3.2-style architecture that use the Sparse Flash Attention (SFA) backend, such as DeepSeek-V3.2, GLM-5.1, and GLM-5.2. When using Decode Context Parallelism (DCP) with these models, enable it on both the prefiller and decoder nodes, or disable it on both. Enabling DCP on only one side can cause known accuracy issues.
+```
 
 ## Verify Multi-Node Communication Environment
 
 ### Physical Layer Requirements
 
-- The physical machines must be located on the same WLAN, with network connectivity.
+- The physical machines must be located on the same LAN, with network connectivity.
 - All NPUs must be interconnected. Intra-node connectivity is via HCCS, and inter-node connectivity is via RDMA.
 
 ### Verification Process
@@ -26,7 +30,7 @@ Execute the following commands on each node in sequence. The results must all be
 
     ```bash
     # Check the remote switch ports
-    for i in {0..15}; do hccn_tool -i $i -lldp -g | grep Ifname; done 
+    for i in {0..15}; do hccn_tool -i $i -lldp -g | grep Ifname; done
     # Get the link status of the Ethernet ports (UP or DOWN)
     for i in {0..15}; do hccn_tool -i $i -link -g ; done
     # Check the network health status
@@ -173,7 +177,7 @@ docker run --rm \
 
 ## Install Mooncake
 
-Mooncake is the serving platform for Kimi, a leading LLM service provided by Moonshot AI.Installation and Compilation Guide: <https://github.com/kvcache-ai/Mooncake?tab=readme-ov-file#build-and-use-binaries>
+Mooncake is the serving platform for Kimi, a leading LLM service provided by Moonshot AI. Installation and Compilation Guide: <https://github.com/kvcache-ai/Mooncake?tab=readme-ov-file#build-and-use-binaries>
 First, we need to obtain the Mooncake project. Refer to the following command:
 
 ```shell
@@ -247,6 +251,26 @@ Use `launch_online_dp.py` to launch external dp vllm servers.
 Modify `run_dp_template.sh` on each node.
 [run_dp_template.sh](https://github.com/vllm-project/vllm-ascend/blob/main/examples/external_online_dp/run_dp_template.sh)
 
+`launch_online_dp.py` starts `dp-size-local` vLLM instances and passes seven positional arguments to `run_dp_template.sh`. The examples below correspond to [Start the service](#start-the-service).
+
+| Launcher option | Template value | Meaning | Example value | Constraints |
+| --- | --- | --- | --- | --- |
+| `--dp-size` | `$3` / `--data-parallel-size` | Total DP ranks in the group. | P: `2`; D: `32` | Positive integer; identical within the same group. Total ranks must cover `[0, dp-size)` without overlap. |
+| `--tp-size` | `$7` / `--tensor-parallel-size` | NPUs used by each instance. | P: `8`; D: `1` | Positive integer; `dp-size-local * tp-size` must not exceed available NPUs on the node.|
+| `--dp-size-local` | Number of template invocations | DP instances on this node. | P: `2`; D: `16` | If set to `-1`, it defaults to `dp-size`. Otherwise, `1 <= dp-size-local <= dp-size`.|
+| `--dp-rank-start` | `$4` / `--data-parallel-rank` = `dp-rank-start + i` | First DP rank on this node. | P: `0`; D: `0` or `16` | Non-negative integer; the assigned rank range must be within `dp-size` and not overlap. |
+| `--dp-address` | `$5` / `--data-parallel-address` | DP master address. | P: `192.0.0.1` or `192.0.0.2`; D: `192.0.0.3` | The IP address must be reachable and identical within the same DP group. |
+| `--dp-rpc-port` | `$6` / `--data-parallel-rpc-port` | DP master RPC port. | `12321` | Free, reachable port; identical within a DP group. |
+| `--vllm-start-port` | `$2` / `--port` = `vllm-start-port + i` | First local API port. | `7100`, then `7101`, ... | Consecutive free ports; must match the proxy configuration. |
+| Computed by the launcher | `$1` / `ASCEND_RT_VISIBLE_DEVICES` | NPU IDs assigned to each instance. | P: `0,...,7`, `8,...,15`; D: `0` through `15` | IDs must exist and not overlap; non-contiguous IDs require adapting the launcher. |
+
+> **Note**:
+>
+> - The launcher validates only argument types and required options. Check the remaining constraints before deployment.
+> - If speculative decoding is enabled, `num_speculative_tokens` should be subject to one of the following conditions:
+>   1. Hybrid Mamba models (e.g., Qwen-Next and Qwen3.5 series): `num_speculative_tokens` should be equal on P nodes and D nodes.
+>   2. Other models: `num_speculative_tokens` on P nodes should be 1, and `num_speculative_tokens` on D nodes should be greater or equal to 1.
+
 #### Layerwise
 
 :::::{tab-set}
@@ -290,7 +314,7 @@ vllm serve /path_to_weight/DeepSeek-r1_w8a8_mtp \
   --quantization ascend \
   --no-enable-prefix-caching \
   --speculative-config '{"num_speculative_tokens": 1, "method":"deepseek_mtp"}' \
-  --additional-config '{"recompute_scheduler_enable":true,"enable_shared_expert_dp": true}' \
+  --additional-config '{"enable_shared_expert_dp": true}' \
   --kv-transfer-config \
   '{"kv_connector": "MooncakeLayerwiseConnector",
   "kv_role": "kv_producer",
@@ -348,7 +372,7 @@ vllm serve /path_to_weight/DeepSeek-r1_w8a8_mtp \
   --quantization ascend \
   --no-enable-prefix-caching \
   --speculative-config '{"num_speculative_tokens": 1, "method":"deepseek_mtp"}' \
-  --additional-config '{"recompute_scheduler_enable":true,"enable_shared_expert_dp": true}' \
+  --additional-config '{"enable_shared_expert_dp": true}' \
   --kv-transfer-config \
   '{"kv_connector": "MooncakeLayerwiseConnector",
   "kv_role": "kv_producer",
@@ -469,7 +493,7 @@ vllm serve /path_to_weight/DeepSeek-r1_w8a8_mtp \
   "kv_role": "kv_consumer",
   "kv_port": "36200",
   "kv_connector_extra_config": {
-            
+
             "prefill": {
                     "dp_size": 2,
                     "tp_size": 8
@@ -529,7 +553,7 @@ vllm serve /path_to_weight/DeepSeek-r1_w8a8_mtp \
   --quantization ascend \
   --no-enable-prefix-caching \
   --speculative-config '{"num_speculative_tokens": 1, "method":"deepseek_mtp"}' \
-  --additional-config '{"recompute_scheduler_enable":true,"enable_shared_expert_dp": true}' \
+  --additional-config '{"enable_shared_expert_dp": true}' \
   --kv-transfer-config \
   '{"kv_connector": "MooncakeConnectorV1",
   "kv_role": "kv_producer",
@@ -587,7 +611,7 @@ vllm serve /path_to_weight/DeepSeek-r1_w8a8_mtp \
   --quantization ascend \
   --no-enable-prefix-caching \
   --speculative-config '{"num_speculative_tokens": 1, "method":"deepseek_mtp"}' \
-  --additional-config '{"recompute_scheduler_enable":true,"enable_shared_expert_dp": true}' \
+  --additional-config '{"enable_shared_expert_dp": true}' \
   --kv-transfer-config \
   '{"kv_connector": "MooncakeConnectorV1",
   "kv_role": "kv_producer",
@@ -857,14 +881,20 @@ python load_balance_proxy_server_example.py \
 
 :::::
 
-|Parameter  | meaning |
-| --- | --- |
-| --port | Proxy service Port |
-| --host | Proxy service Host IP|
-| --prefiller-hosts | Hosts of prefiller nodes |
-| --prefiller-ports | Ports of prefiller nodes |
-| --decoder-hosts | Hosts of decoder nodes |
-| --decoder-ports | Ports of decoder nodes |
+Both proxies share the following backend options.
+
+| Parameter | Applies to | Default | Example value | Meaning and constraints |
+| --- | --- | --- | --- | --- |
+| `--port` | Both | `8000` | `1999` | Proxy listen port. Must be free, reachable, and between `1` and `65535`. |
+| `--host` | Both | `localhost` | `192.0.0.1` | Proxy listen address. Layerwise mode requires a non-wildcard address reachable by D nodes. |
+| `--prefiller-hosts` | Both | `localhost` | `192.0.0.1 192.0.0.1 192.0.0.2 192.0.0.2` | P-instance hosts. Count must equal the number of `--prefiller-ports`. |
+| `--prefiller-ports` | Both | `8001` | `7100 7101 7100 7101` | P-instance ports. Each host-port pair must be unique and reachable. |
+| `--decoder-hosts` | Both | `localhost` | Sixteen `192.0.0.3`, then sixteen `192.0.0.4` | D-instance hosts. Count must equal the number of `--decoder-ports`. |
+| `--decoder-ports` | Both | `8002` | `7100`-`7115` for each D host | D-instance ports. Each host-port pair must be unique and reachable. |
+
+> **Note**
+>
+> The proxy scripts validate that each host list has the same length as its corresponding port list.
 
 You can get the proxy program in the repository's examples, [load\_balance\_proxy\_server\_example.py](https://github.com/vllm-project/vllm-ascend/blob/main/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py)
 
@@ -887,7 +917,7 @@ unset https_proxy
 ```
 
 - You can place your datasets in the dir: `benchmark/ais_bench/datasets`
-- You can change the configuration in the dir :`benchmark/ais_bench/benchmark/configs/models/vllm_api` Take the ``vllm_api_stream_chat.py`` for example
+- You can change the configuration in the dir :`benchmark/ais_bench/benchmark/configs/models/vllm_api` Take the `vllm_api_stream_chat.py` for example
 
 ```python
 models = [
@@ -913,7 +943,7 @@ models = [
 ]
 ```
 
-- Take gsm8k dataset for example, execute the following commands  to assess performance.
+- Take gsm8k dataset for example, execute the following commands to assess performance.
 
 ```shell
 ais_bench --models vllm_api_stream_chat --datasets gsm8k_gen_0_shot_cot_str_perf  --debug  --mode perf

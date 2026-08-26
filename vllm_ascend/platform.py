@@ -44,9 +44,11 @@ from vllm_ascend.utils import (
     AscendDeviceType,
     bootstrap_custom_op_env,
     check_kv_extra_config,
+    enable_sfa_dcp_replicated_indexer,
     flashcomm2_enable,
     get_ascend_device_type,
     is_moe_model,
+    model_uses_sfa_sparse,
     refresh_block_size,
     update_cudagraph_capture_sizes,
     is_310p,
@@ -513,8 +515,8 @@ class NPUPlatform(Platform):
         from vllm.config.compilation import CUDAGraphMode
 
         if ascend_config.xlite_graph_config.enabled:
-            if ascend_config.xlite_graph_config.full_mode:
-                logger.info("ACLGraph is disabled under xlite full mode")
+            if ascend_config.xlite_graph_config.full_mode and vllm_config.speculative_config is None:
+                logger.info("ACLGraph has been disabled when speculation is disabled in xlite full mode")
                 enforce_eager = True
                 model_config.enforce_eager = True
                 compilation_config.cudagraph_mode = CUDAGraphMode.NONE
@@ -546,6 +548,7 @@ class NPUPlatform(Platform):
         # is supported by vllm-ascend.
         if (
             vllm_config.parallel_config.tensor_parallel_size > 1
+            and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
             and not vllm_config.model_config.enforce_eager
             and enable_sp(vllm_config)
         ):
@@ -590,6 +593,9 @@ class NPUPlatform(Platform):
         if compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
             compilation_config.mode = CompilationMode.NONE
             ascend_config.ascend_compilation_config.enable_npugraph_ex = False
+            ascend_config.ascend_compilation_config.enable_static_kernel = False
+            vllm_config.additional_config["ascend_compilation_config"]["enable_npugraph_ex"] = False
+            vllm_config.additional_config["ascend_compilation_config"]["enable_static_kernel"] = False
         elif compilation_config.cudagraph_mode.requires_piecewise_compilation():
             # Our is_cuda_alike is False so we cannot reuse the assertion of upstream
             assert compilation_config.mode == CompilationMode.VLLM_COMPILE, (
@@ -618,6 +624,9 @@ class NPUPlatform(Platform):
             if get_ascend_device_type() == AscendDeviceType.A5:
                 prune_capture_sizes_for_950(vllm_config)
             ascend_config.ascend_compilation_config.enable_npugraph_ex = False
+            ascend_config.ascend_compilation_config.enable_static_kernel = False
+            vllm_config.additional_config["ascend_compilation_config"]["enable_npugraph_ex"] = False
+            vllm_config.additional_config["ascend_compilation_config"]["enable_static_kernel"] = False
         elif compilation_config.cudagraph_mode.has_full_cudagraphs():
             # We don't want to have our FX graph split for the sake of static kernel feature,
             # because it will compile multiple times, so we set splitting_ops to empty manually.
@@ -629,6 +638,9 @@ class NPUPlatform(Platform):
             compilation_config.cudagraph_mode = CUDAGraphMode.NONE
             compilation_config.mode = CompilationMode.NONE
             ascend_config.ascend_compilation_config.enable_npugraph_ex = False
+            ascend_config.ascend_compilation_config.enable_static_kernel = False
+            vllm_config.additional_config["ascend_compilation_config"]["enable_npugraph_ex"] = False
+            vllm_config.additional_config["ascend_compilation_config"]["enable_static_kernel"] = False
 
         # TODO: Remove this check when ACL Graph supports ASCEND_LAUNCH_BLOCKING=1
         # Then, we will have to discuss the error handling strategy and user experience
@@ -677,16 +689,25 @@ class NPUPlatform(Platform):
         if ascend_config.recompute_scheduler_enable:
             kv_transfer_config = vllm_config.kv_transfer_config
             kv_role = getattr(kv_transfer_config, "kv_role", None)
-            if kv_transfer_config is None or kv_role == "kv_both":
-                raise ValueError(
-                    "recompute_scheduler_enable can only be enabled in PD-disaggregated mode "
-                    "(kv_role='kv_producer' or 'kv_consumer'), and is not supported in PD-mixed mode."
+            if kv_role == "kv_producer":
+                logger.warning(
+                    "recompute_scheduler_enable is ignored on PD-disaggregated P nodes "
+                    "(kv_role='kv_producer') and will be deprecated on P nodes in a future release. "
+                    "Please remove it from P-node configs and keep it only on PD-disaggregated D nodes "
+                    "(kv_role='kv_consumer')."
                 )
+                ascend_config.recompute_scheduler_enable = False
+                vllm_config.additional_config["recompute_scheduler_enable"] = False
+            elif kv_transfer_config is None or kv_role != "kv_consumer":
+                raise ValueError(
+                    "recompute_scheduler_enable can only be enabled on PD-disaggregated D nodes "
+                    f"(kv_role='kv_consumer', but got kv_role={kv_role!r}), and is not supported in PD-mixed mode."
+                )
+            else:
+                from vllm_ascend.core.recompute_scheduler import RecomputeSchedulerConfig
 
-            from vllm_ascend.core.recompute_scheduler import RecomputeSchedulerConfig
-
-            recompute_scheduler_config = RecomputeSchedulerConfig.initialize_from_config(vllm_config)
-            vllm_config.scheduler_config = recompute_scheduler_config
+                recompute_scheduler_config = RecomputeSchedulerConfig.initialize_from_config(vllm_config)
+                vllm_config.scheduler_config = recompute_scheduler_config
 
         # Extend original scheduler_config to use SchedulerDynamicBatch.
         if ascend_config.SLO_limits_for_dynamic_batch != -1:
@@ -704,6 +725,21 @@ class NPUPlatform(Platform):
             import vllm_ascend.patch.platform.patch_profiling_chunk  # noqa
 
         cp_size = parallel_config.decode_context_parallel_size * parallel_config.prefill_context_parallel_size
+        use_sparse = model_uses_sfa_sparse(model_config)
+        sfa_dcp_replicated_indexer = enable_sfa_dcp_replicated_indexer(vllm_config)
+        if sfa_dcp_replicated_indexer:
+            if parallel_config.decode_context_parallel_size != parallel_config.tensor_parallel_size:
+                raise AssertionError(
+                    f"DCP for SFA is only supported when dcp_size({parallel_config.decode_context_parallel_size}) "
+                    f"== tp_size({parallel_config.tensor_parallel_size})."
+                )
+            enable_sparse_c8 = (ascend_config.enable_sparse_sfa_c8 or ascend_config.enable_sparse_li_c8) and use_sparse
+            if enable_sparse_c8 and get_ascend_device_type() == AscendDeviceType.A5:
+                raise NotImplementedError(
+                    "SFA DCP with sparse C8 cache is not supported on A5 yet. "
+                    "A5 uses the fused CKV quant sparse attention path, which needs a separate DCP LSE merge."
+                )
+
         if (
             vllm_config.kv_transfer_config is not None
             and cache_config.block_size != parallel_config.cp_kv_cache_interleave_size
@@ -715,14 +751,9 @@ class NPUPlatform(Platform):
                 "needs to be equal if use pcp or dcp > 1 in P/D disaggregate and kv pool scenario."
             )
 
-        use_sparse = (
-            model_config is not None
-            and model_config.hf_text_config is not None
-            and hasattr(model_config.hf_text_config, "index_topk")
-        )
         if use_sparse and cp_size > 1 and parallel_config.cp_kv_cache_interleave_size != cache_config.block_size:
             logger.warning_once(
-                "The current SFA's PCP&DCP implementation requires"
+                "The current SFA CP implementation requires "
                 f"cp_kv_cache_interleave_size({parallel_config.cp_kv_cache_interleave_size})"
                 f" == block_size({cache_config.block_size}). "
                 f"Override cp_kv_cache_interleave_size to {cache_config.block_size}."
@@ -937,7 +968,7 @@ class NPUPlatform(Platform):
         # compared to v1, v2's forward context lacks some fields, such as:
         # is_first_layer, prefetch_mlp_gate_up_proj, prefetch_mlp_gate_down_proj,
         # prefetch_mlp_enabled, model_instance, is_draft_model.
-        if not envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
+        if not vllm_config.use_v2_model_runner:
             return {}
 
         # is_draft_model will be removed later, so we set it to False temporarily.
@@ -1240,6 +1271,15 @@ class NPUPlatform(Platform):
                 )
                 vllm_config.compilation_config.use_inductor_graph_partition = False
 
+        # ==================== 11. VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS ====================
+        if envs_vllm.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS < 1836:
+            envs_vllm.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS = 3000
+            logger.info(
+                "The timeout interval of the HCCL operator is 1836s. Timeout in "
+                "seconds for execute_model RPC calls in multiprocessing must be "
+                "greater than 1836s, Set VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000"
+            )
+
     @classmethod
     def use_custom_op_collectives(cls) -> bool:
         return True
@@ -1247,3 +1287,9 @@ class NPUPlatform(Platform):
     @classmethod
     def manual_seed_all(cls, seed: int) -> None:
         pass
+
+    @classmethod
+    def register_custom_kv_cache_specs(cls, vllm_config: VllmConfig) -> None:
+        from vllm_ascend.core.kv_cache_interface import register_ascend_kv_cache_specs
+
+        register_ascend_kv_cache_specs()

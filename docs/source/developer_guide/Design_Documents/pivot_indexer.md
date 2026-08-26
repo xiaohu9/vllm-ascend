@@ -1,4 +1,4 @@
-# PIVOT-Refine Indexer 设计文档(修订 v3.4.8)
+# PIVOT-Refine Indexer 设计文档(修订 v3.4.9)
 
 > 复现论文 [PIVOT: Efficient Query-Group Indexing for Token-Level Sparse Attention](https://arxiv.org/abs/2607.24593)
 > 的 PIVOT-Refine 方案,作为原生 SFA indexer 的 decode 路径 drop-in 替换,通过开关控制。
@@ -35,6 +35,7 @@
 | **v3.4.6** | **两项用户决策(2026-08-25)**:①**环境变量再自动化**--删 `VLLM_ASCEND_PIVOT_CANDIDATE_COUNT`(总预算 = 2048 是算子原生上限,固化为 `pivot_indexer.py` 模块常量 `_CANDIDATE_BUDGET=2048`)与 `VLLM_ASCEND_PIVOT_WINDOW_SIZE`(W 恒自动 = g = 草稿数+1,无需配置);envs.py 最终只 +2 个变量(总开关 + topk)。②**派生元信息提升**--`counts/group_start/req_ids/positions_q` 提升到 `AscendSFAMetadata._build` 一次性计算(decode 态才算,其余路径零开销),PIVOT 分支直接读字段,消除 select_topk 内每步重复推导(§6) |
 | **v3.4.5** | **两项用户决策(2026-08-25)**:①**删 `VLLM_ASCEND_PIVOT_WINDOW_KEEP`**--scored 联合竞争为**唯一语义,不设回退开关**;envs.py 最终只 +4 个变量。②**语义再确认**:计算 C 时代理扫描**不涉及 W 的 kv cache**(C 宽 = 总预算-W 仅是宽度预算),每个 query 在 refine 时并入**自身**的 W_t -> C∪W_t 联合 -> top-512;W 的 key 只在 query 级出现一次(§4.2-4/§4.4) |
 | **v3.4.8** | **新增 §4.1.1 端到端时序图**(用户需求 2026-08-25):Mermaid sequenceDiagram 展示"元信息提升(每步 1 次)-> 每层 PIVOT 分支(代理扫描 + refine)-> SFA 消费"全链路,节点挂 file:line;附**图读法**与 **PPT 半页落地价值素材**(§4.1.1 末) |
+| **v3.4.9(本版)** | **A3 穿刺版双路径支持(用户需求 2026-08-25)**:穿刺版在 **A3(910B/C,`BaseDeviceAdaptor`)** 上测 **GLM-5.2-w4a8c16** -- `enable_sparse_li_c8` 关闭、走 **BF16 索引器路径**(raw BF16 q/k,无 hadamard/quant/scale)。代码严格修改:①**删除 C8-only `NotImplementedError` guard**;②路径判据 = `sfa_impl.enable_sparse_li_c8`(与原生 dispatch 同 flag):C8 走量化索引器 + refine 反量化,**BF16 走 `torch_npu.npu_lightning_indexer`**(与 BaseDeviceAdaptor:618 非 C8 分支、A5DeviceAdaptor:1938 逐字节一致,query=R 代理、sparse_count=2048-W、key_len=L),refine 直接 `Σ_h w·ReLU(q·k)` on **raw q·raw k**(与原生 BF16 op 同式、无 dequant);③**C8 代理扫描设备感知**--A5=`torch_npu.npu_quant_lightning_indexer`(device_op.py:1921),非 A5=`torch.ops._C_ascend.npu_lightning_indexer_quant`(device_op.py:601,逐字节一致);④q_li 归一:C8=[N_in*H,D]+scale、BF16=[N_in,H,D] raw 均切片到 [:N] 实 token;⑤UT 新增 BF16 套件 6 项(稠密 parity/代理域/窗口召回/空前缀/padding 行/宽度 pad),本地冒烟 **24 项全过**(17 C8 + 7 BF16);新增 §4.6 双路径说明、§6/§8 同步 |
 
 ---
 
@@ -42,10 +43,11 @@
 
 - **唯一目标**:decode 阶段的 indexer 选择流程优化。**不实现 prefill 阶段设计**(用户明确)。
 - **落地模型**:GLM-5.2-w4a4c8(模型类型 `glm_moe_dsa`)。带 **C8 FP8 KV cache**(A5 e4m3)。
+  **【v3.4.9】穿刺版在 A3 上测 GLM-5.2-w4a8c16(非 C8)**,PIVOT 同时支持 C8 与 BF16 索引器路径(§4.6)。
 - **执行路径**:原生 SFA 路径。调用链:
   `AscendSFAImpl.indexer_select_post_process`([sfa_v1.py:1483](A5/vllm-ascend/vllm_ascend/attention/sfa_v1.py#L1483))
-  → `DeviceOperator.indexer_select_post_process`([device_op.py:1896](A5/vllm-ascend/vllm_ascend/device/device_op.py#L1896))
-  → `torch_npu.npu_quant_lightning_indexer`(C8 分支,device_op.py:1921)。
+  → `DeviceOperator.indexer_select_post_process`(C8 分支 device_op.py:601 = `torch.ops._C_ascend.npu_lightning_indexer_quant`(非 A5)/ device_op.py:1921 = `torch_npu.npu_quant_lightning_indexer`(A5);
+  **非 C8 分支 device_op.py:618/1938 = `torch_npu.npu_lightning_indexer`**(raw BF16))。
   **排除** dsa_offload 路径(LIDU 增量索引器):LIDU 是增量 top-K 维护、非全前缀扫描,PIVOT 论文
   算法在结构上不适用;且 `bind_dsa_offload_context` 对 C8 硬拒。
 - **投机解码**:带 MTP,decode 分组 g = d + 1(主 token + d 个 MTP draft)。分组落在
@@ -477,6 +479,33 @@ C 宽 = 2048 - W。
 
 ---
 
+### 4.6 双路径支持:C8 与 BF16(非 C8)索引器【v3.4.9】
+
+A3 穿刺版模型 GLM-5.2-w4a8c16 的 `enable_sparse_li_c8` 关闭,走原生 **BF16 索引器路径**。
+`PivotIndexer.select_topk` 以 `sfa_impl.enable_sparse_li_c8` 为判据(**与原生 dispatch 同一个 flag**),
+两条路径在"元信息提升 / 组均值代理 / 联合 top-k / 图安全"上完全共享,差异仅在 **代理扫描的算子形态**
+与 **refine 的 key 反量化**:
+
+| 环节 | C8 路径(量化索引器缓存) | BF16 路径(非 C8,如 w4a8c16) |
+|---|---|---|
+| 输入形态 | `q_li`[N_in*H,D] 量化 + `q_li_scale`[N_in*H] + `q_li_shape_ori`(sfa_v1.py:1614-1618) | `q_li`[N_in,H,D] raw BF16,`q_li_scale`/`q_li_shape_ori` = None(sfa_v1.py:1611-1613) |
+| 代理 q̄ 归一 | 反量化(Hadamard 域)→ 组均值 → `npu_dynamic_quant` 重量化 | raw 域组均值,无需重量化 |
+| 代理扫描 | **A5**:`torch_npu.npu_quant_lightning_indexer`(device_op.py:1921 逐字节)<br/>**非 A5(A3)**:`torch.ops._C_ascend.npu_lightning_indexer_quant`(device_op.py:601 逐字节),带 query/key_dequant_scale | `torch_npu.npu_lightning_indexer`(BaseDeviceAdaptor:618 非 C8 分支、A5DeviceAdaptor:1938 逐字节),**无 scale**,raw BF16 |
+| refine 打分 | gather C/W 的量化 key + per-token scale 反量化 → `Σ_h w·ReLU(q_dq·k_dq)`(BF16 反量化域) | gather raw BF16 key,**无 dequant**,直接 `Σ_h w·ReLU(q_raw·k_raw)`(与原生 BF16 op 打分同式) |
+| 打分域一致性 | 与原生 C8 算子内部反量化域一致(§4.4 依据) | 与原生 BF16 算子一致(raw 域) |
+| 输出 | 同 `[N_in,1,k]` + -1 终止符 + padding/宽度卫兵(§4.1.1) | 完全相同 |
+
+**事实核查依据(v3.4.9)**:①非 C8 时 `q_li = wq_b(q_c)` → `view(-1, n_head, head_dim)` → rope 后为
+raw BF16 [N,H,D](sfa_v1.py:1596-1609),无 hadamard/quant;②原生非 C8 索引器 = `torch_npu.npu_lightning_indexer`
+(BaseDeviceAdaptor:618 在 `use_torch_npu_lightning_indexer=True` 时,`glm_moe_dsa` 恒真 sfa_v1.py:722-725;
+A5DeviceAdaptor:1938 无条件同调用);③A3 归属 `BaseDeviceAdaptor`(get_device_adaptor() 仅 A5/310P 特判,device_op.py:2112-2117);
+④C8 代理扫描在 A5 用 `torch_npu.npu_quant_lightning_indexer`、非 A5 用 `torch.ops._C_ascend.npu_lightning_indexer_quant`,
+与各自 adaptor 的 C8 分支逐字节一致(权重、scale 布局、quant_mode/layout/sparse 参数全同)。
+
+**UT/冒烟覆盖(v3.4.9)**:BF16 套件验证稠密 parity(L≤c 时 C∪W=全前缀 → 逐行一致)、代理 key_len=L 且
+sparse_count=2048-W、窗口召回草稿 key、空前缀、graph padding 行 -1、index_cache 宽度 pad;本地冒烟
+24 项全过(C8 17 + BF16 7)。
+
 ## 5. 入图(graph-mode)兼容性分析
 
 ### 5.1 capture 硬约束 → 设计映射
@@ -538,18 +567,21 @@ gather/matmul/relu/topk/masked_fill(标准 aclrt 算子或生产先例,§4.4),�
 |---|---|
 | `vllm_ascend/envs.py` | +2 环境变量(§4.5;仅 ENABLE+TOPK;POOLING/REFINE_CHUNK/WINDOW_KEEP/CANDIDATE_COUNT/WINDOW_SIZE 已删,用户决策) |
 | `vllm_ascend/attention/sfa_v1.py` | `AscendSFAMetadata._build`(365)增加 PIVOT 派生元信息字段 `pivot_counts/pivot_group_start/pivot_req_ids/pivot_positions_q/pivot_window_pos/pivot_proxy_key_lens`(decode 态一次性计算,**复用 common_attn_metadata 现成字段**:counts/group_start 由 `query_start_loc[:R]` 给出(counts=cum_query_lens-query_start_loc),g 直接取 `decode_token_per_req`,positions_q 取 scheduler 权威 `positions[:num_actual_tokens]`(graph padding 之外的真实 token),window_pos = positions_q-(g-1-arange(g)) 且越界列=-1(W=g 自动),proxy_key_lens = seq_lens-counts = 组首 t0;门控=env 开 + decode_token_per_req>=2 + decode 态 + dsa_cp_context 为 None,不满足时字段全 None 零开销;每层 forward 直接读,不再逐层重算);`indexer_select_post_process`(1483)加 PIVOT 分支:仅判 `pivot_counts is not None`(单点真源,门控已在 _build 编码),`select_topk` 返回 None(g<2)则落回原生路径;输出 shape `[N_in,1,k]`(k=512,含 -1 终止符;按 num_actual_tokens 计算,padding 行补 -1 尾) |
-| `vllm_ascend/attention/pivot_indexer.py`(新) | `PivotIndexerConfig` + `PivotIndexer.select_topk(q_li, q_li_scale, weights, kv_cache, metadata)`;含 `_segment_mean_proxy`(固定 mean)、`_proxy_scan`(原生算子,R 个代理)、`_refine_topk`(torch 直通打分,§4.4)、`_gather_candidate_k`(C8 FP8+scale gather+反量化)、`_build_window`、use_index_cache 宽度对策(§4.4)、模块常量 `_CANDIDATE_BUDGET=2048`(C∪W 总预算)+ `_REFINE_CHUNK=256`(分块粒度),均不入 envs;元信息直接读 metadata 派生字段(§6 sfa_v1 行) |
-| `tests/ut/attention/a2/test_pivot_indexer.py`(新) | 对照稠密参考索引器(纯 torch,同一打分公式):top-512 集合一致率、坐标 0-based 断言、窗口联合竞争与去重、短前缀、MTP 分组(主 forward 每请求 1+d query)、多请求、C8 反量化域一致性、分块一致性 |
+| `vllm_ascend/attention/pivot_indexer.py`(新) | `PivotIndexer.select_topk(q_li, q_li_scale, q_li_shape_ori, weights, kv_cache, metadata)`;**双路径(§4.6,v3.4.9)**:判据 `sfa_impl.enable_sparse_li_c8` -- C8 走量化索引器(A5=`torch_npu.npu_quant_lightning_indexer` / 非 A5=`torch.ops._C_ascend.npu_lightning_indexer_quant`,设备感知)+ refine 反量化;**BF16 走 `torch_npu.npu_lightning_indexer`**(raw q/k,无 scale)+ refine raw 打分;含 `_segment_mean_proxy`(固定 mean)、`_refine_topk`(torch 直通打分,§4.4)、C/W key gather(FP8+scale 或 raw BF16)、use_index_cache 宽度对策(§4.4)、模块常量 `_CANDIDATE_BUDGET=2048`(C∪W 总预算)+ `_REFINE_CHUNK=256`(分块粒度),均不入 envs;元信息直接读 metadata 派生字段(§6 sfa_v1 行);g<2 返回 None 回退原生 |
+| `tests/ut/attention/a2/test_pivot_indexer.py`(新) | 对照稠密参考索引器(纯 torch,同一打分公式):top-512 集合一致率、坐标 0-based 断言、窗口联合竞争与去重、短前缀、MTP 分组(主 forward 每请求 1+d query)、多请求、C8 反量化域一致性、分块一致性;**【v3.4.9】新增 BF16(非 C8)套件 6 项**(稠密 parity / 代理域 key_len=L / 窗口召回 / 空前缀 / padding 行 / 宽度 pad),mock 覆盖 `npu_quant_lightning_indexer` 与 `npu_lightning_indexer` 双算子,`get_ascend_device_type` 钉 A5 验证设备感知 C8 分支 |
 
 ## 7. 验证计划
 
 - **UT(本机,无 NPU)**:PIVOT 输出与稠密参考索引器(同打分公式 `Σ_h w[h]·ReLU(q[h]·k)`,
-  BF16 反量化域)对比:组内 query **top-512 集合一致率**(决定正确性)、短前缀(=稠密)等价、
+  C8=BF16 反量化域 / BF16=raw 域)对比:组内 query **top-512 集合一致率**(决定正确性)、短前缀(=稠密)等价、
   窗口联合竞争(草稿 key 入选/落选双向)、C∪W 去重(输出无重复位置)、C8 反量化域一致性(量化误差容差内)、`att` 分块一致性、k=512/W 边界、序列开头窗口越界列 = -1。
   构造 MTP 分组 batch(TND,每请求 g 个 query)验证 `_segment_mean_proxy` 与逐 query refine。
+  **【v3.4.9】双路径套件**:C8 与 BF16(非 C8)各跑同一组断言(稠密 parity / 代理域 / 窗口召回 / 空前缀 / padding 行 / 宽度 pad),本地冒烟 24 项全过。
 - **NPU(迁节点)**:代理扫描(原生算子,R 个代理)+ torch 直通 refine;重点验证
   **k=512 宽度 topk_indices 被 `npu_sparse_flash_attention` 正常消费**(-1 终止符逐行)、
   use_index_cache 路径无脏索引(§4.4 坑);对照稠密 DSA 的精度与 token 级正确性;验证 V1(①-⑥)/V4(V2 已静态核实;V3 见图模式项)。
+  **A3 穿刺版重点**:BF16 路径代理扫描(`torch_npu.npu_lightning_indexer`,R 代理)在 910B/C 上与原生
+  逐字节同调用形态(仅 query 数/宽度不同),E2E 对比开关前后精度与 token 级正确性。
 - **图模式**:capture `cudagraph_mode=FULL`(decode),验证 V3(refine 的 torch topk/matmul 录制)
   ;对比 eager 输出的逐位一致性。
 
@@ -569,6 +601,8 @@ gather/matmul/relu/topk/masked_fill(标准 aclrt 算子或生产先例,§4.4),�
    §3.3-6);草稿步 1..d(g=1 + skip_topk)不适用。若后续要独立优化草稿步,另行评估。
 6. **代理均值量化域(V4)**:C8 下代理的量化方式可能引入小的 top-c 集差异;若 V4 不通过,
    退路是全 BF16 代理路径(POOLING 已删,mean 为唯一池化,用户决策 2026-08-25)。
+   **【v3.4.9】BF16 路径(§4.6)本身就是"raw 域代理 + 无重量化"的形态**,天然规避 V4 的
+   量化域差异 -- A3 穿刺版(w4a8c16)即走此路径,C8 路径仅 A5(w4a4c8)继续使用。
 7. **性能核算**:代理扫描降为每请求 1 次(scan 次数 ÷ (1+d));refine 的 C 打分在 torch 层
    (batched bmm `R·(g·H)·c·D` FLOPs + `[R,g*H,c]` 中间物化,§4.4-②)+ `[R,c,D]` 候选 gather。
    总索引成本 ≈ `R·L(代理算子) + R·c·D(gather) + R·g·H·c·D(torch 打分)`,对比基线 `N·L = R·g·L`。

@@ -6,12 +6,24 @@ replacement of the per-query full-prefix indexer scan on MTP decode
 batches:
 
   1. mean-proxy: per-request mean of the g = 1+d indexer queries.
-  2. proxy scan: one ``npu_quant_lightning_indexer`` call with R proxy
-     queries (C width = budget - W, so C∪W equals the 2048 budget; the
-     scan key length is ``seq_lens - counts``, i.e. the C domain never
-     contains this step's MTP keys).
+  2. proxy scan: one indexer call with R proxy queries (C width =
+     budget - W, so C∪W equals the 2048 budget; the scan key length is
+     ``seq_lens - counts``, i.e. the C domain never contains this step's
+     MTP keys).
   3. torch refine: joint C∪W_t scoring per query (same formula and
-     dequant domain as the operator) followed by a joint top-k.
+     scoring domain as the operator) followed by a joint top-k.
+
+Two indexer paths are supported, mirroring the native dispatch in
+``DeviceOperator.indexer_select_post_process``:
+
+  * ``enable_sparse_li_c8`` -- quantized indexer cache (GLM-5.2-w4a4c8):
+    proxy re-quantized and scanned by the quant indexer, refine
+    dequantizes keys (device-aware: ``npu_quant_lightning_indexer`` on
+    A5, the registered quant op elsewhere).
+  * BF16 indexer cache (non-C8, e.g. GLM-5.2-w4a8c16 on A3): raw BF16
+    q/k, proxy scanned by ``torch_npu.npu_lightning_indexer``, refine
+    scores raw q . raw k -- exactly the formula the native BF16 op
+    computes (doc v3.4.9).
 
 Derived quantities are NOT env knobs (user decision, doc v3.4.6): the
 window W = g (draft_num + 1) and the C∪W budget = 2048 (native op
@@ -34,6 +46,7 @@ import torch_npu
 
 from vllm.logger import logger
 from vllm_ascend import envs
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 # C∪W total budget. 2048 is the native indexer hard limit
 # (SPARSE_LIMIT / TOPK_MAX_SIZE in tiling.cpp), so C width = 2048 - g.
@@ -46,14 +59,14 @@ _REFINE_CHUNK = 256
 
 
 class PivotIndexer:
-    """PIVOT-Refine top-k selection (V1 torch pass-through, C8 only)."""
+    """PIVOT-Refine top-k selection (V1 torch pass-through, C8 + BF16)."""
 
     @staticmethod
     def select_topk(
         sfa_impl,
         q_li: torch.Tensor,
-        q_li_scale: torch.Tensor,
-        q_li_shape_ori: tuple,
+        q_li_scale: torch.Tensor | None,
+        q_li_shape_ori: tuple | None,
         weights: torch.Tensor,
         kv_cache: tuple,
         attn_metadata,
@@ -64,15 +77,24 @@ class PivotIndexer:
         PIVOT switch is on and the batch is a grouped MTP decode batch.
         Returns None for ungrouped batches (g < 2); the caller then falls
         back to the native indexer path.
-        """
-        if not sfa_impl.enable_sparse_li_c8:
-            # V1 targets the C8 indexer path (GLM-5.2-w4a4c8). The BF16
-            # path keeps the native indexer.
-            raise NotImplementedError(
-                "PIVOT-Refine V1 supports enable_sparse_li_c8 only."
-            )
 
-        N_in, H, D = q_li_shape_ori
+        The path discriminator is ``sfa_impl.enable_sparse_li_c8``, the same
+        flag the native dispatch uses (doc v3.4.9):
+
+        * C8 (quantized indexer cache): ``q_li`` is quantized [N_in*H, D]
+          with per-token ``q_li_scale`` and ``q_li_shape_ori`` set. The
+          proxy is re-quantized and scanned by the quant indexer
+          (device-aware: ``npu_quant_lightning_indexer`` on A5,
+          ``torch.ops._C_ascend.npu_lightning_indexer_quant`` elsewhere);
+          refine dequantizes keys from FP8/INT8 + per-token scale.
+        * BF16 (non-C8 indexer cache, e.g. GLM-5.2-w4a8c16 on A3): ``q_li``
+          is raw BF16 [N_in, H, D], ``q_li_scale``/``q_li_shape_ori`` are
+          None, keys are raw BF16 without scale. The proxy scan calls
+          ``torch_npu.npu_lightning_indexer`` and refine scores raw
+          q . raw k -- the exact formula the native BF16 op computes.
+        """
+        is_c8 = bool(getattr(sfa_impl, "enable_sparse_li_c8", False))
+
         # Real tokens only: graph batches pad num_input_tokens beyond
         # num_actual_tokens; padded rows get -1 output tails below.
         N = attn_metadata.num_actual_tokens
@@ -117,40 +139,89 @@ class PivotIndexer:
 
         device = q_li.device
 
-        # ---- 1. mean proxy (dequant -> segment mean -> requant) ----------
-        q_dq = q_li.view(N_in, H, D)[:N].to(torch.bfloat16) * q_li_scale.view(
-            N_in, H, 1
-        )[:N].to(torch.bfloat16)  # [N, H, D], Hadamard domain
+        # ---- 1. mean proxy (normalize -> segment mean -> requant) --------
+        if is_c8:
+            # Quantized indexer cache: q_li is [N_in*H, D] quantized with a
+            # per-token scale; dequant to the BF16 Hadamard domain.
+            N_in, H, D = q_li_shape_ori
+            q_dq = q_li.view(N_in, H, D)[:N].to(torch.bfloat16) * q_li_scale.view(
+                N_in, H, 1
+            )[:N].to(torch.bfloat16)  # [N, H, D], Hadamard domain
+        else:
+            # BF16 indexer cache: q_li is already raw BF16 [N_in, H, D]
+            # (no hadamard, no quant, no scale). Slice real rows only.
+            N_in, H, D = q_li.shape
+            q_dq = q_li[:N]
         q_bar, w_bar = _segment_mean(q_dq, weights[:N], group_start, counts)
-
-        # Requant the proxy exactly like the native q side (sfa_v1.py
-        # npu_dynamic_quant on [tokens*heads, D]).
-        q_bar_flat = q_bar.reshape(-1, D)
-        q_bar_q, q_bar_scale = torch_npu.npu_dynamic_quant(
-            q_bar_flat, dst_type=sfa_impl.c8_k_cache_dtype
-        )
-        q_bar_scale = q_bar_scale.to(sfa_impl.c8_k_scale_cache_dtype)
 
         # ---- 2. proxy scan (native op, R proxies, key len = t0) ----------
         packed_kv_cache = getattr(sfa_impl, "enable_sparse_sfa_c8", False)
         indexer_cache_idx = 1 if packed_kv_cache else 2
         indexer_scale_cache_idx = 2 if packed_kv_cache else 3
-        topk_candidates = torch_npu.npu_quant_lightning_indexer(
-            query=q_bar_q.view(R, H, D),
-            key=kv_cache[indexer_cache_idx],
-            weights=w_bar,
-            query_dequant_scale=q_bar_scale.view(R, H),
-            key_dequant_scale=kv_cache[indexer_scale_cache_idx].squeeze(2),
-            actual_seq_lengths_query=torch.arange(1, R + 1, dtype=torch.int32, device=device),
-            actual_seq_lengths_key=proxy_key_lens.to(torch.int32),
-            block_table=attn_metadata.block_table,
-            query_quant_mode=0,
-            key_quant_mode=0,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=c,
-            sparse_mode=3,
-        )
+        proxy_key_lens_i32 = proxy_key_lens.to(torch.int32)
+        arange_r = torch.arange(1, R + 1, dtype=torch.int32, device=device)
+        if is_c8:
+            # Requant the proxy exactly like the native q side (sfa_v1.py
+            # npu_dynamic_quant on [tokens*heads, D]).
+            q_bar_flat = q_bar.reshape(-1, D)
+            q_bar_q, q_bar_scale = torch_npu.npu_dynamic_quant(
+                q_bar_flat, dst_type=sfa_impl.c8_k_cache_dtype
+            )
+            q_bar_scale = q_bar_scale.to(sfa_impl.c8_k_scale_cache_dtype)
+            if get_ascend_device_type() == AscendDeviceType.A5:
+                # Byte-consistent with A5DeviceAdaptor.indexer_select_post_process
+                # (device_op.py:1921, the A5 quant path).
+                topk_candidates = torch_npu.npu_quant_lightning_indexer(
+                    query=q_bar_q.view(R, H, D),
+                    key=kv_cache[indexer_cache_idx],
+                    weights=w_bar,
+                    query_dequant_scale=q_bar_scale.view(R, H),
+                    key_dequant_scale=kv_cache[indexer_scale_cache_idx].squeeze(2),
+                    actual_seq_lengths_query=arange_r,
+                    actual_seq_lengths_key=proxy_key_lens_i32,
+                    block_table=attn_metadata.block_table,
+                    query_quant_mode=0,
+                    key_quant_mode=0,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=c,
+                    sparse_mode=3,
+                )
+            else:
+                # Byte-consistent with BaseDeviceAdaptor (device_op.py:601,
+                # non-A5 incl. A3): the registered quant op.
+                topk_candidates = torch.ops._C_ascend.npu_lightning_indexer_quant(
+                    query=q_bar_q.view(R, H, D),
+                    key=kv_cache[indexer_cache_idx],
+                    weights=w_bar,
+                    query_dequant_scale=q_bar_scale.view(R, H),
+                    key_dequant_scale=kv_cache[indexer_scale_cache_idx].squeeze(2),
+                    actual_seq_lengths_query=arange_r,
+                    actual_seq_lengths_key=proxy_key_lens_i32,
+                    block_table=attn_metadata.block_table,
+                    query_quant_mode=0,
+                    key_quant_mode=0,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=c,
+                    sparse_mode=3,
+                )
+        else:
+            # BF16 indexer path: raw BF16 q/k, no scales. Byte-consistent
+            # with the native non-C8 dispatch (BaseDeviceAdaptor:618 with
+            # use_torch_npu_lightning_indexer, and A5DeviceAdaptor:1938).
+            topk_candidates, _ = torch_npu.npu_lightning_indexer(
+                query=q_bar,
+                key=kv_cache[indexer_cache_idx],
+                weights=w_bar,
+                actual_seq_lengths_query=arange_r,
+                actual_seq_lengths_key=proxy_key_lens_i32,
+                block_table=attn_metadata.block_table,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=c,
+                sparse_mode=3,
+            )
         C = topk_candidates[:, 0, :]  # [R, c], 0-based, causally clean
 
         # ---- 3. refine: joint C∪W_t scoring + joint top-k ---------------
@@ -169,6 +240,7 @@ class PivotIndexer:
             k,
             W,
             N,
+            is_c8=is_c8,
         )
 
         # Graph padding guard (shape-based branch, capture-safe: N_in/N are
@@ -230,24 +302,33 @@ def _segment_mean(q_dq: torch.Tensor, weights: torch.Tensor, group_start, counts
 def _refine_topk(
     q_dq, weights, C, window_pos, positions_q, req_ids,
     kv_cache, indexer_cache_idx, indexer_scale_cache_idx,
-    block_table, block_size, k, W, N,
+    block_table, block_size, k, W, N, is_c8,
 ):
-    """Joint C∪W_t scoring with the operator's formula, then joint top-k."""
+    """Joint C∪W_t scoring with the operator's formula, then joint top-k.
+
+    Key gather/dequant mirrors the native path: C8 (``is_c8``) dequantizes
+    quantized keys with per-token scale; BF16 (non-C8) uses raw BF16 keys
+    with no scale, matching what ``npu_lightning_indexer`` scores.
+    """
     device = q_dq.device
     R, c = C.shape
 
-    k_cache = kv_cache[indexer_cache_idx]  # [B, S, 1, D] FP8 (N2 = 1)
+    k_cache = kv_cache[indexer_cache_idx]  # [B, S, 1, D] FP8/INT8 (c8) or BF16
     kc = k_cache.view(-1, k_cache.shape[-1])  # [B*S, D]
-    k_scale_flat = kv_cache[indexer_scale_cache_idx].squeeze(2).reshape(-1)  # [B*S]
+    if is_c8:
+        k_scale_flat = kv_cache[indexer_scale_cache_idx].squeeze(2).reshape(-1)  # [B*S]
 
     r = torch.arange(R, dtype=torch.int64, device=device)
     c_safe = C.clamp(min=0).to(torch.int64)  # -1 slots (short prefix) clamped for gather
     slots_c = (
         block_table[r.unsqueeze(1), c_safe // block_size] * block_size + c_safe % block_size
     )  # [R, c]
-    k_cand = kc[slots_c.reshape(-1)].view(R, c, -1)  # [R, c, D] FP8
-    k_scale = k_scale_flat[slots_c.reshape(-1)].view(R, c)
-    k_dq = k_cand.to(torch.bfloat16) * k_scale.to(torch.bfloat16).unsqueeze(-1)  # [R, c, D]
+    k_cand = kc[slots_c.reshape(-1)].view(R, c, -1)  # [R, c, D]
+    if is_c8:
+        k_scale = k_scale_flat[slots_c.reshape(-1)].view(R, c)
+        k_dq = k_cand.to(torch.bfloat16) * k_scale.to(torch.bfloat16).unsqueeze(-1)
+    else:
+        k_dq = k_cand.to(torch.bfloat16)  # raw BF16 keys, no scale
 
     # C-side scores: [N, c], chunked over R (_REFINE_CHUNK).
     score_c = _score_c_side(q_dq, weights, k_dq, req_ids, c)
@@ -258,8 +339,11 @@ def _refine_topk(
         block_table[req_ids.unsqueeze(1), w_safe // block_size] * block_size + w_safe % block_size
     )  # [N, W]
     k_win = kc[slots_w.reshape(-1)].view(N, W, -1)
-    s_win = k_scale_flat[slots_w.reshape(-1)].view(N, W)
-    k_win_dq = k_win.to(torch.bfloat16) * s_win.to(torch.bfloat16).unsqueeze(-1)
+    if is_c8:
+        s_win = k_scale_flat[slots_w.reshape(-1)].view(N, W)
+        k_win_dq = k_win.to(torch.bfloat16) * s_win.to(torch.bfloat16).unsqueeze(-1)
+    else:
+        k_win_dq = k_win.to(torch.bfloat16)
     att_w = torch.relu(
         torch.matmul(q_dq, k_win_dq.transpose(1, 2))
     )  # [N, H, W]

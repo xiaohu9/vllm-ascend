@@ -86,16 +86,63 @@ def _make_mock_lightning_indexer(records):
     return mock_op
 
 
+def _make_mock_bf16_indexer(records):
+    """Dense-reference stand-in for torch_npu.npu_lightning_indexer (BF16).
+
+    Same contract as the quant mock but on raw BF16 q/k with no dequant
+    scales -- mirrors the native non-C8 indexer.
+    """
+
+    def mock_op(
+        query,
+        key,
+        weights,
+        actual_seq_lengths_query,
+        actual_seq_lengths_key,
+        block_table,
+        sparse_count,
+        **kwargs,
+    ):
+        records.append(
+            {
+                "key_lens": actual_seq_lengths_key.clone(),
+                "sparse_count": int(sparse_count),
+            }
+        )
+        R = query.shape[0]
+        bs = key.shape[1]  # PA_BSND: [num_blocks, block_size, 1, D]
+        kc = key.reshape(-1, key.shape[-1])
+        bt = block_table.long()
+        out = torch.full((R, 1, sparse_count), -1, dtype=torch.int32)
+        for r in range(R):
+            length = int(actual_seq_lengths_key[r])
+            if length == 0:
+                continue
+            pos = torch.arange(length)
+            slots = bt[r, pos // bs] * bs + pos % bs
+            k_dq = kc[slots]  # [L, D] raw BF16, no scale
+            q_dq = query[r]  # [H, D] raw BF16, no scale
+            att = torch.relu(q_dq @ k_dq.T)  # [H, L]
+            score = (att * weights[r].to(torch.bfloat16).unsqueeze(-1)).sum(0)  # [L]
+            n = min(length, sparse_count)
+            top = torch.topk(score, n).indices
+            out[r, 0, :n] = pos[top].to(torch.int32)
+        return out, None
+
+    return mock_op
+
+
 class PivotCase:
     """Fixture builder for grouped MTP decode batches on CPU."""
 
-    def __init__(self, prefix_lens, g, seed=0, num_input_tokens=None):
+    def __init__(self, prefix_lens, g, seed=0, num_input_tokens=None, c8=True):
         torch.manual_seed(seed)
         self.g = g
         self.R = len(prefix_lens)
         self.N = self.R * g
         self.prefix_lens = torch.tensor(prefix_lens, dtype=torch.int64)
         self.num_input_tokens = num_input_tokens or self.N
+        self.c8 = c8
         N_in = self.num_input_tokens
 
         # Contiguous per-request key allocation: position p of request r
@@ -121,8 +168,14 @@ class PivotCase:
             self.k_scale,
         )
 
-        self.q_li = torch.randn(N_in * H, D, dtype=torch.bfloat16)
-        self.q_li_scale = torch.ones(N_in * H, dtype=torch.float32)
+        if c8:
+            # Quantized indexer cache: q_li is [N_in*H, D] + per-token scale.
+            self.q_li = torch.randn(N_in * H, D, dtype=torch.bfloat16)
+            self.q_li_scale = torch.ones(N_in * H, dtype=torch.float32)
+        else:
+            # BF16 indexer cache: q_li is raw [N_in, H, D], no scale.
+            self.q_li = torch.randn(N_in, H, D, dtype=torch.bfloat16)
+            self.q_li_scale = None
         self.weights = torch.rand(N_in, H, dtype=torch.bfloat16) + 0.5
 
         # Scheduler-authoritative positions: t0..t0+g-1 per request.
@@ -158,7 +211,7 @@ class PivotCase:
             pivot_proxy_key_lens=self.proxy_key_lens,
         )
         self.sfa_impl = SimpleNamespace(
-            enable_sparse_li_c8=True,
+            enable_sparse_li_c8=c8,
             enable_sparse_sfa_c8=False,
             c8_k_cache_dtype=torch.bfloat16,
             c8_k_scale_cache_dtype=torch.float32,
@@ -176,10 +229,15 @@ class PivotCase:
             pos = torch.arange(pos_q + 1)
             r = int(self.req_ids[n])
             slots = self.block_table[r, pos // BLOCK_SIZE] * BLOCK_SIZE + pos % BLOCK_SIZE
-            k_dq = (kc[slots].float() * ks[slots].unsqueeze(-1)).to(torch.bfloat16)
-            q_dq = self.q_li.view(self.num_input_tokens, H, D)[n] * self.q_li_scale.view(
-                self.num_input_tokens, H, 1
-            )[n].to(torch.bfloat16)
+            if self.c8:
+                k_dq = (kc[slots].float() * ks[slots].unsqueeze(-1)).to(torch.bfloat16)
+                q_dq = self.q_li.view(self.num_input_tokens, H, D)[n] * self.q_li_scale.view(
+                    self.num_input_tokens, H, 1
+                )[n].to(torch.bfloat16)
+            else:
+                # BF16: raw q/k, no dequant.
+                k_dq = kc[slots]
+                q_dq = self.q_li[n]
             att = torch.relu(q_dq @ k_dq.T)
             score = (att * self.weights[n].unsqueeze(-1)).sum(0)
             n_top = min(pos_q + 1, k)
@@ -200,14 +258,30 @@ class TestPivotIndexerSelectTopk(TestBase):
             "npu_quant_lightning_indexer",
             side_effect=_make_mock_lightning_indexer(self.records),
         )
+        self.bf16_indexer_patcher = patch.object(
+            pivot_mod.torch_npu,
+            "npu_lightning_indexer",
+            side_effect=_make_mock_bf16_indexer(self.records),
+        )
+        # C8 proxy-scan dispatch mirrors A5DeviceAdaptor on A5 hardware; pin
+        # the device stub so c8 cases exercise torch_npu.npu_quant_lightning_indexer.
+        self.device_patcher = patch.object(
+            pivot_mod,
+            "get_ascend_device_type",
+            return_value=pivot_mod.AscendDeviceType.A5,
+        )
         self.quant_patcher.start()
         self.indexer_patcher.start()
+        self.bf16_indexer_patcher.start()
+        self.device_patcher.start()
         self.env_patcher = patch.dict(os.environ, {"VLLM_ASCEND_PIVOT_TOPK": str(K)})
         self.env_patcher.start()
 
     def tearDown(self):
         self.quant_patcher.stop()
         self.indexer_patcher.stop()
+        self.bf16_indexer_patcher.stop()
+        self.device_patcher.stop()
         self.env_patcher.stop()
 
     def _select(self, case):
@@ -215,7 +289,7 @@ class TestPivotIndexerSelectTopk(TestBase):
             case.sfa_impl,
             case.q_li,
             case.q_li_scale,
-            (case.num_input_tokens, H, D),
+            (case.num_input_tokens, H, D) if case.c8 else None,
             case.weights,
             case.kv_cache,
             case.metadata,
@@ -290,11 +364,71 @@ class TestPivotIndexerSelectTopk(TestBase):
         out = self._select(case)
         self.assertIsNone(out)
 
-    def test_c8_only_guard(self):
-        case = PivotCase(prefix_lens=[10], g=2, seed=19)
-        case.sfa_impl.enable_sparse_li_c8 = False
-        with self.assertRaises(NotImplementedError):
-            self._select(case)
+    def test_bf16_path_dense_parity(self):
+        # BF16 (non-C8) indexer cache, e.g. GLM-5.2-w4a8c16 on A3: no
+        # quant/scale anywhere; refine scores raw q . raw k and must match
+        # the dense reference (L <= c covers the full prefix).
+        case = PivotCase(prefix_lens=[20, 24, 12], g=2, seed=19, c8=False)
+        out = self._select(case)
+        self.assertEqual(tuple(out.shape), (case.N, 1, K))
+        expected = case.dense_topk()
+        for n in range(case.N):
+            got = sorted(out[n, 0].tolist())
+            self.assertEqual(got, expected[n], f"row {n}")
+
+    def test_bf16_proxy_uses_bf16_indexer_and_clean_domain(self):
+        # The BF16 path must call torch_npu.npu_lightning_indexer (not the
+        # quant one), with key len L (no MTP keys in C) and width 2048 - W.
+        case = PivotCase(prefix_lens=[30, 40], g=3, seed=7, c8=False)
+        out = self._select(case)
+        self.assertEqual(len(self.records), 1)
+        self.assertTrue(
+            torch.equal(self.records[0]["key_lens"].long(), case.prefix_lens)
+        )
+        self.assertEqual(self.records[0]["sparse_count"], 2048 - case.g)
+        for n in range(case.N):
+            pos_q = int(case.positions_q[n])
+            for p in out[n, 0].tolist():
+                if p >= 0:
+                    self.assertLessEqual(p, pos_q)
+
+    def test_bf16_window_bring_draft_keys(self):
+        # Same window recall as C8: boosted draft keys must be selected.
+        case = PivotCase(prefix_lens=[30, 40], g=2, seed=11, c8=False)
+        for r in range(case.R):
+            L = int(case.prefix_lens[r])
+            for p in range(L, L + case.g):
+                slot = case.block_table[r, p // BLOCK_SIZE] * BLOCK_SIZE + p % BLOCK_SIZE
+                case.k_cache.view(-1, D)[slot] *= 100.0
+        out = self._select(case)
+        for n in range(case.N):
+            row = out[n, 0].tolist()
+            self.assertIn(int(case.positions_q[n]), row)
+
+    def test_bf16_empty_prefix(self):
+        case = PivotCase(prefix_lens=[0, 0], g=2, seed=13, c8=False)
+        out = self._select(case)
+        self.assertTrue(torch.equal(self.records[0]["key_lens"].long(), torch.zeros(2)))
+        expected = case.dense_topk()
+        for n in range(case.N):
+            got = sorted(out[n, 0].tolist())
+            self.assertEqual(got, expected[n], f"row {n}")
+
+    def test_bf16_graph_padding_rows(self):
+        case = PivotCase(prefix_lens=[20, 24], g=2, seed=29, num_input_tokens=6, c8=False)
+        out = self._select(case)
+        self.assertEqual(tuple(out.shape), (6, 1, K))
+        self.assertTrue(torch.equal(out[case.N :, 0], torch.full_like(out[case.N :, 0], -1)))
+
+    def test_bf16_use_index_cache_width_pad(self):
+        case = PivotCase(prefix_lens=[20, 24], g=2, seed=23, c8=False)
+        case.sfa_impl.use_index_cache = True
+        case.sfa_impl.topk_indices_buffer = torch.zeros(
+            case.num_input_tokens, 16, dtype=torch.int32
+        )
+        out = self._select(case)
+        self.assertEqual(tuple(out.shape), (case.N, 1, 16))
+        self.assertTrue(torch.equal(out[..., K:], torch.full_like(out[..., K:], -1)))
 
     def test_use_index_cache_width_pad(self):
         case = PivotCase(prefix_lens=[20, 24], g=2, seed=23)

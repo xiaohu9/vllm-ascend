@@ -12,6 +12,15 @@ mean-proxy coarse screen plus a per-query top-k refine over the candidates:
   3. refine      broadcast C to each query row, score with the native
                  formula, top-k (k = 2048)
 
+Mixed-batch routing (PD co-location): every batch is reordered to
+decode -> short_extend -> long_extend -> prefill
+(reorder_batch_to_split_decodes_and_prefills, driven by this backend's
+reorder_batch_threshold = 1 + num_speculative_tokens), so the decode
+requests form a contiguous HEAD of the batch. select_topk routes that head
+through PIVOT and runs the prefill tail through the native indexer, then
+concatenates -- decode requests get PIVOT in every step they appear in, not
+only in all-decode steps.
+
 Lossless contract: with L + g <= 2048 the refine output reproduces the whole
 prefix exactly; with L + g <= 4096 the coarse screen still returns the whole
 prefix, so refine only drops keys past 2048 by score. k is fixed at 2048 (the
@@ -20,10 +29,16 @@ deliberately no k knob.
 
 BF16 only: enable_sparse_li_c8 falls back to the native indexer.
 
-The caller (AscendSFAImpl.indexer_select_post_process) only enters this path
-for decode states, so g is uniform by construction and the group geometry is
-derived from the token/request counts without any device-side sync.
+Grouping is definitional: actual_seq_lengths_query is the cumulative
+per-request query-token count (vLLM v1 query_start_loc[1:]) that the native
+indexer and the sparse-attention kernel both use to group TND rows into
+requests. The segment split needs a few scalar device->CPU syncs (int()/bool()),
+acceptable in the eager decode path -- no graph capture.
 """
+
+from __future__ import annotations
+
+import dataclasses
 
 import torch
 
@@ -37,12 +52,32 @@ from vllm.logger import logger
 _COARSE_BUDGET = 4096
 _REFINE_BUDGET = 2048
 
+# Precision diagnostics compiled out: the lossless self-check walks every
+# output row with per-element int() device->CPU syncs (N x 2048 per call,
+# per layer, per step), which dominates decode step time. Flip to True on
+# the NPU box when a precision problem needs localizing; the three
+# PIVOT[dbg] log lines come back.
+_ENABLE_REPORT = False
+
+# A decode group carries 1 + num_speculative_tokens query rows, and the SFA
+# decode threshold is asserted <= 16 (TND layout limit), so a leading run
+# with per-request counts in [2, 16] can only be decode groups or
+# <= 16-token prefills. The latter are exactly reproducible under PIVOT
+# (their whole prefix fits the lossless window), so admitting them is safe.
+_MAX_GROUP = 16
+
 
 def _capturing() -> bool:
     try:
         return torch.npu.is_current_stream_capturing()
     except Exception:
         return False
+
+
+def _request_counts(cum: torch.Tensor) -> torch.Tensor:
+    """Per-request query-token counts from cumulative ends (query_start_loc[1:])."""
+    starts = torch.cat([torch.zeros(1, dtype=cum.dtype, device=cum.device), cum[:-1]])
+    return (cum - starts).to(torch.int64)
 
 
 class PivotIndexer:
@@ -57,12 +92,23 @@ class PivotIndexer:
         weights: torch.Tensor,
         kv_cache: tuple,
         attn_metadata,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        allow_whole_batch: bool = True,
     ) -> torch.Tensor | None:
         """Return topk_indices [N_in, 1, 2048] (0-based logical key positions).
 
-        Returns None when the batch is not a grouped decode batch (C8, g < 2,
-        or a ragged group layout); the caller then falls back to the native
-        indexer path.
+        Decode requests sit at the head of the batch (the engine reorders to
+        decode -> ... -> prefill), so the leading run of requests with a
+        uniform query count g is the decode segment: requests [0, K), query
+        rows [0, D). That segment runs through PIVOT; a non-empty prefill
+        tail runs through the native indexer and the results are
+        concatenated.
+
+        Returns None when the batch has no grouped decode head (C8, g < 2,
+        g > 16, or a uniform batch in a prefill state when the caller
+        disallows whole-batch PIVOT); the caller then falls back to the
+        native indexer for the whole batch.
         """
         if getattr(sfa_impl, "enable_sparse_li_c8", False):
             logger.warning_once(
@@ -71,49 +117,102 @@ class PivotIndexer:
             )
             return None
 
-        N = attn_metadata.num_actual_tokens
-        seq_lens = attn_metadata.seq_lens  # [R], == L + g at indexer time
-        R = seq_lens.shape[0]
-        if R == 0 or N < R:
+        cum = actual_seq_lengths_query  # [R], cumulative ends
+        seq_lens = actual_seq_lengths_key  # [R], == L + g at indexer time
+        R_all = cum.shape[0]
+        if R_all == 0:
             return None
-        g = N // R
-        if g < 2 or N % R != 0:
-            # Ungrouped decode (g == 1) or a ragged layout: nothing to
-            # amortize; fall back to the native per-query indexer.
+
+        N = attn_metadata.num_actual_tokens
+        if int(cum[-1]) != N:
+            # TND row count must match the last cumulative boundary; if not,
+            # the caller's grouping is not what we assume -- bail to native.
+            return None
+
+        counts = _request_counts(cum)  # [R]
+        g = int(counts[0])
+        if not 2 <= g <= _MAX_GROUP:
+            # Not a grouped-decode head (single-token decode, or a prefill
+            # leading the batch): nothing to amortize.
+            return None
+
+        # Decode segment: the leading run of requests carrying g query rows.
+        eq = counts == g
+        if bool(eq.all()):
+            K, D = R_all, N
+        else:
+            K = int((~eq).nonzero()[0, 0])  # first non-group request
+            D = int(cum[K - 1])
+
+        if K == R_all and not allow_whole_batch:
+            # A uniform batch in a prefill state is an all-prefill shape
+            # (needs prefix caching / chunked prefill to arise): PIVOT's
+            # proxy adds nothing there and could approximate past the
+            # lossless window, so keep it on the native indexer.
             return None
 
         device = q_li.device
         N_in = q_li.shape[0]
-        q_dq = q_li[:N]  # raw BF16 [N, H, D] (no hadamard/quant on this path)
+        q_dq = q_li[:D]  # raw BF16 [D, H, Dh] (no hadamard/quant on this path)
 
-        # ---- 1. mean proxy (segment mean over each request's g queries) ---
-        H, D = q_dq.shape[1], q_dq.shape[2]
-        q_bar = q_dq.view(R, g, H, D).mean(dim=1)  # [R, H, D]
-        w_bar = weights[:N].view(R, g, H).mean(dim=1)  # [R, H]
+        # ---- 1. mean proxy (segment mean over each request's g queries) --
+        H, Dh = q_dq.shape[1], q_dq.shape[2]
+        q_bar = q_dq.view(K, g, H, Dh).mean(dim=1)  # [K, H, Dh]
+        w_bar = weights[:D].view(K, g, H).mean(dim=1)  # [K, H]
 
-        # ---- 2. coarse screen: torch proxy scan, R rows -> 4096 ----------
+        # ---- 2. coarse screen: torch proxy scan, K rows -> 4096 ----------
         # Done in torch (not the native npu_lightning_indexer) so the
         # candidate superset is _COARSE_BUDGET (4096, the paper's number)
         # rather than the native 2048 sparse_count hard limit. Same score
         # formula (sum_h w_bar * relu(q_bar . k)) over the full [0, L+g)
         # prefix; the SFA attention kernel applies causality downstream.
         C = _coarse_screen(
-            q_bar, w_bar, kv_cache, attn_metadata.block_table,
-            attn_metadata.block_size, seq_lens,
+            q_bar, w_bar, kv_cache, attn_metadata.block_table[:K],
+            attn_metadata.block_size, seq_lens[:K],
         )
 
         # ---- 3. refine: broadcast C, score, top-k -------------------------
-        req_ids = torch.repeat_interleave(torch.arange(R, device=device), g)  # [N]
-        topk_indices = _refine_topk(
+        # Query row -> request id within the decode segment (the leading run
+        # is uniform, so this equals repeat_interleave(arange(K), g)).
+        req_ids = torch.repeat_interleave(
+            torch.arange(K, dtype=torch.int64, device=device), counts[:K]
+        )  # [D]
+        topk_dec = _refine_topk(
             q_dq,
-            weights[:N],
+            weights[:D],
             C,
             req_ids,
             kv_cache,
-            attn_metadata.block_table,
+            attn_metadata.block_table[:K],
             attn_metadata.block_size,
-            N,
+            D,
         )
+
+        if K == R_all:
+            topk_indices = topk_dec
+        else:
+            # Mixed batch: the prefill tail (requests [K, R_all), rows
+            # [D, N)) stays on the native indexer.
+            topk_indices = torch.cat(
+                [
+                    topk_dec,
+                    _native_indexer_tail(
+                        sfa_impl,
+                        q_li,
+                        q_li_scale,
+                        q_li_shape_ori,
+                        weights,
+                        kv_cache,
+                        attn_metadata,
+                        actual_seq_lengths_query,
+                        actual_seq_lengths_key,
+                        K,
+                        D,
+                        N,
+                    ),
+                ],
+                dim=0,
+            )
 
         # Graph padding guard: padded rows [N, N_in) get -1 tails so the
         # output row count matches the native path (num_input_tokens).
@@ -139,14 +238,60 @@ class PivotIndexer:
                 )
                 topk_indices = torch.cat([topk_indices, pad], dim=-1)
 
-        if not _capturing():
+        if _ENABLE_REPORT and not _capturing():
             try:
-                _report(seq_lens, C, topk_indices, N, R, g)
+                _report(seq_lens[:K], counts[:K], C, topk_indices, D, K, g, R_all, N)
             except Exception as e:  # diagnostics must never take down the decode path
                 logger.warning("PIVOT[dbg] _report failed: %s", e)
 
-        logger.debug("PIVOT refine: N=%d R=%d g=%d", N, R, g)
+        logger.debug(
+            "PIVOT refine: rows=%d/%d reqs=%d/%d g=%d", D, N, K, R_all, g
+        )
         return topk_indices
+
+
+def _native_indexer_tail(
+    sfa_impl,
+    q_li: torch.Tensor,
+    q_li_scale: torch.Tensor | None,
+    q_li_shape_ori: tuple | None,
+    weights: torch.Tensor,
+    kv_cache: tuple,
+    attn_metadata,
+    actual_seq_lengths_query: torch.Tensor,
+    actual_seq_lengths_key: torch.Tensor,
+    K: int,
+    D: int,
+    N: int,
+) -> torch.Tensor:
+    """Native indexer over the prefill tail: requests [K, R), rows [D, N).
+
+    The tail is a self-contained sub-batch: query rows [D, ...), cumulative
+    query lens rebased by -D, and the block table / key lens sliced to the
+    tail requests -- exactly what the native indexer would have received
+    for those requests alone.
+    """
+    # Imported lazily: vllm_ascend.device.device_op pulls torch_npu, which is
+    # absent on non-NPU hosts (CPU unit tests import this module with torch
+    # only).
+    from vllm_ascend.device.device_op import DeviceOperator
+
+    tail_meta = dataclasses.replace(
+        attn_metadata, block_table=attn_metadata.block_table[K:]
+    )
+    return DeviceOperator.indexer_select_post_process(
+        sfa_impl,
+        q_li[D:N],
+        q_li_scale,
+        q_li_shape_ori,
+        weights[D:N],
+        kv_cache,
+        tail_meta,
+        actual_seq_lengths_query[K:] - D,
+        actual_seq_lengths_key[K:],
+        getattr(sfa_impl, "enable_sparse_li_c8", False),
+        getattr(sfa_impl, "use_torch_npu_lightning_indexer", False),
+    )
 
 
 def _coarse_screen(
@@ -251,26 +396,32 @@ def _refine_topk(
 
 def _report(
     seq_lens: torch.Tensor,
+    counts: torch.Tensor,
     C: torch.Tensor,
     topk_indices: torch.Tensor,
-    N: int,
-    R: int,
+    D: int,
+    K: int,
     g: int,
+    R_all: int,
+    N: int,
 ) -> None:
     """Traceable prints to localize any precision problem on the real op.
 
     Three checks, each narrowing the failure location:
-      1. entry shape (gate/group geometry),
+      1. entry shape (segment + whole-batch geometry),
       2. proxy-scan contract (the coarse screen's per-row valid count vs
          expected, 4096 wide),
-      3. lossless self-check (rows with L+g <= 2048 must reproduce the full
-         prefix, i.e. the exact dense key set).
+      3. lossless self-check (decode rows with L+g <= 2048 must reproduce
+         the full prefix, i.e. the exact dense key set).
     """
     seq = seq_lens.to(torch.int64)
     sl_min, sl_max = int(seq.min()), int(seq.max())
+    # counts (per-request query tokens) expose the real batch layout under
+    # concurrency: a non-uniform batch is what cross-bleeds request keys.
+    counts_list = [int(c) for c in counts]
     logger.info(
-        "PIVOT[dbg] entry: N=%d R=%d g=%d budget=%d seq_lens=[%d..%d]",
-        N, R, g, _COARSE_BUDGET, sl_min, sl_max,
+        "PIVOT[dbg] entry: rows=%d/%d reqs=%d/%d g=%d budget=%d seq_lens=[%d..%d] counts=%s",
+        D, N, K, R_all, g, _COARSE_BUDGET, sl_min, sl_max, counts_list,
     )
 
     # Proxy-scan contract: valid per-row counts vs expected, out-of-range.
@@ -279,7 +430,7 @@ def _report(
     # .to() is a defensive no-op.
     C_i64 = C.to(torch.int64)
     valid = C_i64 >= 0
-    valid_per_row = valid.sum(-1)  # [R]
+    valid_per_row = valid.sum(-1)  # [K]
     expected = torch.clamp(seq, max=_COARSE_BUDGET)
     mismatch = (valid_per_row != expected).sum()
     out_of_range = (C_i64.clamp(min=0).max(-1).values >= seq).sum()
@@ -292,10 +443,10 @@ def _report(
     )
 
     # Lossless self-check: rows with L+g <= 2048 must equal [0..L+g) exactly.
-    out = topk_indices[:N, 0].to(torch.int64)
+    out = topk_indices[:D, 0].to(torch.int64)
     violations = 0
     first = None
-    for r in range(R):
+    for r in range(K):
         Lg = int(seq[r])
         if Lg > _REFINE_BUDGET:
             continue
@@ -311,10 +462,10 @@ def _report(
         logger.warning(
             "PIVOT[dbg] LOSSLESS VIOLATION: %d rows (of %d in the lossless "
             "regime) are not [0..L+g); first row=%d L+g=%d got=%s",
-            violations, N, first[0], first[1], first[2],
+            violations, D, first[0], first[1], first[2],
         )
     else:
         logger.info(
             "PIVOT[dbg] lossless self-check: PASS (%d rows, L+g<=%d)",
-            N, _REFINE_BUDGET,
+            D, _REFINE_BUDGET,
         )

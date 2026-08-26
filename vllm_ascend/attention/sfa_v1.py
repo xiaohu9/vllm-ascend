@@ -1556,11 +1556,17 @@ class AscendSFAImpl(MLAAttentionImpl):
         if envs.VLLM_ASCEND_ENABLE_PIVOT_REFINE and attn_metadata.attn_state in (
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,
+            # Mixed batches (decodes + prefills in one step): decodes are
+            # reordered to the head of the batch, so select_topk routes the
+            # decode segment through PIVOT and the prefill tail through the
+            # native indexer.
+            AscendAttentionState.ChunkedPrefill,
+            AscendAttentionState.PrefillCacheHit,
         ):
-            # Grouped MTP decode batch: PIVOT-Refine replaces the per-query
+            # Grouped MTP decode: PIVOT-Refine replaces the per-query
             # full-prefix indexer scan with one mean-proxy scan + torch
-            # refine. select_topk returns None for ungrouped / C8 batches,
-            # which then fall through to the native indexer below.
+            # refine. select_topk returns None when the batch has no grouped
+            # decode head, which then falls through to the native indexer.
             topk_indices = PivotIndexer.select_topk(
                 self,
                 q_li,
@@ -1569,6 +1575,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                 weights,
                 kv_cache,
                 attn_metadata,
+                actual_seq_lengths_query,
+                actual_seq_lengths_key,
+                allow_whole_batch=attn_metadata.attn_state in (
+                    AscendAttentionState.DecodeOnly,
+                    AscendAttentionState.SpecDecoding,
+                ),
             )
             if topk_indices is not None:
                 return topk_indices

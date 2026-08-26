@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import scipy  # type: ignore
@@ -36,6 +36,7 @@ from vllm_ascend.attention.utils import (
     get_sfa_qsfa_packed_head_dim,
     maybe_save_kv_layer_to_connector,
     notify_kv_cache_written,
+    split_decodes_and_prefills,
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
@@ -250,7 +251,9 @@ class AscendSFAMetadata:
     # PIVOT-Refine derived group metadata (doc pivot_indexer.md §6), computed
     # once per step in _build for decode states with the switch on; None
     # otherwise (zero overhead). Every MLA layer's indexer path reads these
-    # instead of recomputing per layer.
+    # instead of recomputing per layer. The decode-segment extent is derived
+    # from them, not stored: num_decodes = pivot_counts.shape[0],
+    # num_decode_tokens = pivot_req_ids.shape[0].
     pivot_counts: torch.Tensor | None = None  # [R] query count per request (g)
     pivot_group_start: torch.Tensor | None = None  # [R] first query row per request
     pivot_req_ids: torch.Tensor | None = None  # [N] request id of each query row
@@ -523,15 +526,15 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             actual_group_key_idx = None
             actual_group_key_cache_idx = None
 
-        # PIVOT-Refine derived group metadata (doc pivot_indexer.md §6):
-        # computed once per step for decode states with the switch on;
-        # every layer's indexer path reads these fields directly. Reuses
-        # common_attn_metadata fields: query_start_loc encodes both counts
-        # and group starts, decode_token_per_req IS g, positions is the
-        # scheduler-authoritative query position. PD-mixed / chunked-prefill
-        # batches carry non-decode attn_states and never reach this branch;
-        # draft iterations have decode_token_per_req == 1 and are skipped by
-        # the g >= 2 guard.
+        # PIVOT-Refine group metadata (doc pivot_indexer.md §6), built once
+        # per step for the decode segment (decode-first layout; pure decode
+        # the segment IS the batch). Reuses common_attn_metadata: query_start_loc
+        # encodes group starts, decode_token_per_req IS g, positions are the
+        # scheduler-authoritative query positions. Decode requests (query_len
+        # <= decode_threshold = g, MTP groups) are classified by
+        # split_decodes_and_prefills -- NOT attn_state enumeration, which
+        # excluded PD-mixed batches before. Draft iterations (g == 1) are
+        # skipped by the g >= 2 guard.
         pivot_counts = None
         pivot_group_start = None
         pivot_req_ids = None
@@ -542,35 +545,41 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         if (
             envs.VLLM_ASCEND_ENABLE_PIVOT_REFINE
             and pivot_g >= 2
-            and common_attn_metadata.attn_state
-            in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding)
             and dsa_cp_context is None
         ):
-            # seq_lens = L + g at indexer time (this step's g keys are
-            # stored before the indexer call), so proxy_key_lens =
-            # seq_lens - counts = L = group start t0.
-            query_start = common_attn_metadata.query_start_loc[:num_reqs]
-            pivot_counts = cum_query_lens - query_start
-            pivot_group_start = query_start
-            pivot_req_ids = torch.repeat_interleave(
-                torch.arange(num_reqs, dtype=torch.int64, device=cum_query_lens.device),
-                pivot_counts,
-                output_size=num_actual_tokens,
+            num_decodes, _num_prefills, num_decode_tokens, _num_prefill_tokens = split_decodes_and_prefills(
+                common_attn_metadata, decode_threshold=self.decode_threshold
             )
-            pivot_positions_q = input_positions[:num_actual_tokens]
-            # Local window W_t = [t-W+1, t] with W = g (= decode_token_per_req,
-            # draft_num + 1); out-of-range columns are -1 (NOT clamped to 0:
-            # position 0 would duplicate a real key).
-            win_offsets = pivot_g - 1 - torch.arange(
-                pivot_g, dtype=torch.int64, device=cum_query_lens.device
-            )
-            pivot_window_pos = pivot_positions_q.unsqueeze(1) - win_offsets.unsqueeze(0)
-            pivot_window_pos = torch.where(
-                pivot_window_pos >= 0,
-                pivot_window_pos,
-                torch.full_like(pivot_window_pos, -1),
-            )
-            pivot_proxy_key_lens = seq_lens - pivot_counts
+            if num_decodes > 0:
+                # Fields are scoped to the decode segment: request rows
+                # [:num_decodes], token rows [:num_decode_tokens]. For pure
+                # decode the segment IS the whole batch, so this construction
+                # is byte-identical to the pre-v3.4.10 full-batch version.
+                # seq_lens = L + g at indexer time (this step's g keys are
+                # stored before the indexer call), so proxy_key_lens =
+                # seq_lens - counts = L = group start t0.
+                query_start = common_attn_metadata.query_start_loc[:num_decodes]
+                pivot_counts = cum_query_lens[:num_decodes] - query_start
+                pivot_group_start = query_start
+                pivot_req_ids = torch.repeat_interleave(
+                    torch.arange(num_decodes, dtype=torch.int64, device=cum_query_lens.device),
+                    pivot_counts,
+                    output_size=num_decode_tokens,
+                )
+                pivot_positions_q = input_positions[:num_decode_tokens]
+                # Local window W_t = [t-W+1, t] with W = g (= decode_token_per_req,
+                # draft_num + 1); out-of-range columns are -1 (NOT clamped to 0:
+                # position 0 would duplicate a real key).
+                win_offsets = pivot_g - 1 - torch.arange(
+                    pivot_g, dtype=torch.int64, device=cum_query_lens.device
+                )
+                pivot_window_pos = pivot_positions_q.unsqueeze(1) - win_offsets.unsqueeze(0)
+                pivot_window_pos = torch.where(
+                    pivot_window_pos >= 0,
+                    pivot_window_pos,
+                    torch.full_like(pivot_window_pos, -1),
+                )
+                pivot_proxy_key_lens = seq_lens[:num_decodes] - pivot_counts
 
         return self.metadata_cls(  # type: ignore
             num_input_tokens=common_attn_metadata.num_input_tokens,
@@ -1622,20 +1631,28 @@ class AscendSFAImpl(MLAAttentionImpl):
             envs.VLLM_ASCEND_ENABLE_PIVOT_REFINE
             and attn_metadata.pivot_counts is not None
         ):
-            # Grouped MTP decode batch: pivot_counts being set encodes the
-            # full gate (switch on + decode state + g >= 2 + no DSA-CP),
-            # see _build. PIVOT-Refine replaces the per-query full-prefix
-            # indexer scan (doc pivot_indexer.md §4); ungrouped batches
-            # (g < 2) get None back and fall through to the native indexer.
-            topk_indices = PivotIndexer.select_topk(
-                self,
-                q_li,
-                q_li_scale,
-                q_li_shape_ori,
-                weights,
-                kv_cache,
-                attn_metadata,
-            )
+            # pivot_counts set => structural gate fired (switch + g >= 2 + no
+            # DSA-CP + >= 1 decode request), see _build. Decode-segment extent
+            # is derived from the pivot tensors (num_decodes = counts.shape[0],
+            # num_decode_tokens = req_ids.shape[0]). Pure grouped decode
+            # (num_decodes == num_reqs) runs PIVOT over the whole batch; PD-mixed
+            # runs the hybrid in _pivot_pd_mixed_select; both return None to
+            # fall back to the native full-batch indexer below.
+            num_decodes = attn_metadata.pivot_counts.shape[0]
+            if num_decodes == attn_metadata.seq_lens.shape[0]:
+                topk_indices = PivotIndexer.select_topk(
+                    self,
+                    q_li,
+                    q_li_scale,
+                    q_li_shape_ori,
+                    weights,
+                    kv_cache,
+                    attn_metadata,
+                )
+            else:
+                topk_indices = self._pivot_pd_mixed_select(
+                    q_li, q_li_scale, weights, kv_cache, attn_metadata
+                )
             if topk_indices is not None:
                 return topk_indices
         return DeviceOperator.indexer_select_post_process(
@@ -1651,6 +1668,121 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.enable_sparse_li_c8,
             self.use_torch_npu_lightning_indexer,
         )
+
+    def _pivot_pd_mixed_select(
+        self,
+        q_li: torch.Tensor,
+        q_li_scale: torch.Tensor | None,
+        weights: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: M,
+    ) -> torch.Tensor | None:
+        """PD-mixed PIVOT: PIVOT over decode rows [0, num_decode_tokens),
+        native indexer over the prefill rows, row-order concat width-padded
+        to the native budget (2048). None -> caller falls back to native."""
+        num_decodes = attn_metadata.pivot_counts.shape[0]
+        num_decode_tokens = attn_metadata.pivot_req_ids.shape[0]
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        # ---- decode segment -> PIVOT ------------------------------------
+        # Re-scope q/weights/metadata to the decode requests so select_topk
+        # sees g = num_decode_tokens // num_decodes. C8 q_li is [N*H, D]
+        # token-major; BF16 is raw [N, H, D].
+        if self.enable_sparse_li_c8:
+            q_li_d = q_li[: num_decode_tokens * self.n_head]
+            q_li_scale_d = (
+                q_li_scale[: num_decode_tokens * self.n_head]
+                if q_li_scale is not None
+                else None
+            )
+            q_li_shape_ori_d = (num_decode_tokens, self.n_head, q_li.shape[-1])
+        else:
+            q_li_d = q_li[:num_decode_tokens]
+            q_li_scale_d = None
+            q_li_shape_ori_d = None
+        decode_meta = replace(
+            attn_metadata,
+            num_actual_tokens=num_decode_tokens,
+            seq_lens=attn_metadata.seq_lens[:num_decodes],
+            block_table=attn_metadata.block_table[:num_decodes],
+        )
+        topk_d = PivotIndexer.select_topk(
+            self,
+            q_li_d,
+            q_li_scale_d,
+            q_li_shape_ori_d,
+            weights[:num_decode_tokens],
+            kv_cache,
+            decode_meta,
+        )
+        if topk_d is None:
+            # Unreachable for a grouped decode segment (g >= 2); fall back.
+            return None
+        # ---- prefill segment -> native indexer ---------------------------
+        # Local 0-based query offsets + prefill block tables; key lengths are
+        # absolute (the KV cache is global).
+        if self.enable_sparse_li_c8:
+            q_li_p = q_li[
+                num_decode_tokens * self.n_head : num_actual_tokens * self.n_head
+            ]
+            q_li_scale_p = (
+                q_li_scale[
+                    num_decode_tokens * self.n_head : num_actual_tokens * self.n_head
+                ]
+                if q_li_scale is not None
+                else None
+            )
+            q_li_shape_ori_p = (
+                num_actual_tokens - num_decode_tokens,
+                self.n_head,
+                q_li.shape[-1],
+            )
+        else:
+            q_li_p = q_li[num_decode_tokens:num_actual_tokens]
+            q_li_scale_p = None
+            q_li_shape_ori_p = None
+        prefill_meta = replace(
+            attn_metadata, block_table=attn_metadata.block_table[num_decodes:]
+        )
+        actual_seq_lengths_query_p = (
+            attn_metadata.cum_query_lens[num_decodes:]
+            - attn_metadata.cum_query_lens[num_decodes - 1]
+        )
+        topk_p = DeviceOperator.indexer_select_post_process(
+            self,
+            q_li_p,
+            q_li_scale_p,
+            q_li_shape_ori_p,
+            weights[num_decode_tokens:num_actual_tokens],
+            kv_cache,
+            prefill_meta,
+            actual_seq_lengths_query_p,
+            attn_metadata.seq_lens[num_decodes:],
+            self.enable_sparse_li_c8,
+            self.use_torch_npu_lightning_indexer,
+        )
+        # PIVOT emits k (default 512) columns; width-pad to the native 2048
+        # with -1 tails, then row-order concat -> [num_actual_tokens, 1, 2048].
+        budget = topk_p.shape[-1]
+        if topk_d.shape[-1] < budget:
+            pad = torch.full(
+                (topk_d.shape[0], 1, budget - topk_d.shape[-1]),
+                -1,
+                dtype=topk_d.dtype,
+                device=topk_d.device,
+            )
+            topk_d = torch.cat([topk_d, pad], dim=-1)
+        topk_indices = torch.cat([topk_d, topk_p], dim=0)
+        # Keep the output row count consistent with topk_num_tokens =
+        # num_input_tokens (graph padding rows are -1).
+        if attn_metadata.num_input_tokens > topk_indices.shape[0]:
+            row_pad = torch.full(
+                (attn_metadata.num_input_tokens - topk_indices.shape[0], 1, budget),
+                -1,
+                dtype=topk_indices.dtype,
+                device=topk_indices.device,
+            )
+            topk_indices = torch.cat([topk_indices, row_pad], dim=0)
+        return topk_indices
 
     def _get_indexcache_topk_indices(self, num_tokens: int) -> torch.Tensor:
         if self.topk_indices_buffer is None:

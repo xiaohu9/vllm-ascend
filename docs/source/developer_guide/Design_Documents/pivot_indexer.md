@@ -1,4 +1,4 @@
-# PIVOT-Refine Indexer 设计文档(修订 v3.4.9)
+# PIVOT-Refine Indexer 设计文档(修订 v3.4.10)
 
 > 复现论文 [PIVOT: Efficient Query-Group Indexing for Token-Level Sparse Attention](https://arxiv.org/abs/2607.24593)
 > 的 PIVOT-Refine 方案,作为原生 SFA indexer 的 decode 路径 drop-in 替换,通过开关控制。
@@ -35,13 +35,15 @@
 | **v3.4.6** | **两项用户决策(2026-08-25)**:①**环境变量再自动化**--删 `VLLM_ASCEND_PIVOT_CANDIDATE_COUNT`(总预算 = 2048 是算子原生上限,固化为 `pivot_indexer.py` 模块常量 `_CANDIDATE_BUDGET=2048`)与 `VLLM_ASCEND_PIVOT_WINDOW_SIZE`(W 恒自动 = g = 草稿数+1,无需配置);envs.py 最终只 +2 个变量(总开关 + topk)。②**派生元信息提升**--`counts/group_start/req_ids/positions_q` 提升到 `AscendSFAMetadata._build` 一次性计算(decode 态才算,其余路径零开销),PIVOT 分支直接读字段,消除 select_topk 内每步重复推导(§6) |
 | **v3.4.5** | **两项用户决策(2026-08-25)**:①**删 `VLLM_ASCEND_PIVOT_WINDOW_KEEP`**--scored 联合竞争为**唯一语义,不设回退开关**;envs.py 最终只 +4 个变量。②**语义再确认**:计算 C 时代理扫描**不涉及 W 的 kv cache**(C 宽 = 总预算-W 仅是宽度预算),每个 query 在 refine 时并入**自身**的 W_t -> C∪W_t 联合 -> top-512;W 的 key 只在 query 级出现一次(§4.2-4/§4.4) |
 | **v3.4.8** | **新增 §4.1.1 端到端时序图**(用户需求 2026-08-25):Mermaid sequenceDiagram 展示"元信息提升(每步 1 次)-> 每层 PIVOT 分支(代理扫描 + refine)-> SFA 消费"全链路,节点挂 file:line;附**图读法**与 **PPT 半页落地价值素材**(§4.1.1 末) |
-| **v3.4.9(本版)** | **A3 穿刺版双路径支持(用户需求 2026-08-25)**:穿刺版在 **A3(910B/C,`BaseDeviceAdaptor`)** 上测 **GLM-5.2-w4a8c16** -- `enable_sparse_li_c8` 关闭、走 **BF16 索引器路径**(raw BF16 q/k,无 hadamard/quant/scale)。代码严格修改:①**删除 C8-only `NotImplementedError` guard**;②路径判据 = `sfa_impl.enable_sparse_li_c8`(与原生 dispatch 同 flag):C8 走量化索引器 + refine 反量化,**BF16 走 `torch_npu.npu_lightning_indexer`**(与 BaseDeviceAdaptor:618 非 C8 分支、A5DeviceAdaptor:1938 逐字节一致,query=R 代理、sparse_count=2048-W、key_len=L),refine 直接 `Σ_h w·ReLU(q·k)` on **raw q·raw k**(与原生 BF16 op 同式、无 dequant);③**C8 代理扫描设备感知**--A5=`torch_npu.npu_quant_lightning_indexer`(device_op.py:1921),非 A5=`torch.ops._C_ascend.npu_lightning_indexer_quant`(device_op.py:601,逐字节一致);④q_li 归一:C8=[N_in*H,D]+scale、BF16=[N_in,H,D] raw 均切片到 [:N] 实 token;⑤UT 新增 BF16 套件 6 项(稠密 parity/代理域/窗口召回/空前缀/padding 行/宽度 pad),本地冒烟 **24 项全过**(17 C8 + 7 BF16);新增 §4.6 双路径说明、§6/§8 同步 |
+| **v3.4.9** | **A3 穿刺版双路径支持(用户需求 2026-08-25)**:穿刺版在 **A3(910B/C,`BaseDeviceAdaptor`)** 上测 **GLM-5.2-w4a8c16** -- `enable_sparse_li_c8` 关闭、走 **BF16 索引器路径**(raw BF16 q/k,无 hadamard/quant/scale)。代码严格修改:①**删除 C8-only `NotImplementedError` guard**;②路径判据 = `sfa_impl.enable_sparse_li_c8`(与原生 dispatch 同 flag):C8 走量化索引器 + refine 反量化,**BF16 走 `torch_npu.npu_lightning_indexer`**(与 BaseDeviceAdaptor:618 非 C8 分支、A5DeviceAdaptor:1938 逐字节一致,query=R 代理、sparse_count=2048-W、key_len=L),refine 直接 `Σ_h w·ReLU(q·k)` on **raw q·raw k**(与原生 BF16 op 同式、无 dequant);③**C8 代理扫描设备感知**--A5=`torch_npu.npu_quant_lightning_indexer`(device_op.py:1921),非 A5=`torch.ops._C_ascend.npu_lightning_indexer_quant`(device_op.py:601,逐字节一致);④q_li 归一:C8=[N_in*H,D]+scale、BF16=[N_in,H,D] raw 均切片到 [:N] 实 token;⑤UT 新增 BF16 套件 6 项(稠密 parity/代理域/窗口召回/空前缀/padding 行/宽度 pad),本地冒烟 **24 项全过**(17 C8 + 7 BF16);新增 §4.6 双路径说明、§6/§8 同步 |
+| **v3.4.10(本版)** | **PD-mixed(ChunkedPrefill)适配(用户需求 2026-08-26,必须适配)**:v3.4.7 的"PD mixed 天然不触发或安全"结论**作废**。事实核查:MTP decode + prefill **可在同一步共存**(`scheduler_dynamic_batch.py:193` 对 running 请求按 `num_new_tokens` 调度,MTP decode 请求 `num_new_tokens=g`、prefill 请求 `=chunk`),混合步 `_build_attn_state` 归为 **ChunkedPrefill**(model_runner_v1.py:1490-1496,现门控排除);`decode_threshold=1+spec_token_num=g`(attention_v1.py:247-257 / sfa_v1.py:312)使 `split_decodes_and_prefills` 把 MTP decode 请求(query_len=g)精确归为 **decode 段**,prefill(query_len>g)归为 prefill,`num_decode_tokens=query_start_loc[first_prefill]` 覆盖 grouped decode 行;布局 decode-first(attention_v1.py:1841-1844);原生索引器已正确处理 mixed 批(device_op.py:576,`actual_seq_lengths_query=cum_query_lens[R]`、`actual_seq_lengths_key=seq_lens[R]`)。**设计(§4.7)**:门控从 attn_state 枚举改为**结构判定** -- 纯 grouped decode(行为不变)或 PD-mixed 均建 pivot_* 字段(纯 decode 全批作用域 / mixed decode 段作用域);**PD-mixed 走 hybrid**:PIVOT 处理 decode 段行 [0,`num_decode_tokens`),原生索引器处理 prefill 段行 [`num_decode_tokens`,N),宽度统一(pad 2048)后按行序 concat。**入图路由核查(SFA→FULL_DECODE_ONLY→dispatcher 无 mixed key→mixed 恒 eager)**:mixed 批从不入图,`_build` 无需 graph-mode 检测,§5 不再有"回退原生"分支。新增元数据 `pivot_num_decodes/pivot_num_decode_tokens`(decode 段边界);§4.7/§5/§6/§7/§8 同步 |
 
 ---
 
 ## 1. 目标与范围
 
-- **唯一目标**:decode 阶段的 indexer 选择流程优化。**不实现 prefill 阶段设计**(用户明确)。
+- **唯一目标**:decode 阶段(含 **PD-mixed 批的 decode 段**【v3.4.10,§4.7])的 indexer 选择流程优化。
+  **不实现纯 prefill 阶段设计**(用户明确;PD-mixed 的 prefill 段走原生索引器)。
 - **落地模型**:GLM-5.2-w4a4c8(模型类型 `glm_moe_dsa`)。带 **C8 FP8 KV cache**(A5 e4m3)。
   **【v3.4.9】穿刺版在 A3 上测 GLM-5.2-w4a8c16(非 C8)**,PIVOT 同时支持 C8 与 BF16 索引器路径(§4.6)。
 - **执行路径**:原生 SFA 路径。调用链:
@@ -506,13 +508,112 @@ A5DeviceAdaptor:1938 无条件同调用);③A3 归属 `BaseDeviceAdaptor`(get_de
 sparse_count=2048-W、窗口召回草稿 key、空前缀、graph padding 行 -1、index_cache 宽度 pad;本地冒烟
 24 项全过(C8 17 + BF16 7)。
 
+---
+
+### 4.7 PD-mixed(ChunkedPrefill)适配:结构门控 + decode 段 PIVOT + prefill 段原生【v3.4.10】
+
+#### 4.7.1 事实核查(全部代码依据)
+
+| # | 事实 | 依据 |
+|---|---|---|
+| ① | MTP decode + prefill **可同一步共存**:running 请求(含 MTP decode 的 `g` token 与 prefill chunk)按 `num_new_tokens` 一并调度,`scheduled_spec_decode_tokens` 单独跟踪草稿 token | `scheduler_dynamic_batch.py:193-207`(`num_new_tokens = num_tokens_with_spec + num_output_placeholders - num_computed_tokens`,MTP decode=g) |
+| ② | 混合步 attn_state = **ChunkedPrefill**(现门控排除):`np.all(num_scheduled_tokens==1)` 假(有 prefill)、`np.all(num_valid_tokens==1)` 假(prefill valid>1) → `enable_chunked_prefill` → ChunkedPrefill | `model_runner_v1.py:1481-1496` |
+| ③ | **`decode_threshold = 1 + spec_token_num = g`**(MTP 时)⇒ `split_decodes_and_prefills` 把 MTP decode 请求(query_len=g)归 **decode**,prefill(query_len>g)归 prefill;`num_decode_tokens = query_start_loc[first_prefill]` 精确覆盖 grouped decode 行(阈值=g 正是为此设计) | `attention_v1.py:247-257`;`sfa_v1.py:312`;`utils.py:337-430` |
+| ④ | 批布局 **decode-first**:decode 行 [0,`num_decode_tokens`),prefill 行 [`num_decode_tokens`,N) | `attention_v1.py:1841-1844`;`utils.py:337-345`(docstring) |
+| ⑤ | 原生索引器**已正确处理 mixed 批**(PIVOT 关闭时现状):全批单次调用,`actual_seq_lengths_query=cum_query_lens[R]`(每请求累计)、`actual_seq_lengths_key=seq_lens[R]` | `device_op.py:576-640`;`sfa_v1.py:1722-1725` |
+| ⑥ | 每请求实际 counts = `cum_query_lens - query_start` 对 mixed 自然给出 decode 段 counts(=g)与 prefill 段 counts(=chunk) | `sfa_v1.py:553`(现代码) |
+| ⑦ | 纯 decode 判定:`split_decodes_and_prefills` 当 `max_query_len<=threshold` 早返回 `(num_reqs,0,num_tokens,0)` ⇒ `num_decodes==num_reqs` | `utils.py:366-370` |
+
+#### 4.7.2 设计:结构门控 + hybrid(两段式索引器)
+
+**核心变化**:门控不再枚举 `attn_state`,改为**结构判定**(decode 段是否存在且分组)。三种批:
+
+| 批形态 | `split_decodes_and_prefills` 结果 | PIVOT 行为 |
+|---|---|---|
+| 纯 grouped decode(DecodeOnly/SpecDecoding,现网已支持) | `num_decodes==num_reqs`,全批均为 g 组 | **不变**:PIVOT 覆盖全批,graph 兼容(shape 固定) |
+| **PD-mixed(ChunkedPrefill,新增)** | `0 < num_decodes < num_reqs`,decode 段行 [0,`num_decode_tokens`) | **hybrid**:PIVOT 覆盖 decode 段 + 原生覆盖 prefill 段,按行序 concat |
+| 纯 prefill(PrefillNoCache/CacheHit/ChunkedPrefill-无 decode) | `num_decodes==0` | **回退原生**(decode 段不存在,零开销) |
+
+**`_build` 门控改造(sfa_v1.py:542-548)**:
+
+```
+env 开 + pivot_g(=decode_token_per_req)>=2 + dsa_cp_context 为 None
+  → split_decodes_and_prefills(common_attn_metadata, decode_threshold=self.decode_threshold)
+     (self.decode_threshold = 1+spec_token_num = g, sfa_v1.py:312)
+  → 若 num_decode_tokens>0:
+       纯 decode(num_decodes==num_reqs)  → 建 pivot_* (全批, 现状)
+       PD-mixed(num_decodes<num_reqs)    → 建 pivot_* (decode 段作用域) + pivot_num_decodes/pivot_num_decode_tokens
+  → 其余(纯 prefill / g<2 / DSA-CP)→ pivot_* = None(现状零开销)
+```
+
+**注(入图路由,§5.1)**:门控**无需** graph-mode 检测 -- SFA 后端声明
+`AttentionCGSupport.UNIFORM_BATCH`(sfa_v1.py:353),`resolve_cudagraph_mode_and_sizes`
+把 FULL 系降级为 **FULL_DECODE_ONLY**(mixed_mode=NONE,compilation.py:1345-1368);
+dispatcher 只注册纯 decode 的 FULL key(uniform=True,cudagraph_dispatcher.py:203-227),
+不注册任何 mixed key(185 行 `mixed_mode()!=NONE` 为假即跳过);PD-mixed 批
+`uniform=False` 的 descriptor 匹配不到任何 key → dispatch 返回 `NONE` → **恒走 eager**。
+故 mixed 批在 `_build` 一律建 decode 段作用域 pivot_* 即可,与全局 graph 开关无关;
+
+**decode 段作用域的 pivot_* 元信息**(PD-mixed 时;纯 decode 时即全批,现公式不变):
+- `pivot_counts = cum_query_lens[:num_decodes] - query_start_loc[:num_decodes]`(decode 请求实际 query 数,=g)
+- `pivot_group_start = query_start_loc[:num_decodes]`
+- `pivot_req_ids = repeat_interleave(arange(num_decodes), pivot_counts, output_size=num_decode_tokens)`
+- `pivot_positions_q = input_positions[:num_decode_tokens]`
+- `pivot_window_pos`(宽 g 窗口,越界列 -1,现公式)
+- `pivot_proxy_key_lens = seq_lens[:num_decodes] - pivot_counts`(= L,组首 t0,现公式)
+- **新增** `pivot_num_decodes = num_decodes`(int)、`pivot_num_decode_tokens = num_decode_tokens`(int) → 消费分支判边界
+
+**消费分支 hybrid(sfa_v1.py:1618-1638)`indexer_select_post_process`**:
+
+```
+if PIVOT on and pivot_counts is not None:
+    if pivot_num_decodes == num_reqs:          # 纯 grouped decode(含 graph padding)
+        return PivotIndexer.select_topk(...)   # 现状,不改
+    # PD-mixed(eager):两段索引
+    decode_meta  = 浅拷贝 metadata,作用域切到 decode 段(block_table[:num_decodes],
+                   seq_lens[:num_decodes], query_start_loc[:num_decodes+1],
+                   num_reqs=num_decodes, num_actual_tokens=num_input_tokens=num_decode_tokens)
+    topk_d       = PivotIndexer.select_topk(self, q_li_d, q_li_scale_d, shape_d, weights_d, kv_cache, decode_meta)
+    if topk_d is None:                         # g<2 边界(防御)→ 整批回退原生
+        fall through to full native
+    prefill_meta = 浅拷贝 metadata,作用域切到 prefill 段(block_table[num_decodes:],
+                   seq_lens[num_decodes:], query_start_loc 去首段本地化,
+                   num_reqs=num_prefills, num_actual_tokens=num_input_tokens=num_input_tokens-num_decode_tokens)
+    topk_p       = DeviceOperator.indexer_select_post_process(self, q_li_p, ..., prefill_meta,
+                   prefill_actual_seq_lengths_query, prefill_actual_seq_lengths_key, ...)
+    # 宽度统一:topk_d[k=512] pad 到 2048(-1 尾)后与 topk_p[2048] 沿 dim0 concat
+    # → [num_input_tokens, 1, 2048],decode 行在前、prefill 行在后(padding 行在尾, 原生语义)
+```
+
+**切片规则**(C8 与 BF16 双路径共用,见 §4.6):`q_li` 按行切 -- C8 先 `view(N,H,D)` 再切再 flatten、
+`q_li_scale` 按 `view(N,H)` 切、`q_li_shape_ori` 改为切后行数;BF16 直接 `[N,H,D]` 切行;`weights` 按行切。
+`kv_cache` 共享无需切。`actual_seq_lengths_query`(prefill 段)= `cum_query_lens[num_decodes:] - cum_query_lens[num_decodes-1]`(本地 0 基);
+`actual_seq_lengths_key` = `seq_lens[num_decodes:]`。
+
+**为什么不走"原生全批 + 覆盖 decode 行"**:那会让原生仍对 decode 行做全前缀扫描,PIVOT 的代理替换收益归零、
+反而多一倍 decode 扫描(非适配是负优化)。hybrid 双调用的意义就是**让 PIVOT 真正替代 decode 段的扫描**。
+
+#### 4.7.3 边界与防御
+
+- **prefill query_len 恰 == g 的误归**:`split_decodes_and_prefills` 判 `query_len > threshold`(严格大于),
+  query_len==g 的请求会被当 decode。实际 prefill chunk ≫ g(阈值=g=1+草稿数,chunk 数百),不触发;文档记边界。
+- **decode 段非均匀**(某 decode 请求 count<g,如接受回退):`pivot_counts` 取实际 counts,组均值自然退化(§8-1),
+  窗口仍按 g 宽(窗口列按位置,与组大小无关),安全。
+- **topk_d 返回 None(防御)**:PD-mixed 下 decode 段 g<2 时 PIVOT 不输出 → 整批回退原生(现逻辑)。
+- **graph 开关下 mixed 步仍 eager(§5.1)**:SFA→FULL_DECODE_ONLY 后 mixed 批 dispatch 恒 `NONE`,
+  `_build` 照常建 decode 段 pivot_*、hybrid 照常执行 -- **无"graph-mode mixed 回退原生"分支**;
+  pure decode 的 FULL graph 只服务纯 decode 批(dispatcher key 严格 uniform=True),两者互不干扰。
+  若用户在非 SFA 路径显式配 FULL_AND_PIECEWISE 且 mixed 批 dispatch 到 PIECEWISE 图,那是
+  原生 mixed 路径自身的 Python 切片问题(attention_v1.py:1806-1880),非 PIVOT 引入,超出本设计范围。
+
+
 ## 5. 入图(graph-mode)兼容性分析
 
 ### 5.1 capture 硬约束 → 设计映射
 
 | 约束 | PIVOT 中的应对 |
 |---|---|
-| 静态形状 | 代理 `q_bar`[R_pad,H,D]、refine 输出 `[N_pad, 1, k]` 全部预分配;R/N 由既有 capture-size 填充机制处理 |
+| 静态形状 | 代理 `q_bar`[R_pad,H,D]、refine 输出 `[N_pad, 1, k]` 全部预分配;R/N 由既有 capture-size 填充机制处理。**【v3.4.10】PD-mixed 不入图(结构性,§5.1)**:mixed 批的 decode 段边界 `num_decode_tokens` 逐步变化,与图 capture 固定 shape 冲突 -- 但该问题被核心路由**天然规避**:SFA 声明 `UNIFORM_BATCH`(sfa_v1.py:353)→ `resolve_cudagraph_mode_and_sizes` 把 FULL 系降级为 **FULL_DECODE_ONLY**(mixed_mode=NONE,compilation.py:1345-1368)→ dispatcher 无 mixed key → mixed 批 dispatch 恒 `NONE`(**恒 eager**)。故 **mixed 批从不入图,`_build` 无需 graph-mode 检测**,decode 段作用域 pivot_* 直接建;纯 grouped decode 的 graph 兼容性不受影响(全批 shape 固定,dispatcher key 严格 uniform=True) |
 | 无张量值 Python 分支 | **移除 `t0<c` 护栏分支**(always-run,§4.2-1);组均值/refine 全向量化,无分支 |
 | 无宿主同步 | 代理均值用 `scatter_add_`/cumsum 分段和(设备端;`index_reduce_` 有录制风险,§8-8);refine 无 `.item()/.cpu()`;窗口宽度 W 为静态常量 |
 | 算子可录制 | 代理扫描复用 `npu_quant_lightning_indexer`(现 eager decode 已走该算子);入图安全性 = NPU 实测项 V3 |
@@ -537,6 +638,13 @@ gather/matmul/relu/topk/masked_fill(标准 aclrt 算子或生产先例,§4.4),�
 无宿主同步。唯一无法入图的是论文的 `t0<c` 数据相关护栏分支 -- 以 always-run 消解
 (§4.2-1:短前缀自动稠密,语义等价,且无需写该分支)。**代价**:短前缀下多算一次 O(c+W) refine,
 相对全前缀扫描可忽略;refine 走 torch 多 pass 的时延是已知取舍(§8-13),V1 优先正确性与入图。
+**【v3.4.10】入图边界收窄**:上述结论仅对**纯 grouped decode** 成立(全批 shape 固定)。
+**PD-mixed 的 PIVOT 仅 eager 可用**(decode 段边界动态,§4.7.2)。这不是我们的取舍,而是
+**核心路由的既定事实**:SFA 后端 `UNIFORM_BATCH`(sfa_v1.py:353)→ `FULL_DECODE_ONLY`
+(mixed_mode=NONE,compilation.py:1345-1368)→ dispatcher 无 mixed key → **mixed 批恒 eager**。
+也就是说 **vLLM 核心本身就设计为 mixed 批不入图**,原生 mixed 路径
+(`_forward_c8_chunked_prefill`,attention_v1.py:1806-1880)同样依赖运行时 Python 边界切片,
+与 PIVOT hybrid 是同类约束 -- PIVOT 只是尊重这个既有边界,不引入新的正确性缺口。
 
 ### 5.4 验证项(V1-V5)
 
@@ -560,13 +668,19 @@ gather/matmul/relu/topk/masked_fill(标准 aclrt 算子或生产先例,§4.4),�
   非 PA 必须 `block_table=None`(tiling.cpp:270);TND key `s2Size=key.dim0`、
   `actual_seq_lengths_key` 每请求累计(tiling.cpp:440 / kernel.h:159)。
   **v3.4 注**:V1 直通版 refine 不走算子,V5 仅在启用算子化 refine(性能阶段,§8-13)时生效。
+- **V6(v3.4.10,PD-mixed hybrid)**:①UT 构造 mixed mock 批(前 num_decodes 个 g=2 请求 + 后 prefill chunk 请求):
+  断言 decode 段行 == PIVOT 稠密 parity、prefill 段行 == 原生稠密 parity、concat 行序(decode 在前)、
+  宽度统一(PIVOT 行 pad 到 2048 尾 -1);②纯 decode/纯 prefill 批回归(行为不变);③graph 开关下 mixed
+  批 dispatch 断言为 NONE(→eager hybrid,§5.1 路由),纯 decode 批仍入 FULL 图且 PIVOT 字段
+  shape 与捕获一致;④NPU(eager):开关前后 mixed 步 token 级正确性一致,decode 段
+  PIVOT 生效(prefill 段保持原生)且 `npu_sparse_flash_attention` 正常消费 concat 输出。
 
 ## 6. 集成点(文件/函数,releases/v0.23.0)
 
 | 文件 | 改动 |
 |---|---|
 | `vllm_ascend/envs.py` | +2 环境变量(§4.5;仅 ENABLE+TOPK;POOLING/REFINE_CHUNK/WINDOW_KEEP/CANDIDATE_COUNT/WINDOW_SIZE 已删,用户决策) |
-| `vllm_ascend/attention/sfa_v1.py` | `AscendSFAMetadata._build`(365)增加 PIVOT 派生元信息字段 `pivot_counts/pivot_group_start/pivot_req_ids/pivot_positions_q/pivot_window_pos/pivot_proxy_key_lens`(decode 态一次性计算,**复用 common_attn_metadata 现成字段**:counts/group_start 由 `query_start_loc[:R]` 给出(counts=cum_query_lens-query_start_loc),g 直接取 `decode_token_per_req`,positions_q 取 scheduler 权威 `positions[:num_actual_tokens]`(graph padding 之外的真实 token),window_pos = positions_q-(g-1-arange(g)) 且越界列=-1(W=g 自动),proxy_key_lens = seq_lens-counts = 组首 t0;门控=env 开 + decode_token_per_req>=2 + decode 态 + dsa_cp_context 为 None,不满足时字段全 None 零开销;每层 forward 直接读,不再逐层重算);`indexer_select_post_process`(1483)加 PIVOT 分支:仅判 `pivot_counts is not None`(单点真源,门控已在 _build 编码),`select_topk` 返回 None(g<2)则落回原生路径;输出 shape `[N_in,1,k]`(k=512,含 -1 终止符;按 num_actual_tokens 计算,padding 行补 -1 尾) |
+| `vllm_ascend/attention/sfa_v1.py` | `AscendSFAMetadata._build`(365)增加 PIVOT 派生元信息字段 `pivot_counts/pivot_group_start/pivot_req_ids/pivot_positions_q/pivot_window_pos/pivot_proxy_key_lens` + **【v3.4.10】`pivot_num_decodes/pivot_num_decode_tokens`**(decode 段边界) -- 一次性计算,**复用 common_attn_metadata 现成字段**:counts/group_start 由 `query_start_loc[:R]` 给出(counts=cum_query_lens-query_start_loc),g 直接取 `decode_token_per_req`,positions_q 取 scheduler 权威 `positions[:num_actual_tokens]`(graph padding 之外的真实 token),window_pos = positions_q-(g-1-arange(g)) 且越界列=-1(W=g 自动),proxy_key_lens = seq_lens-counts = 组首 t0。**【v3.4.10 门控改为结构判定(§4.7)】**:env 开 + decode_token_per_req>=2 + dsa_cp_context 为 None 时,`split_decodes_and_prefills(common_attn_metadata, decode_threshold=self.decode_threshold)`(阈值=g,sfa_v1.py:312)判批形态 -- **纯 grouped decode**(`num_decodes==num_reqs`):全批作用域建字段(现状);**PD-mixed**(`0<num_decodes<num_reqs`):**decode 段作用域**建字段(切片 [:num_decodes]/[:num_decode_tokens],§4.7.2;mixed 批恒 eager -- SFA→FULL_DECODE_ONLY→dispatcher 无 mixed key,§5.1,无需 graph 检测);**纯 prefill / g<2 / DSA-CP**:字段全 None 零开销(回退原生)。`indexer_select_post_process`(1550)PIVOT 分支:仅判 `pivot_counts is not None`(单点真源);**纯 decode 直接返回 `select_topk` 结果(现状);PD-mixed 走 hybrid(§4.7.2)**:PIVOT 处理 decode 段(浅拷贝 decode 段作用域 metadata + 行切片)、原生索引器处理 prefill 段(浅拷贝 prefill 段作用域 metadata + 行切片 + 本地化 `actual_seq_lengths_query/key`),`select_topk` 返回 None 则整批回退原生;PIVOT 行 pad 到 2048(-1 尾)后按行序 concat,输出 `[N_in,1,2048]` |
 | `vllm_ascend/attention/pivot_indexer.py`(新) | `PivotIndexer.select_topk(q_li, q_li_scale, q_li_shape_ori, weights, kv_cache, metadata)`;**双路径(§4.6,v3.4.9)**:判据 `sfa_impl.enable_sparse_li_c8` -- C8 走量化索引器(A5=`torch_npu.npu_quant_lightning_indexer` / 非 A5=`torch.ops._C_ascend.npu_lightning_indexer_quant`,设备感知)+ refine 反量化;**BF16 走 `torch_npu.npu_lightning_indexer`**(raw q/k,无 scale)+ refine raw 打分;含 `_segment_mean_proxy`(固定 mean)、`_refine_topk`(torch 直通打分,§4.4)、C/W key gather(FP8+scale 或 raw BF16)、use_index_cache 宽度对策(§4.4)、模块常量 `_CANDIDATE_BUDGET=2048`(C∪W 总预算)+ `_REFINE_CHUNK=256`(分块粒度),均不入 envs;元信息直接读 metadata 派生字段(§6 sfa_v1 行);g<2 返回 None 回退原生 |
 | `tests/ut/attention/a2/test_pivot_indexer.py`(新) | 对照稠密参考索引器(纯 torch,同一打分公式):top-512 集合一致率、坐标 0-based 断言、窗口联合竞争与去重、短前缀、MTP 分组(主 forward 每请求 1+d query)、多请求、C8 反量化域一致性、分块一致性;**【v3.4.9】新增 BF16(非 C8)套件 6 项**(稠密 parity / 代理域 key_len=L / 窗口召回 / 空前缀 / padding 行 / 宽度 pad),mock 覆盖 `npu_quant_lightning_indexer` 与 `npu_lightning_indexer` 双算子,`get_ascend_device_type` 钉 A5 验证设备感知 C8 分支 |
 
@@ -577,13 +691,19 @@ gather/matmul/relu/topk/masked_fill(标准 aclrt 算子或生产先例,§4.4),�
   窗口联合竞争(草稿 key 入选/落选双向)、C∪W 去重(输出无重复位置)、C8 反量化域一致性(量化误差容差内)、`att` 分块一致性、k=512/W 边界、序列开头窗口越界列 = -1。
   构造 MTP 分组 batch(TND,每请求 g 个 query)验证 `_segment_mean_proxy` 与逐 query refine。
   **【v3.4.9】双路径套件**:C8 与 BF16(非 C8)各跑同一组断言(稠密 parity / 代理域 / 窗口召回 / 空前缀 / padding 行 / 宽度 pad),本地冒烟 24 项全过。
+  **【v3.4.10】PD-mixed 套件(V6,§5.4)**:mixed mock 批(前 g=2 decode 请求 + 后 prefill chunk 请求)断言
+  decode 段行 == PIVOT parity、prefill 段行 == 原生 parity、concat 行序、宽度 pad;纯 decode / 纯 prefill 回归;
+  graph 模式 mixed 断言 pivot_* 为 None。
 - **NPU(迁节点)**:代理扫描(原生算子,R 个代理)+ torch 直通 refine;重点验证
   **k=512 宽度 topk_indices 被 `npu_sparse_flash_attention` 正常消费**(-1 终止符逐行)、
   use_index_cache 路径无脏索引(§4.4 坑);对照稠密 DSA 的精度与 token 级正确性;验证 V1(①-⑥)/V4(V2 已静态核实;V3 见图模式项)。
   **A3 穿刺版重点**:BF16 路径代理扫描(`torch_npu.npu_lightning_indexer`,R 代理)在 910B/C 上与原生
   逐字节同调用形态(仅 query 数/宽度不同),E2E 对比开关前后精度与 token 级正确性。
+  **【v3.4.10】PD-mixed NPU(eager)**:混合步(0<num_decodes<num_reqs)开关前后 token 级正确性一致,
+  decode 段 PIVOT 生效(对比开关前后 decode 段 topk 非逐位一致、但 SFA 消费后 token 级一致)、
+  prefill 段保持原生;graph 开关下 mixed 步仍走 eager(§5.1 路由),行为与纯 eager 一致。
 - **图模式**:capture `cudagraph_mode=FULL`(decode),验证 V3(refine 的 torch topk/matmul 录制)
-  ;对比 eager 输出的逐位一致性。
+  ;对比 eager 输出的逐位一致性。**【v3.4.10】仅纯 decode 入图;PD-mixed 不入图(§5)。**
 
 ## 8. 已知限制与后续
 
@@ -596,7 +716,10 @@ gather/matmul/relu/topk/masked_fill(标准 aclrt 算子或生产先例,§4.4),�
    入图;v3.3 的算子化 refine(TND+TND no-mask)与 kernel 级"代理扫描+refine 打分"融合均为
    后续性能优化(§8-13)。
 3. **窗口静态 W**:不随批内 seq_len 自适应;语义等价,仅宽度略大。
-4. **仅 decode**;prefill 保持现有 indexer 行为(开关不影响 prefill)。
+4. **仅 decode + PD-mixed 的 decode 段**【v3.4.10 修订】:纯 prefill 与 prefill 段保持现有 indexer 行为
+   (开关不影响 prefill);PD-mixed 的 **decode 段走 PIVOT(eager only,§4.7/§5)** -- 混合批 decode 段边界
+   动态,核心路由(SFA→FULL_DECODE_ONLY→dispatcher 无 mixed key)本就令 mixed 恒 eager,不入图;
+   原生 mixed 路径(attention_v1.py:1806-1880)同为 Python 边界切片、同受此约束,非 PIVOT 引入缺口。
 5. **草稿模型范围**:草稿 step-0 与主模型同 batch,共享 PIVOT 路径(GLM-5.2 上草稿模型强制 eager,
    §3.3-6);草稿步 1..d(g=1 + skip_topk)不适用。若后续要独立优化草稿步,另行评估。
 6. **代理均值量化域(V4)**:C8 下代理的量化方式可能引入小的 top-c 集差异;若 V4 不通过,

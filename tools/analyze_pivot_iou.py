@@ -1,29 +1,24 @@
 #!/usr/bin/env python3
-"""Offline analyzer for PIVOT step-to-step IoU probe captures.
+"""Offline analyzer for the PIVOT step-to-step top-k change probe.
 
-Reads the .npz files produced by vllm_ascend/attention/pivot_iou_probe.py
-and computes the four IoU families defined in
-plans/pivot_step_iou_measurement.md:
+Reads the .npz files produced by vllm_ascend/attention/pivot_iou_probe.py.
 
-  * IoU_coarse   coarse set (4096) overlap between adjacent decode steps,
-                 per request, within a layer
-  * IoU_refine   refine set (2048) overlap between adjacent decode steps,
-                 per query-row (same request, same row index i in the group)
-  * IoU_group    refine-set overlap among the g query rows of one request
-                 (MTP group internal consistency, innovation #4 premise)
-  * IoU_d(d)     refine IoU vs step distance d (persistence-pool refresh
-                 period)
+The probe does NOT store the big coarse/refine arrays. For each SFA layer and
+each adjacent pair of decode steps it records only the symmetric-difference
+counts of the top-k index sets:
 
-Cross-step request alignment: within a layer, request r at step t has query
-start offset s (cum_start). A live request at step t+1 has cum_start ==
-s + g (each decode step appends g query rows). Chains are matched by this
-exact equality; requests that finish / new requests that reset to 0 do not
-match and are dropped (no false pairing).
+  * coarse_diff = |C(t) Delta C(t+1)| per matched request, summed
+  * refine_diff = |R(t) Delta R(t+1)| per matched query-row, summed
+
+This answers the innovation-#1 premise directly: how much of the candidate
+pool actually changes between adjacent decode steps. Small diff counts vs the
+4096/2048 budget mean the pool is temporally stable -> worth reusing across
+steps.
 
 Pure CPU numpy -- no torch, no NPU. Run on any host with numpy.
 
 Usage:
-  python tools/analyze_pivot_iou.py /tmp/pivot_iou/ --out report.json
+  python tools/analyze_pivot_iou.py /tmp/pivot_iou/ --out report.json --plot report.png
 """
 
 from __future__ import annotations
@@ -33,6 +28,10 @@ import json
 import os
 
 import numpy as np
+
+# Budgets the probe compares against (doc: coarse 4096, refine 2048).
+_COARSE_BUDGET = 4096
+_REFINE_BUDGET = 2048
 
 
 def _load_rows(dir_path: str) -> list[dict]:
@@ -47,98 +46,48 @@ def _load_rows(dir_path: str) -> list[dict]:
     return rows
 
 
-def _pairwise_adjacent(rows: list[dict]):
-    """Group rows by layer, yield (t, t+1) pairs with aligned requests.
-
-    Within one layer, rows are ordered by step. Yields dicts:
-      {layer, g, t, coarse: [(A, B)], refine: [(A, B)], ...}
-    where A/B are numpy int arrays of a matched request (A = step t,
-    B = step t+1), refine paired per row index i.
-    """
-    by_layer: dict[str, list[dict]] = {}
-    for r in rows:
-        by_layer.setdefault(r["layer"], []).append(r)
-    for layer, lrows in by_layer.items():
-        lrows.sort(key=lambda r: r["step"])
-        for a, b in zip(lrows, lrows[1:]):
-            if a["step"] + 1 != b["step"] or a["g"] != b["g"]:
-                continue  # flushed across npz boundaries / g changed
-            g = a["g"]
-            # map request -> row index by cum_start
-            a_idx = {int(s): i for i, s in enumerate(a["cum_start"])}
-            b_idx = {int(s): i for i, s in enumerate(b["cum_start"])}
-            coarse_pairs: list[tuple] = []
-            refine_pairs: list[tuple] = []
-            for s, ia in a_idx.items():
-                ib = b_idx.get(s + g)
-                if ib is None:
-                    continue
-                coarse_pairs.append((a["coarse"][ia], b["coarse"][ib]))
-                ra = a["refine"][ia * g:(ia + 1) * g]
-                rb = b["refine"][ib * g:(ib + 1) * g]
-                if ra.shape[0] == g and rb.shape[0] == g:
-                    for i in range(g):
-                        refine_pairs.append((ra[i], rb[i]))
-            yield {"layer": layer, "g": g, "t": a["step"],
-                   "coarse": coarse_pairs, "refine": refine_pairs,
-                   "seq_lens_a": a["seq_lens"], "seq_lens_b": b["seq_lens"]}
-
-
-def _iou(a: np.ndarray, b: np.ndarray) -> float:
-    """Jaccard IoU of two 1-D position sets (values, order-independent)."""
-    av = set(int(x) for x in a if x >= 0)
-    bv = set(int(x) for x in b if x >= 0)
-    if not av and not bv:
-        return 1.0
-    inter = len(av & bv)
-    union = len(av | bv)
-    return inter / union if union else 1.0
-
-
-def _stats(vals: list[float], with_raw: bool = False) -> dict:
+def _stats(vals: list[float]) -> dict:
     if not vals:
         return {"n": 0}
     a = np.array(vals, dtype=np.float64)
-    out = {
+    return {
         "n": int(a.size),
         "mean": float(a.mean()),
         "median": float(np.median(a)),
         "p10": float(np.percentile(a, 10)),
         "p90": float(np.percentile(a, 90)),
     }
-    if with_raw:
-        out["raw"] = vals
-    return out
 
 
-def _verdict(coarse: dict, refine: dict, group: dict) -> str:
-    """Map measured IoU to the engineering premise (doc §4 judgment lines)."""
+def _verdict(coarse: dict, refine: dict) -> str:
+    """Map measured diff counts to the engineering premise (doc §4)."""
     cm = coarse.get("median", -1)
     lines = []
     if cm < 0:
-        lines.append("no coarse pairs -- nothing to judge")
-    elif cm >= 0.7:
-        lines.append("IoU_coarse median>=0.7: coarse sets highly overlapping -> "
-                     "persistent-pool premise HOLDS, design incremental refresh")
-    elif cm >= 0.4:
-        lines.append("IoU_coarse median in [0.4,0.7): moderate overlap -> pool "
-                     "feasible but refresh period must be short")
+        lines.append("no coarse records -- nothing to judge")
+    elif cm <= _COARSE_BUDGET * 0.3:
+        lines.append(f"coarse_diff median={cm:.0f} <= 30% of 4096: pool highly "
+                     "overlapping -> persistent-pool premise HOLDS, design "
+                     "incremental refresh")
+    elif cm <= _COARSE_BUDGET * 0.6:
+        lines.append(f"coarse_diff median={cm:.0f} in (30%,60%] of 4096: "
+                     "moderate overlap -> pool feasible but refresh period "
+                     "must be short")
     else:
-        lines.append("IoU_coarse median<0.4: premise REFUTED -> downgrade "
-                     "innovation #1 to short-window cache or drop")
+        lines.append(f"coarse_diff median={cm:.0f} > 60% of 4096: premise "
+                     "REFUTED -> downgrade innovation #1 to short-window cache")
     rm = refine.get("median", -1)
-    if rm >= 0.7:
-        lines.append("IoU_refine median>=0.7: refine sets stable -> P1 loss is "
-                     "dominated by coarse-screen misses, not refine churn")
-    gm = group.get("median", -1)
-    if gm >= 0.6:
-        lines.append("IoU_group median>=0.6: MTP group rows near-identical -> "
-                     "cross-group shared candidates (innovation #4) holds")
+    if rm >= 0:
+        frac = rm / _REFINE_BUDGET
+        if frac <= 0.3:
+            lines.append(f"refine_diff median={rm:.0f} <= 30% of 2048: refine "
+                         "sets stable -> P1 loss dominated by coarse-screen "
+                         "misses, not refine churn")
     return "; ".join(lines)
 
 
 def _plot(report: dict, out_base: str) -> None:
-    """Render the four IoU families to a single PNG (matplotlib optional)."""
+    """Render coarse/refine diff-count distributions to a single PNG."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -147,48 +96,33 @@ def _plot(report: dict, out_base: str) -> None:
         print("matplotlib not available; skipping plots")
         return
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle("PIVOT step-to-step IoU (GLM-5.2-w4a8 BF16 non-C8, A3)", fontsize=14)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig.suptitle("PIVOT adjacent-step top-k change (GLM-5.2-w4a8 BF16, A3)",
+                 fontsize=13)
     panels = [
-        ("iou_coarse", "coarse set (4096) adjacent-step IoU", axes[0, 0]),
-        ("iou_refine", "refine set (2048) adjacent-step IoU", axes[0, 1]),
-        ("iou_group", "MTP group-internal IoU (rows i vs i+1)", axes[1, 0]),
+        ("coarse_diff", "coarse set change |A△B| (budget 4096)", _COARSE_BUDGET, axes[0]),
+        ("refine_diff", "refine set change |A△B| (budget 2048)", _REFINE_BUDGET, axes[1]),
     ]
-    for key, title, ax in panels:
+    for key, title, budget, ax in panels:
         st = report[key]
         if not st.get("n"):
             ax.set_title(title + "\n(no data)")
             continue
-        ax.hist([0.0, 1.0], weights=[0, 0], bins=40)  # force axis [0,1]
-        ax.hist(st.get("raw", []), bins=40, alpha=0.7, color="#4c72b0")
+        raw = st["raw"]
+        ax.hist(raw, bins=40, alpha=0.7, color="#4c72b0")
         for stat, color in (("median", "red"), ("p10", "gray"), ("p90", "gray")):
             v = st.get(stat)
             if v is not None:
                 ax.axvline(v, color=color, ls="--", lw=1.2,
-                           label=f"{stat}={v:.3f}")
-        ax.axvline(0.7, color="green", ls=":", lw=1)
-        ax.set_xlim(0, 1)
-        ax.set_title(f"{title} (n={st['n']}, mean={st.get('mean', float('nan')):.3f})")
-        ax.set_xlabel("IoU"); ax.legend(fontsize=8)
-
-    # step-distance decay panel
-    ax = axes[1, 1]
-    dist = report.get("iou_vs_step_distance", {})
-    if dist:
-        ds = sorted(int(k) for k in dist)
-        med = [dist[str(d)]["median"] for d in ds]
-        p10 = [dist[str(d)]["p10"] for d in ds]
-        p90 = [dist[str(d)]["p90"] for d in ds]
-        ax.plot(ds, med, "o-", color="#4c72b0", label="median")
-        ax.fill_between(ds, p10, p90, alpha=0.25, color="#4c72b0", label="p10..p90")
-        ax.set_xlabel("step distance d")
-        ax.set_title("refine IoU vs step distance (refresh-period guide)")
-        ax.grid(True, alpha=0.3)
+                           label=f"{stat}={v:.0f}")
+        ax.axvline(budget * 0.3, color="green", ls=":", lw=1,
+                   label="30% budget")
+        ax.set_title(f"{title} (n={st['n']}, mean={st.get('mean', float('nan')):.0f})")
+        ax.set_xlabel("count of changed indices")
         ax.legend(fontsize=8)
-    else:
-        ax.set_title("step-distance decay\n(no d>1 chains)")
+        ax.grid(True, alpha=0.3)
 
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
     path = out_base + ".png"
     fig.savefig(path, dpi=150)
     print(f"wrote {path}")
@@ -204,104 +138,49 @@ def main() -> None:
     args = ap.parse_args()
 
     rows = _load_rows(args.dir)
-    print(f"loaded {len(rows)} captures")
+    print(f"loaded {len(rows)} (layer, step) records")
     if not rows:
         raise SystemExit("nothing to analyze")
 
     coarse_all: list[float] = []
     refine_all: list[float] = []
-    group_all: list[float] = []
-    dist: dict[int, list[float]] = {}
     per_layer: dict[str, dict] = {}
 
-    for p in _pairwise_adjacent(rows):
-        layer = p["layer"]
+    for r in rows:
+        layer = r["layer"]
         pl = per_layer.setdefault(layer, {"coarse": [], "refine": []})
-        for a, b in p["coarse"]:
-            v = _iou(a, b)
+        if "coarse_diff" in r:
+            # coarse_diff summed over matched requests; normalize per request
+            v = r["coarse_diff"] / max(1, r.get("n_req", 1))
             coarse_all.append(v)
             pl["coarse"].append(v)
-        for a, b in p["refine"]:
-            v = _iou(a, b)
+        if "refine_diff" in r:
+            v = r["refine_diff"] / max(1, r.get("n_req", 1))
             refine_all.append(v)
             pl["refine"].append(v)
-            dist.setdefault(1, []).append(v)
 
-    # Group-internal consistency: for every captured (layer, step, request),
-    # compute IoU between consecutive rows i, i+1 of the same request's
-    # refine block (g rows per request, rows are laid out request-major:
-    # request r occupies rows [r*g, (r+1)*g)). Pure within-step, so it needs
-    # no cross-step alignment -- read straight off the raw captures.
-    for r in rows:
-        g = r["g"]
-        if g < 2:
-            continue
-        ref = r["refine"]  # [D, 2048]
-        n_req = ref.shape[0] // g
-        for req in range(n_req):
-            blk = ref[req * g:(req + 1) * g]
-            if blk.shape[0] < 2:
-                continue
-            for i in range(blk.shape[0] - 1):
-                group_all.append(_iou(blk[i], blk[i + 1]))
-
-    # ---- step distance d = 2..5 via cum_start chains (cheap re-walk) ----
-    def _chain_pairs(d: int) -> list[tuple]:
-        out: list[tuple] = []
-        by_layer2: dict[str, list[dict]] = {}
-        for r in rows:
-            by_layer2.setdefault(r["layer"], []).append(r)
-        for layer, lrows in by_layer2.items():
-            lrows.sort(key=lambda r: r["step"])
-            for i in range(len(lrows) - d):
-                a, b = lrows[i], lrows[i + d]
-                if a["step"] + d != b["step"] or a["g"] != b["g"]:
-                    continue
-                g = a["g"]
-                ai = {int(s): j for j, s in enumerate(a["cum_start"])}
-                bi = {int(s): j for j, s in enumerate(b["cum_start"])}
-                for s, ja in ai.items():
-                    jb = bi.get(s + d * g)
-                    if jb is None:
-                        continue
-                    ra = a["refine"][ja * g:(ja + 1) * g]
-                    rb = b["refine"][jb * g:(jb + 1) * g]
-                    if ra.shape[0] == g and rb.shape[0] == g:
-                        for k in range(g):
-                            out.append((ra[k], rb[k]))
-        return out
-
-    for d in range(2, 6):
-        vals = [_iou(a, b) for a, b in _chain_pairs(d)]
-        if vals:
-            dist[d] = vals
-
-    # Raw IoU samples ride along for the histogram panels (kept out of the
-    # on-disk JSON to avoid bloat; _plot reads them before the report is
-    # serialized).
     report = {
-        "iou_coarse": _stats(coarse_all, with_raw=True),
-        "iou_refine": _stats(refine_all, with_raw=True),
-        "iou_group": _stats(group_all, with_raw=True),
-        "iou_vs_step_distance": {str(d): _stats(v) for d, v in sorted(dist.items())},
+        "coarse_diff": _stats(coarse_all),
+        "refine_diff": _stats(refine_all),
         "per_layer": {
-            k: {"iou_coarse": _stats(v["coarse"]), "iou_refine": _stats(v["refine"])}
+            k: {"coarse_diff": _stats(v["coarse"]),
+                "refine_diff": _stats(v["refine"])}
             for k, v in per_layer.items()
         },
-        "verdict": _verdict(_stats(coarse_all), _stats(refine_all),
-                            _stats(group_all)),
+        "verdict": _verdict(_stats(coarse_all), _stats(refine_all)),
     }
+
     out_base = None
     if args.plot:
         out_base = args.plot[:-4] if args.plot.endswith(".png") else args.plot
     elif args.out:
         out_base = args.out[:-5] if args.out.endswith(".json") else args.out
     if out_base:
-        _plot(report, out_base)
+        # raw samples ride along only for the histogram, then stripped
+        rp = report
+        _plot({"coarse_diff": dict(_stats(coarse_all), raw=coarse_all),
+               "refine_diff": dict(_stats(refine_all), raw=refine_all)}, out_base)
 
-    # Strip raw samples before writing the JSON report.
-    for key in ("iou_coarse", "iou_refine", "iou_group"):
-        report[key].pop("raw", None)
     print(json.dumps(report, indent=2, ensure_ascii=False))
     if args.out:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)

@@ -1,48 +1,43 @@
 # SPDX-License-Identifier: Apache-2.0
-"""PIVOT step-to-step IoU capture probe (measurement only, off by default).
+"""PIVOT step-to-step top-k change probe (measurement only, off by default).
 
-Purpose
--------
+What it measures
+----------------
 The engineering premise for the "temporal-persistent candidate pool"
-innovation (survey innovation #1) is that the coarse/refine top-k sets
-overlap heavily between adjacent decode steps. The literature (GVR
-2604.22312, FlexiCache 2511.00868) confirms this on GPU with a
-head-dependent nuance, but it must be measured on GLM-5.2-w4a8 BF16
-non-C8 (A3 / 910B) through this repo's PIVOT path before it is treated as
-an engineering fact. This probe captures the exact sets PIVOT consumes:
+innovation is that adjacent decode steps pick almost the same coarse/refine
+top-k sets. We measure exactly that, WITHOUT storing the big arrays: for each
+SFA layer, for each adjacent pair of decode steps, we count how many top-k
+indices changed (the symmetric-difference size |A Delta B|) for the same
+request, then throw the arrays away. Only these small integer counts are
+recorded.
 
-  * coarse set C         [K, 4096]   per-request (mean-proxy screen)
-  * refine set topk_dec  [D, 1, 2048] per-query-row (torch refine)
-
-Key design decisions
---------------------
-* Capture is keyed by (layer_name, step) -- the indexer runs once per SFA
-  layer per decode step, and step-to-step overlap is only meaningful within
-  a layer (the literature's per-layer finding). layer_name tags which SFA
-  impl instance produced the set.
-* Cross-step alignment of the same request is NOT done here: the probe
-  records per-request identity anchors (cumulative query start = the
-  request's row offset, seq_len) and the offline analyzer chains them.
-  cum_start increases monotonically for a live request and resets to 0 for
-  a new request, so chains are unambiguous.
-* Captured data is buffered on the Python side and flushed to .npz every
-  _FLUSH_STEPS steps so the hot path never grows unbounded. Two .cpu()
-  copies per layer per step is the only runtime cost, and only when the
-  probe is enabled.
-* Graph capture is skipped entirely (torch.npu.is_current_stream_capturing
-  -- same guard as pivot_indexer._capturing): capturing inside an NPUGraph
-  would freeze the snapshot to a single step.
+Design constraints (hard)
+-------------------------
+1. NON-BLOCKING: capture never blocks the decode hot path. Serialization +
+   disk I/O run on a daemon writer thread; capture only puts a tiny record
+   onto a queue and returns.
+2. BOUNDED MEMORY: we never accumulate the [K,4096]/[D,2048] arrays across
+   steps. We keep exactly ONE previous snapshot per layer (to compare against
+   the current step), compute the diff counts, then keep only the counts.
+   Peak memory = per-layer snapshot + small queue of integer records.
+3. SIMPLE: no fancy alignment/grouping/dist-decay logic here -- just per-layer
+   adjacent-step change counts. Keep it dumb and reliable.
+4. Graph capture is skipped (torch.npu.is_current_stream_capturing -- same
+   guard as pivot_indexer._capturing).
 """
 
 from __future__ import annotations
 
+import atexit
 import os
+import queue
+import threading
 
 import numpy as np
 import torch
 
-# Number of steps (per layer) to buffer before flushing a .npz file.
-_FLUSH_STEPS = 128
+# Number of diff records to buffer on the writer before writing a .npz.
+_FLUSH_STEPS = 256
 
 
 def _enabled() -> bool:
@@ -60,15 +55,54 @@ def _capturing() -> bool:
         return False
 
 
+def _diff_count(a: np.ndarray, b: np.ndarray) -> int:
+    """|A Delta B| -- number of top-k positions that differ (ignores -1 pad)."""
+    sa = set(int(x) for x in a if x >= 0)
+    sb = set(int(x) for x in b if x >= 0)
+    return len(sa ^ sb)
+
+
 class _IoUProbe:
-    """Buffers per-(layer, step) PIVOT top-k sets and flushes to .npz."""
+    """Per-layer adjacent-step top-k change counter. Non-blocking, bounded mem."""
+
+    _STOP = object()
 
     def __init__(self) -> None:
-        self._rows: list[dict] = []
-        self._steps: dict[str, int] = {}  # layer_name -> flushed step count
-        self._flushes = 0
+        # One previous snapshot per layer: {g, cum_start, coarse, refine}
+        self._prev: dict[str, dict] = {}
+        self._steps: dict[str, int] = {}
         self._out = _out_dir()
-        os.makedirs(self._out, exist_ok=True)
+        self._q: "queue.Queue" = queue.Queue()
+        self._worker = threading.Thread(target=self._writer, daemon=True)
+        self._worker.start()
+        try:
+            os.makedirs(self._out, exist_ok=True)
+        except OSError as e:
+            print(f"PIVOT[iou] cannot create {self._out}: {e!r}")
+
+    def _writer(self) -> None:
+        buf: list[dict] = []
+        flushes = 0
+        while True:
+            item = self._q.get()
+            if item is self._STOP:
+                self._dump(buf, flushes)
+                return
+            buf.append(item)
+            if len(buf) >= _FLUSH_STEPS:
+                flushes = self._dump(buf, flushes)
+                buf = []
+
+    def _dump(self, rows: list[dict], flushes: int) -> int:
+        if not rows:
+            return flushes
+        path = os.path.join(self._out, f"pivot_iou_{flushes:05d}.npz")
+        try:
+            np.savez_compressed(path, rows=rows)
+        except Exception as e:  # never let a dump failure kill the writer
+            print(f"PIVOT[iou] dump failed: {e!r}")
+            return flushes
+        return flushes + 1
 
     def capture(
         self,
@@ -84,38 +118,52 @@ class _IoUProbe:
         # decode segment rows [0, K) / [0, D) only; prefill tail excluded.
         step = self._steps.get(layer_name, 0)
         self._steps[layer_name] = step + 1
-        # Query start offset of request r = cumulative end of request r-1
-        # (request 0 starts at 0). Monotone across steps for a live request:
-        # each decode step appends g query rows, so the start shifts +g.
-        cum_k = cum[:K].cpu().numpy().astype(np.int64)
-        cum_start = np.concatenate([np.zeros(1, dtype=np.int64), cum_k[:-1]])
-        self._rows.append({
-            "layer": layer_name,
-            "step": step,
-            "g": g,
-            "seq_lens": seq_lens[:K].cpu().numpy().astype(np.int64),
-            "cum_start": cum_start,
-            "coarse": coarse[:K].cpu().numpy().astype(np.int64),
-            "refine": refine[:D, 0].cpu().numpy().astype(np.int64),
-        })
-        if step and step % _FLUSH_STEPS == 0:
-            self._flush()
 
-    def _flush(self) -> None:
-        if not self._rows:
-            return
-        rows = self._rows
-        self._rows = []
-        path = os.path.join(self._out, f"pivot_iou_{self._flushes:05d}.npz")
-        np.savez_compressed(path, rows=rows)
-        self._flushes += 1
+        cum_k = cum[:K].cpu().numpy()
+        cum_start = np.concatenate([np.zeros(1, dtype=cum_k.dtype), cum_k[:-1]])
+        coarse_c = coarse[:K].cpu().numpy()
+        refine_c = refine[:D, 0].cpu().numpy()
+
+        prev = self._prev.get(layer_name)
+        if prev is not None and prev["g"] == g:
+            # Same request at step t+1 has cum_start == s + g.
+            a_idx = {int(s): i for i, s in enumerate(prev["cum_start"])}
+            b_idx = {int(s): i for i, s in enumerate(cum_start)}
+            cdiff = rdiff = matched = 0
+            for s, ia in a_idx.items():
+                ib = b_idx.get(s + g)
+                if ib is None:
+                    continue
+                matched += 1
+                cdiff += _diff_count(prev["coarse"][ia], coarse_c[ib])
+                ra = prev["refine"][ia * g:(ia + 1) * g]
+                rb = refine_c[ib * g:(ib + 1) * g]
+                if ra.shape[0] == g and rb.shape[0] == g:
+                    rdiff += sum(_diff_count(ra[i], rb[i]) for i in range(g))
+            if matched:
+                self._q.put({
+                    "layer": layer_name,
+                    "step": step,
+                    "g": g,
+                    "coarse_diff": cdiff,
+                    "refine_diff": rdiff,
+                    "n_req": matched,
+                })
+
+        # Keep this step's snapshot as the next comparison baseline.
+        self._prev[layer_name] = {
+            "g": g,
+            "cum_start": cum_start,
+            "coarse": np.ascontiguousarray(coarse_c, dtype=np.int64),
+            "refine": np.ascontiguousarray(refine_c, dtype=np.int64),
+        }
 
     def finish(self) -> None:
-        self._flush()
+        self._q.put(self._STOP)
+        self._worker.join(timeout=30)
 
 
-# Module-level singleton; import is cheap (np/torch already loaded by
-# pivot_indexer callers), capture() no-ops when the env switch is off.
+# Module-level singleton; import is cheap, capture() no-ops when env is off.
 _probe: _IoUProbe | None = None
 
 
@@ -129,10 +177,7 @@ def capture(
     D: int,
     g: int,
 ) -> None:
-    """Entry point called from PivotIndexer.select_topk before returning.
-
-    No-ops unless VLLM_ASCEND_PIVOT_IOU_DUMP=1 and not in graph capture.
-    """
+    """Entry point called from PivotIndexer.select_topk before returning."""
     global _probe
     if not _enabled():
         return
@@ -148,3 +193,8 @@ def finish() -> None:
     if _probe is not None:
         _probe.finish()
         _probe = None
+
+
+# Flush the last (partial) batch on normal process exit. Idempotent; no-op
+# when the probe was never enabled (env off / graph capture skipped).
+atexit.register(finish)

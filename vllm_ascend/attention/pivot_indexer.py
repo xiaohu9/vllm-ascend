@@ -247,6 +247,24 @@ class PivotIndexer:
         logger.debug(
             "PIVOT refine: rows=%d/%d reqs=%d/%d g=%d", D, N, K, R_all, g
         )
+        # Step-to-step IoU measurement (innovation #1 premise). Captures the
+        # exact coarse/refine sets PIVOT consumed, keyed by layer+step; no-ops
+        # unless VLLM_ASCEND_PIVOT_IOU_DUMP=1 (see pivot_iou_probe.py).
+        try:
+            from vllm_ascend.attention.pivot_iou_probe import capture as _iou_capture
+
+            _iou_capture(
+                getattr(sfa_impl, "layer_name", None) or "",
+                seq_lens,
+                cum,
+                C,
+                topk_dec,
+                K,
+                D,
+                g,
+            )
+        except Exception:  # measurement must never take down the decode path
+            logger.warning("PIVOT[iou] capture failed", exc_info=True)
         return topk_indices
 
 

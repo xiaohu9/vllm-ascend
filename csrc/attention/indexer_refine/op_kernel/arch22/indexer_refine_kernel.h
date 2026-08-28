@@ -434,7 +434,7 @@ __aicore__ inline void IndexerRefineKernel<LIT>::Init(__gm__ uint8_t *query,
     uint64_t gatheredKeySize = static_cast<uint64_t>(constInfo.batchSize) * constInfo.kSeqSize * constInfo.kHeadNum *
                                constInfo.headDim * sizeof(K_T);
     gatheredKeyGm.SetGlobalBuffer((__gm__ K_T *)workspace, gatheredKeySize);
-    offset += IndexerRefineCommon::Align(gatheredKeySize, GM_ALIGN_BYTES);
+    offset += IndexerRefineCommon::Align(gatheredKeySize, static_cast<uint64_t>(GM_ALIGN_BYTES));
 
     // mm1开DoubleBuffer
     uint64_t singleCoreMm1ResSize = WS_DOUBLE * constInfo.mBaseSizeAlign * constInfo.s2BaseSize * sizeof(MM1_OUT_T);

@@ -422,9 +422,12 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
             LocalTensor<int32_t> candsSeg = candsFullUb[cuBaseS2Idx];
             LocalTensor<uint8_t> maskUb = reduceOutBuff[2 * cuS2LenVecAlign].template ReinterpretCast<uint8_t>();
             LocalTensor<float> negInfUb = reduceOutBuff[3 * cuS2LenVecAlign];
-            Compare(maskUb, candsSeg, -1, CMPMODE_EQ, cuS2Len);
+            // mask=(cand!=-1):true 保留原分、false(候选==-1)取 -inf;dst==src0 in-place(SFA 同款惯用法)
+            CompareScalar(maskUb, candsSeg, static_cast<int32_t>(-1), CMPMODE::NE, cuS2Len);
+            PipeBarrier<PIPE_V>();
             Duplicate(negInfUb.template ReinterpretCast<int32_t>(), IndexerRefineServiceVec::NEG_INF, cuS2LenVecAlign);
-            Select(sortScoreUb, negInfUb, sortScoreUb, maskUb, cuS2Len);
+            PipeBarrier<PIPE_V>();
+            Select(sortScoreUb, maskUb, sortScoreUb, negInfUb, SELMODE::VSEL_TENSOR_TENSOR_MODE, cuS2Len);
             PipeBarrier<PIPE_V>();
             LocalTensor<int32_t> sortIndiceUbInt = sortIndiceUb.template ReinterpretCast<int32_t>();
             // 无效数据索引填充为-1

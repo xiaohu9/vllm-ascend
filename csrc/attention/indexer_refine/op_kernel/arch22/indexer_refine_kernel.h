@@ -147,7 +147,7 @@ protected:
     __aicore__ inline void ProcessBaseBlock(uint32_t loop, uint64_t s2LoopIdx, IndexerRefineCommon::RunInfo &runInfo);
     __aicore__ inline void ProcessDecode();
     __aicore__ inline void ProcessInvalid();
-    __aicore__ inline void GatherCandidatesToWorkspace();
+    __aicore__ inline void GatherCandidatesToWorkspace(uint32_t rStart, uint32_t rEnd);
     // ================================Params Calc=====================================
     __aicore__ inline void CalcGS1LoopParams(uint32_t bN2Idx);
     __aicore__ inline void GetBN2Idx(uint32_t bN2Idx);
@@ -597,10 +597,10 @@ __aicore__ inline void IndexerRefineKernel<LIT>::Process()
 }
 
 template <typename LIT>
-__aicore__ inline void IndexerRefineKernel<LIT>::GatherCandidatesToWorkspace()
+__aicore__ inline void IndexerRefineKernel<LIT>::GatherCandidatesToWorkspace(uint32_t rStart, uint32_t rEnd)
 {
     if ASCEND_IS_AIV {
-        vectorService.GatherCandidates();
+        vectorService.GatherCandidates(rStart, rEnd);
     }
 }
 
@@ -626,25 +626,26 @@ __aicore__ inline void IndexerRefineKernel<LIT>::ProcessInvalid()
 template <typename LIT>
 __aicore__ inline void IndexerRefineKernel<LIT>::ProcessMain()
 {
-    if ASCEND_IS_AIV {
-        // stage-0:候选 key 从 PA cache 散列搬入 workspace(gather 内 SyncAll 全 AIV 屏障)。
-        // gather 是全局预阶段:按 GetBlockIdx()(0-47) 覆盖全部 AIV 核、覆盖 [0,batchSize) 全请求,
-        // 与按组(aiCoreIdx=GetBlockIdx()/2)的任务切分无关,故必须置于任务检查之前——
-        // 否则 blockDim < AIV组数 时部分 AIV 组漏 gather(数据缺失)且不达 SyncAll(死锁)。
-        // 屏障后任意 AIV 的预置 CrossCoreSetFlag(syncV1C1) 都表示 workspace 就绪,
-        // AIC 首个 matmul 的 CrossCoreWaitFlag(syncV1C1) 即完成屏障。
-        GatherCandidatesToWorkspace();
-    }
-
     if (aiCoreIdx >= usedCoreNum) {
-        // 无任务核直接返回
+        // 无任务核直接返回(同 lightning_indexer:任务检查最先,无任务核不参与任何同步)
         return;
     }
 
     if ASCEND_IS_AIV {
+        // stage-0:候选 key 从 PA cache 散列搬入 workspace。分核与本块 AIC matmul 任务对齐
+        // (只聚本块 bN2 范围覆盖的请求整行,两 AIV 按请求奇偶各半),故无跨块依赖、
+        // 无需 SyncAll 全局屏障(生产 lightning_indexer 主流水线只有事件标志,无 SyncAll)。
+        // gather 后以预置 syncV1C1×2 交接,AIC 首个 matmul 的 CrossCoreWaitFlag(syncV1C1) 完成屏障。
+        uint32_t rStart = splitCoreInfo.bN2Start / constInfo.kHeadNum;
+        uint32_t rEnd = splitCoreInfo.bN2End / constInfo.kHeadNum;
+        GatherCandidatesToWorkspace(rStart, rEnd);
+
         vectorService.AllocEventID();
-        CrossCoreSetFlag<IndexerRefineCommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
-        CrossCoreSetFlag<IndexerRefineCommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
+        // gather 经 MTE3 写 workspace,交接标志必须挂 PIPE_MTE3(标志的 PIPE=产生数据的 PIPE,
+        // 同 lightning_indexer_quant syncV1C1/syncV0C1 于 MTE3、sparse_attn_sharedkv syncV1C2 于 MTE3);
+        // 循环内 per-iter 的 syncV1C1 仍按生产 base 保持 PIPE_MTE2(mm1Res 槽位握手语义)。
+        CrossCoreSetFlag<IndexerRefineCommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(constInfo.syncV1C1);
+        CrossCoreSetFlag<IndexerRefineCommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(constInfo.syncV1C1);
     } else {
         matmulService.AllocEventID();
     }

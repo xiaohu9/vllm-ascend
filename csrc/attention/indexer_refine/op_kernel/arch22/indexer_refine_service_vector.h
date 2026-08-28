@@ -72,7 +72,7 @@ public:
                                                 GlobalTensor<int32_t> paBlockTableGm, GlobalTensor<K_T> paKeyGm,
                                                 GlobalTensor<K_T> gatheredKeyGm);
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
-    __aicore__ inline void GatherCandidates();
+    __aicore__ inline void GatherCandidates(uint32_t rStart, uint32_t rEnd);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
     __aicore__ inline void InitLDBuffers(TPipe *pipe);
@@ -238,14 +238,13 @@ IndexerRefineServiceVector<LIT>::InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm
 }
 
 // refine stage-0 gather:把候选 key 从 PA cache 散列搬入 workspace TND 布局。
-// 分核:按实际 AIV 核号 GetBlockIdx()(0-47)取 contiguous request 子块,
-// 保证 [0, batchSize) 全覆盖且同组两 AIV 不重复;本核 MTE3 flush + SyncAll
-// (AIV 核组 barrier)后,AIC 首个 matmul 的 CrossCoreWaitFlag(syncV1C1) 即完成屏障。
+// 分核与生产同步对齐:只聚本块 AIC 的 bN2 范围覆盖的请求整行 [rStart, rEnd](含),
+// 两 AIV(blockId_%2)按请求奇偶各聚一半 → 本块 AIC matmul 消费的 workspace 全部由本块
+// AIV 产出,块内 syncV1C1(预置 PIPE_MTE3)握手即可闭环,无跨块依赖、无需 SyncAll
+// (生产 lightning_indexer 主流水线只有事件标志,无 SyncAll)。
 template <typename LIT>
-__aicore__ inline void IndexerRefineServiceVector<LIT>::GatherCandidates()
+__aicore__ inline void IndexerRefineServiceVector<LIT>::GatherCandidates(uint32_t rStart, uint32_t rEnd)
 {
-    uint32_t aivNum = GetBlockNum() * 2; // c:v = 1:2
-    uint32_t myAivId = GetBlockIdx();
     uint32_t bs = constInfo_.kCacheBlockSize;
     uint32_t coarseCount = constInfo_.kSeqSize;
     LocalTensor<int32_t> candsUb = candsFullBuf_.Get<int32_t>();
@@ -254,10 +253,7 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::GatherCandidates()
     uint32_t candsRowBlocks = coarseCount * sizeof(int32_t) / 32;
     uint32_t keyLenBlocks = constInfo_.headDim * sizeof(K_T) / 32;
 
-    uint32_t perAiv = CeilDiv(constInfo_.batchSize, aivNum);
-    uint32_t rStart = myAivId * perAiv;
-    uint32_t rEnd = Min(rStart + perAiv, constInfo_.batchSize);
-    for (uint32_t rIdx = rStart; rIdx < rEnd; rIdx++) {
+    for (uint32_t rIdx = rStart + (blockId_ % 2); rIdx <= rEnd; rIdx += 2) {
         // 候选行整行入 UB;blockTable 行宽可 <8(int32 的 32B 对齐下限)且行 stride 非 32B,
         // DataCopy 无法整行搬(旧实现 btRowBlocks=0 → 未初始化 UB → 脏 slot → 非法 GM 读,即 507015 根因),
         // 改每 request 一次逐项 scalar 读入 UB,候选循环内改读 UB(同 AIC KeyNd2NzForPA 惯用法)
@@ -282,9 +278,9 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::GatherCandidates()
                               keyLenBlocks);
         }
     }
-    // 本核 MTE3 写 workspace 全部完成(全局可见),再与所有 AIV 对齐
+    // 本核 MTE3 写 workspace 全部完成;交接由 kernel 预置 CrossCoreSetFlag(syncV1C1, PIPE_MTE3) 承担
+    // (标志的 PIPE = 产生数据的 PIPE,同 lightning_indexer_quant 的 syncV1C1/syncV0C1 于 MTE3)
     AscendC::PipeBarrier<PIPE_MTE3>();
-    AscendC::SyncAll();
 }
 
 template <typename LIT>

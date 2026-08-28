@@ -19,6 +19,7 @@
 
 import logging
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -2317,6 +2318,13 @@ class NPUModelRunner(GPUModelRunner):
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
+            # PIVOT IoU probe: feed this step's REAL request IDs (batch order)
+            # so adjacent decode steps pair by exact request id. Env-gated;
+            # zero cost when the probe is disabled.
+            if os.environ.get("VLLM_ASCEND_PIVOT_IOU_DUMP") == "1":
+                from vllm_ascend.attention.pivot_iou_probe import set_step_request_ids
+
+                set_step_request_ids(self.input_batch.req_ids)
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )

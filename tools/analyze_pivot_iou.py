@@ -142,32 +142,86 @@ def main() -> None:
     if not rows:
         raise SystemExit("nothing to analyze")
 
-    coarse_all: list[float] = []
-    refine_all: list[float] = []
+    coarse_all: list[float] = []     # per-request coarse diff
+    refine_per_req: list[float] = []  # per-request refine diff (sum over g rows)
+    g_counts: dict[int, int] = {}
+    tot_K = 0   # prev requests available to match
+    tot_matched = 0  # requests that were uniquely matched
     per_layer: dict[str, dict] = {}
 
     for r in rows:
         layer = r["layer"]
-        pl = per_layer.setdefault(layer, {"coarse": [], "refine": []})
+        g = int(r.get("g", 0))
+        n_req = max(1, r.get("n_req", 1))
+        tot_K += int(r.get("K", 0))
+        tot_matched += int(r.get("n_req", 0))
+        if g > 0:
+            g_counts[g] = g_counts.get(g, 0) + 1
+        pl = per_layer.setdefault(layer, {"coarse": [], "refine_per_req": []})
         if "coarse_diff" in r:
             # coarse_diff summed over matched requests; normalize per request
-            v = r["coarse_diff"] / max(1, r.get("n_req", 1))
+            v = r["coarse_diff"] / n_req
             coarse_all.append(v)
             pl["coarse"].append(v)
         if "refine_diff" in r:
-            v = r["refine_diff"] / max(1, r.get("n_req", 1))
-            refine_all.append(v)
-            pl["refine"].append(v)
+            # refine_diff = sum over g rows AND over matched requests; keep
+            # per-request (sum over rows) so per-row = this / g.
+            v = r["refine_diff"] / n_req
+            refine_per_req.append(v)
+            pl["refine_per_req"].append(v)
+
+    coarse_stats = _stats(coarse_all)
+    refine_per_req_stats = _stats(refine_per_req)
+
+    # Derive per-row refine diff from the dominant g (or median g of records).
+    g_mode = max(g_counts, key=g_counts.get) if g_counts else None
+    if g_mode:
+        per_row = [v / g_mode for v in refine_per_req]
+        refine_per_row_stats = _stats(per_row)
+        # IoU implied by the median diff vs the per-row budget (2048): if the
+        # measured budget differs this is only approximate -- g/budget are the
+        # two unknowns the probe must confirm.
+        rd = refine_per_row_stats.get("median", -1)
+        if rd >= 0 and rd <= _REFINE_BUDGET:
+            refine_iou = (_REFINE_BUDGET * 2 - rd) / (_REFINE_BUDGET * 2 + rd)
+        else:
+            refine_iou = None  # diff exceeds budget -> budget/g mismatch, trust nothing
+    else:
+        refine_per_row_stats = {"n": 0}
+        refine_iou = None
+
+    # IoU implied by the median coarse diff (per-request, budget 4096).
+    cd = coarse_stats.get("median", -1)
+    coarse_iou = (_COARSE_BUDGET * 2 - cd) / (_COARSE_BUDGET * 2 + cd) if 0 <= cd <= _COARSE_BUDGET else None
 
     report = {
-        "coarse_diff": _stats(coarse_all),
-        "refine_diff": _stats(refine_all),
+        "config": {
+            "g_counts": g_counts,
+            "g_mode": g_mode,
+            "coarse_budget": _COARSE_BUDGET,
+            "refine_budget": _REFINE_BUDGET,
+        },
+        # Match quality: what fraction of prev requests could be uniquely
+        # matched by exact request-id (the probe pairs by real req id string,
+        # never by heuristic). Low (<0.5) => batch churns a lot between steps;
+        # the diff numbers are then based on a small, possibly biased sample
+        # and should be read with caution.
+        "matching": {
+            "prev_requests": tot_K,
+            "matched_requests": tot_matched,
+            "match_rate": round(tot_matched / tot_K, 4) if tot_K else None,
+        },
+        "coarse_diff_per_req": coarse_stats,
+        "coarse_median_iou": coarse_iou,
+        "refine_diff_per_req": refine_per_req_stats,
+        "refine_diff_per_row": refine_per_row_stats,
+        "refine_median_iou": refine_iou,
         "per_layer": {
-            k: {"coarse_diff": _stats(v["coarse"]),
-                "refine_diff": _stats(v["refine"])}
+            k: {"coarse_diff_per_req": _stats(v["coarse"]),
+                "refine_diff_per_req": _stats(v["refine_per_req"])}
             for k, v in per_layer.items()
         },
-        "verdict": _verdict(_stats(coarse_all), _stats(refine_all)),
+        "verdict": _verdict(coarse_stats, refine_per_req_stats),
     }
 
     out_base = None
@@ -176,10 +230,11 @@ def main() -> None:
     elif args.out:
         out_base = args.out[:-5] if args.out.endswith(".json") else args.out
     if out_base:
-        # raw samples ride along only for the histogram, then stripped
-        rp = report
+        # raw samples ride along only for the histogram, then stripped.
+        # refine panel uses per-row diff (÷g) so the "budget 2048" axis holds.
+        refine_plot = per_row if g_mode else refine_per_req
         _plot({"coarse_diff": dict(_stats(coarse_all), raw=coarse_all),
-               "refine_diff": dict(_stats(refine_all), raw=refine_all)}, out_base)
+               "refine_diff": dict(_stats(refine_plot), raw=refine_plot)}, out_base)
 
     print(json.dumps(report, indent=2, ensure_ascii=False))
     if args.out:

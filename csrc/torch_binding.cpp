@@ -39,6 +39,7 @@
 #include "gmm/grouped_matmul_swiglu_quant_weight_nz_tensor_list/grouped_matmul_swiglu_quant_torch_adpt.h"
 #include "gmm/grouped_matmul_swiglu_quant_v2/grouped_matmul_swiglu_quant_v2_torch_adpt.h"
 #include "attention/lightning_indexer/lightning_indexer_torch_adpt.h"
+#include "attention/indexer_refine/indexer_refine_torch_adpt.h"
 #include "mc2/matmul_allreduce_add_rmsnorm/matmul_allreduce_add_rmsnorm_torch_adpt.h"
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "moe/moe_init_routing_custom/moe_init_routing_custom_torch_adpt.h"
@@ -2405,6 +2406,19 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         ") -> (Tensor sparse_indices, Tensor sparse_values)"
     );
     ops.impl("npu_lightning_indexer", torch::kPrivateUse1, &vllm_ascend::npu_lightning_indexer);
+
+    ops.def(
+        "npu_indexer_refine("
+            "Tensor query, Tensor key, Tensor weights, Tensor candidates, "
+            "*, "
+            "Tensor? actual_seq_lengths_query=None, "
+            "Tensor? actual_seq_lengths_key=None, "
+            "Tensor? block_table=None, "
+            "str layout_query=\"TND\", str layout_key=\"PA_BSND\", "
+            "int sparse_count=2048"
+        ") -> Tensor"
+    );
+    ops.impl("npu_indexer_refine", torch::kPrivateUse1, &vllm_ascend::npu_indexer_refine);
 
     ops.def(
         "npu_sparse_flash_attention(Tensor query, Tensor key, Tensor value,"

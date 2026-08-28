@@ -287,6 +287,39 @@ std::tuple<at::Tensor, at::Tensor> npu_lightning_indexer_meta(
     return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
 }
 
+at::Tensor npu_indexer_refine_meta(
+    const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
+    const at::Tensor &candidates,
+    const c10::optional<at::Tensor> &actual_seq_lengths_query,
+    const c10::optional<at::Tensor> &actual_seq_lengths_key,
+    const c10::optional<at::Tensor> &block_table, c10::string_view layout_query,
+    c10::string_view layout_key, int64_t sparse_count)
+{
+    // npu tensor max size
+    constexpr int64_t SIZE = 8;
+    constexpr int64_t DIM_0 = 0;
+    constexpr int64_t DIM_2 = 2;
+
+    TORCH_CHECK(query.numel() > 0, "Query is empty.");
+    TORCH_CHECK(key.numel() > 0, "Key is empty.");
+    TORCH_CHECK(weights.numel() > 0, "Weights is empty.");
+    TORCH_CHECK(candidates.numel() > 0, "Candidates is empty.");
+    for (size_t i = 0; i < query.sizes().size(); i++) {
+        TORCH_CHECK(query.size(i) > 0, "All values within query's shape should be greater "
+                                       "than 0, but shape[", i, "] is ", query.size(i));
+    }
+    TORCH_CHECK(sparse_count > 0, "sparse count should be greater than 0, but now is ", sparse_count);
+    // refine 固定 TND query + PA_BSND key: out [T, key.shape[2](恒1), refineCount]
+    std::string query_layout_str = std::string(layout_query);
+    std::string key_layout_str = std::string(layout_key);
+    TORCH_CHECK(query_layout_str == "TND",
+                "layout_query only supported TND for refine, but got ", query_layout_str);
+    TORCH_CHECK(key_layout_str == "PA_BSND",
+                "layout_key only supported PA_BSND for refine, but got ", key_layout_str);
+    at::SmallVector<int64_t, SIZE> output_size = {query.size(DIM_0), key.size(DIM_2), sparse_count};
+    return at::empty(output_size, query.options().dtype(at::kInt));
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention_meta(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
     const at::Tensor &sparse_indices, double scale_value,
@@ -1811,6 +1844,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("dispatch_gmm_combine_decode", &vllm_ascend::meta::dispatch_gmm_combine_decode_meta);
     // Lightning indexer
     ops.impl("npu_lightning_indexer", &vllm_ascend::meta::npu_lightning_indexer_meta);
+    // Indexer refine
+    ops.impl("npu_indexer_refine", &vllm_ascend::meta::npu_indexer_refine_meta);
     // Sparse flash attention
     ops.impl("npu_sparse_flash_attention", &vllm_ascend::meta::npu_sparse_flash_attention_meta);
     ops.impl("npu_kv_quant_sparse_flash_attention",

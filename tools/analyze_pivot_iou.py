@@ -86,8 +86,8 @@ def _verdict(coarse: dict, refine: dict) -> str:
     return "; ".join(lines)
 
 
-def _plot(report: dict, out_base: str) -> None:
-    """Render coarse/refine diff-count distributions to a single PNG."""
+def _plot(report: dict, per_layer: dict, out_base: str) -> None:
+    """Render coarse/refine diff-count distributions + per-layer medians."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -96,7 +96,7 @@ def _plot(report: dict, out_base: str) -> None:
         print("matplotlib not available; skipping plots")
         return
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
     fig.suptitle("PIVOT adjacent-step top-k change (GLM-5.2-w4a8 BF16, A3)",
                  fontsize=13)
     panels = [
@@ -121,6 +121,34 @@ def _plot(report: dict, out_base: str) -> None:
         ax.set_xlabel("count of changed indices")
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
+
+    # Panel 3: per-layer medians -- the per-layer numbers carried in
+    # report.json's per_layer section, as bars so uneven layers stand out.
+    ax3 = axes[2]
+    layers = sorted(per_layer.keys())
+    if not layers:
+        ax3.set_title("per-layer median diff\n(no layer data)")
+    else:
+        coarse_m = [float(np.median(per_layer[l]["coarse"]))
+                    if per_layer[l]["coarse"] else 0.0 for l in layers]
+        refine_m = [float(np.median(per_layer[l]["refine_per_req"]))
+                    if per_layer[l]["refine_per_req"] else 0.0 for l in layers]
+        x = np.arange(len(layers))
+        w = 0.4
+        ax3.bar(x - w / 2, coarse_m, w, label="coarse_diff", color="#4c72b0")
+        ax3.bar(x + w / 2, refine_m, w, label="refine_diff", color="#dd8452")
+        ax3.axhline(_COARSE_BUDGET * 0.3, color="#4c72b0", ls=":", lw=1.2,
+                    label="30% coarse budget")
+        ax3.axhline(_REFINE_BUDGET * 0.3, color="#dd8452", ls=":", lw=1.2,
+                    label="30% refine budget")
+        stride = max(1, (len(layers) + 29) // 30)  # cap tick count
+        ax3.set_xticks(x[::stride])
+        ax3.set_xticklabels([layers[i] for i in range(0, len(layers), stride)],
+                            rotation=90, fontsize=7)
+        ax3.set_title(f"per-layer median diff (n_layers={len(layers)})")
+        ax3.set_xlabel("layer")
+        ax3.legend(fontsize=7)
+        ax3.grid(True, alpha=0.3, axis="y")
 
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     path = out_base + ".png"
@@ -234,7 +262,8 @@ def main() -> None:
         # refine panel uses per-row diff (÷g) so the "budget 2048" axis holds.
         refine_plot = per_row if g_mode else refine_per_req
         _plot({"coarse_diff": dict(_stats(coarse_all), raw=coarse_all),
-               "refine_diff": dict(_stats(refine_plot), raw=refine_plot)}, out_base)
+               "refine_diff": dict(_stats(refine_plot), raw=refine_plot)},
+              per_layer, out_base)
 
     print(json.dumps(report, indent=2, ensure_ascii=False))
     if args.out:

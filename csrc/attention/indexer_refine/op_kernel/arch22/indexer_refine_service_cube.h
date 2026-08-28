@@ -74,7 +74,7 @@ protected:
                                           uint64_t s1gL0RealSize, const IndexerRefineCommon::RunInfo &runInfo);
     __aicore__ inline void QueryNd2Nz(uint64_t s1gL1RealSize, uint64_t s1gL1Offset, const IndexerRefineCommon::RunInfo &runInfo);
     __aicore__ inline void KeyNd2Nz(uint64_t s2L1RealSize, uint64_t s2GmOffset, const IndexerRefineCommon::RunInfo &runInfo);
-    __aicore__ inline void KeyNd2NzForPA(uint64_t s2L1RealSize, uint64_t s2GmOffset, const IndexerRefineCommon::RunInfo &runInfo);
+    __aicore__ inline void KeyNd2NzForWorkspace(uint64_t s2L1RealSize, uint64_t s2GmOffset, const IndexerRefineCommon::RunInfo &runInfo);
     GlobalTensor<int32_t> blkTableGm_;
     GlobalTensor<K_T> keyGm_;
     GlobalTensor<Q_T> queryGm_;
@@ -150,7 +150,8 @@ __aicore__ inline void IndexerRefineServiceCube<LIT>::ComputeMm1(const IndexerRe
         uint64_t s2L1RealSize =
             s2GmOffset + S2_BASIC_BLOCK > s2ProcessSize ? s2ProcessSize - s2GmOffset : S2_BASIC_BLOCK;
         if (PAGE_ATTENTION) {
-            KeyNd2NzForPA(s2L1RealSize, s2GmBaseOffset + s2GmOffset, runInfo);
+            // refine:key 已由 AIV stage-0 gather 搬入 TND workspace,按候选全局下标直读(等效 KeyNd2Nz)
+            KeyNd2NzForWorkspace(s2L1RealSize, s2GmBaseOffset + s2GmOffset, runInfo);
         }else {
             KeyNd2Nz(s2L1RealSize, s2GmOffset, runInfo);
         }
@@ -241,23 +242,21 @@ __aicore__ inline void IndexerRefineServiceCube<LIT>::KeyNd2Nz(uint64_t s2L1Real
 
 // blkNum, blkSize, N2, D
 template <typename LIT>
-__aicore__ inline void IndexerRefineServiceCube<LIT>::KeyNd2NzForPA(uint64_t s2L1RealSize, uint64_t s2GmOffset,
+__aicore__ inline void IndexerRefineServiceCube<LIT>::KeyNd2NzForWorkspace(uint64_t s2L1RealSize, uint64_t s2GmOffset,
                                                     const IndexerRefineCommon::RunInfo &runInfo)
 {
+    // refine:key 输入 = AIV stage-0 gather 后的 workspace[TND 连续, R*coarseCount*Dh]。
+    // 原始 PA 块表语义已在上游 gather 消化,此处按候选全局下标直读,与 KeyNd2Nz 同构
+    // (不再用 blkTableGm_:PA 布局非每请求连续时块表偏移会指向错误候选,旧实现属克隆残留)。
     uint64_t s2L1Offset = 0;
     while (s2L1Offset < s2L1RealSize) {
-        uint64_t s2BlkId = (s2L1Offset + s2GmOffset) / constInfo_.kCacheBlockSize;
-        uint64_t s2BlkOffset = (s2L1Offset + s2GmOffset) % constInfo_.kCacheBlockSize;
-        uint64_t keyGmOffset = blkTableGm_.GetValue(runInfo.bIdx * constInfo_.maxBlockNumPerBatch + s2BlkId) *
-                                   constInfo_.kCacheBlockSize * constInfo_.kHeadNum * constInfo_.headDim +
-                               s2BlkOffset * constInfo_.headDim;
+        uint64_t keyGmOffset = (runInfo.bIdx * constInfo_.kSeqSize + s2GmOffset + s2L1Offset) * constInfo_.headDim;
         // 搬运按照S2_BASIC_BLOCK_L0*D_BASIC_BLOCK_L0的方式在l1上排布, 方便后续mte1
         // 根据s2的offset判断当前属于前一个L0分型还是后一个L0分型，暂时只支持两个分型
         uint64_t s2Mte2Size = (s2L1RealSize <= S2_BASIC_BLOCK_L0 || s2L1Offset >= S2_BASIC_BLOCK_L0) ?
                                   s2L1RealSize - s2L1Offset :
                                   S2_BASIC_BLOCK_L0 - s2L1Offset;
-        s2Mte2Size = s2BlkOffset + s2Mte2Size >= constInfo_.kCacheBlockSize ? constInfo_.kCacheBlockSize - s2BlkOffset :
-                                                                              s2Mte2Size;
+
         Nd2NzParams nd2nzPara;
         nd2nzPara.ndNum = 1;
         nd2nzPara.nValue = s2Mte2Size; // 行数

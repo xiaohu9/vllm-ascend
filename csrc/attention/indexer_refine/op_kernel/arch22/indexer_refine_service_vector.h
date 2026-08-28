@@ -252,16 +252,19 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::GatherCandidates()
     LocalTensor<int32_t> btRowUb = candsUb[coarseCount];
     LocalTensor<K_T> keyTmpUb = candsUb[coarseCount + constInfo_.maxBlockNumPerBatch].template ReinterpretCast<K_T>();
     uint32_t candsRowBlocks = coarseCount * sizeof(int32_t) / 32;
-    uint32_t btRowBlocks = constInfo_.maxBlockNumPerBatch * sizeof(int32_t) / 32;
     uint32_t keyLenBlocks = constInfo_.headDim * sizeof(K_T) / 32;
 
     uint32_t perAiv = CeilDiv(constInfo_.batchSize, aivNum);
     uint32_t rStart = myAivId * perAiv;
     uint32_t rEnd = Min(rStart + perAiv, constInfo_.batchSize);
     for (uint32_t rIdx = rStart; rIdx < rEnd; rIdx++) {
-        // 候选行 + blockTable 行整行入 UB,后续 UB 内 scalar 读
+        // 候选行整行入 UB;blockTable 行宽可 <8(int32 的 32B 对齐下限)且行 stride 非 32B,
+        // DataCopy 无法整行搬(旧实现 btRowBlocks=0 → 未初始化 UB → 脏 slot → 非法 GM 读,即 507015 根因),
+        // 改每 request 一次逐项 scalar 读入 UB,候选循环内改读 UB(同 AIC KeyNd2NzForPA 惯用法)
         AscendC::DataCopy(candsUb, candidatesGm_[rIdx * coarseCount], candsRowBlocks);
-        AscendC::DataCopy(btRowUb, paBlockTableGm_[rIdx * constInfo_.maxBlockNumPerBatch], btRowBlocks);
+        for (uint32_t bIdx = 0; bIdx < constInfo_.maxBlockNumPerBatch; bIdx++) {
+            btRowUb.SetValue(bIdx, paBlockTableGm_.GetValue(rIdx * constInfo_.maxBlockNumPerBatch + bIdx));
+        }
         AscendC::PipeBarrier<PIPE_MTE2>();
         for (uint32_t cIdx = 0; cIdx < coarseCount; cIdx++) {
             int32_t cand = candsUb.GetValue(cIdx);

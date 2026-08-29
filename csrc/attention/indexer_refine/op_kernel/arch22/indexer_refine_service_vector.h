@@ -417,16 +417,22 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
             Duplicate(sortScoreUb.template ReinterpretCast<int32_t>(), IndexerRefineServiceVec::NEG_INF, cuS2LenVecAlign);
             PipeBarrier<PIPE_V>();
             Adds(sortScoreUb, reduceOutInner, 0.0f, cuS2Len);
-            // refine scattered mask:cand==-1 的列分数置 -inf → topk 沉底 → 尾部输出自动 -1
+            // refine scattered mask:cand==-1 的列分数置 -inf → topk 沉底 → 尾部输出自动 -1。
+            // dav_c220 vsel 仅接受 __ubuf__ half*,float Select 同样无法编译 → 算术替代:
+            //   mask=(cand!=-1):cand≥-1 ⇒ t=cand+1≥0,mask=(t>=1)?1:0 = Mins(t,t,1)(单条,免 bit-mask)
+            //   位级 (score_bits-NEG_INF)*mask+NEG_INF:mask=1→原分、mask=0→NEG_INF(0xFF800000)
             LocalTensor<int32_t> candsSeg = candsFullUb[cuBaseS2Idx];
-            LocalTensor<uint8_t> maskUb = reduceOutBuff[2 * cuS2LenVecAlign].template ReinterpretCast<uint8_t>();
             LocalTensor<float> negInfUb = reduceOutBuff[3 * cuS2LenVecAlign];
-            // mask=(cand!=-1):true 保留原分、false(候选==-1)取 -inf;dst==src0 in-place(SFA 同款惯用法)
-            CompareScalar(maskUb, candsSeg, static_cast<int32_t>(-1), CMPMODE::NE, cuS2Len);
-            PipeBarrier<PIPE_V>();
             Duplicate(negInfUb.template ReinterpretCast<int32_t>(), IndexerRefineServiceVec::NEG_INF, cuS2LenVecAlign);
             PipeBarrier<PIPE_V>();
-            Select(sortScoreUb, maskUb, sortScoreUb, negInfUb, SELMODE::VSEL_TENSOR_TENSOR_MODE, cuS2Len);
+            LocalTensor<int32_t> maskI32 = sortIndiceUb.template ReinterpretCast<int32_t>(); // 复用 sortIndiceUb 段,L437 前会被重写
+            Adds(maskI32, candsSeg, static_cast<int32_t>(1), cuS2Len);
+            Mins(maskI32, maskI32, static_cast<int32_t>(1), cuS2Len);
+            PipeBarrier<PIPE_V>();
+            LocalTensor<int32_t> scoreI32 = sortScoreUb.template ReinterpretCast<int32_t>();
+            Subs(scoreI32, scoreI32, IndexerRefineServiceVec::NEG_INF, cuS2Len);
+            Mul(scoreI32, scoreI32, maskI32, cuS2Len);
+            Adds(scoreI32, scoreI32, IndexerRefineServiceVec::NEG_INF, cuS2Len);
             PipeBarrier<PIPE_V>();
             LocalTensor<int32_t> sortIndiceUbInt = sortIndiceUb.template ReinterpretCast<int32_t>();
             // 无效数据索引填充为-1
@@ -504,9 +510,14 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
                     LocalTensor<int32_t> truePosUb = outValueUb[2 * offset].template ReinterpretCast<int32_t>();
                     // refine true_pos guard:globalTopk init 的 (-inf,-1) 槽被 topk 选中时列号=-1,
                     // ×4 → 0xFFFFFFFC → 4GB 字节偏移越界读。留 (列号>=0) 掩码 + clamp 列号到 0,
-                    // Gather 后按掩码把无效槽写回 -1(有效候选→真实值, 无效槽→-1, 语义不变)
-                    LocalTensor<uint8_t> validMask = outValueUb[2 * offset + copyLen].template ReinterpretCast<uint8_t>();
-                    CompareScalar(validMask, idxULocal1, static_cast<int32_t>(0), CMPMODE::GE, copyLen);
+                    // Gather 后按掩码把无效槽写回 -1(有效候选→真实值, 无效槽→-1, 语义不变)。
+                    // dav_c220 vsel 仅接受 __ubuf__ half*,int32 Select 无法编译 → 算术替代:
+                    //   mask=(col>=0)?1:0 由 Mins(col,0)→Maxs(-1)→Adds(1) 生成(免 CompareScalar bit-mask),
+                    //   dst=(src+1)*mask-1:mask=1→src、mask=0→-1。mask 暂存 value 段(offset>=copyLen)
+                    LocalTensor<int32_t> maskI32 = outValueUb.template ReinterpretCast<int32_t>();
+                    Mins(maskI32, idxULocal1, static_cast<int32_t>(0), copyLen);
+                    Maxs(maskI32, maskI32, static_cast<int32_t>(-1), copyLen);
+                    Adds(maskI32, maskI32, static_cast<int32_t>(1), copyLen);
                     PipeBarrier<PIPE_V>();
                     Maxs(idxULocal1, idxULocal1, static_cast<int32_t>(0), copyLen);
                     PipeBarrier<PIPE_V>();
@@ -514,9 +525,9 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
                     AscendC::Gather(truePosUb, candsFullUb, idxULocal1.template ReinterpretCast<uint32_t>(), 0,
                                     copyLen);
                     PipeBarrier<PIPE_MTE2>();
-                    Duplicate(idxULocal1, static_cast<int32_t>(-1), copyLen); // idx 段复用为 -1 常量
-                    PipeBarrier<PIPE_V>();
-                    Select(truePosUb, validMask, truePosUb, idxULocal1, SELMODE::VSEL_TENSOR_TENSOR_MODE, copyLen);
+                    Adds(truePosUb, truePosUb, static_cast<int32_t>(1), copyLen);
+                    Mul(truePosUb, truePosUb, maskI32, copyLen);
+                    Adds(truePosUb, truePosUb, static_cast<int32_t>(-1), copyLen);
                     PipeBarrier<PIPE_V>();
                     outQueue_.EnQue<float>(outValueUb);
                     outValueUb = outQueue_.DeQue<float>();
@@ -763,9 +774,14 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessLD()
         AscendC::DataCopy(candsFullUb, candidatesGm_[bn2Idx * constInfo_.kSeqSize],
                           constInfo_.kSeqSize * sizeof(int32_t) / 32);
         AscendC::PipeBarrier<PIPE_MTE2>();
-        // refine true_pos guard:与 ProcessVec 同款 — (列号>=0) 掩码 + clamp, Gather 后无效槽写回 -1
-        LocalTensor<uint8_t> validMask = tmpUb.template ReinterpretCast<uint8_t>();
-        CompareScalar(validMask, idxULocal1, static_cast<int32_t>(0), CMPMODE::GE, constInfo_.sparseCount);
+        // refine true_pos guard:与 ProcessVec 同款 — (列号>=0) 掩码 + clamp, Gather 后无效槽写回 -1。
+        // dav_c220 vsel 仅接受 __ubuf__ half*,int32 Select 无法编译 → 算术替代:
+        //   mask=(col>=0)?1:0 由 Mins(col,0)→Maxs(-1)→Adds(1) 生成(免 CompareScalar bit-mask),
+        //   dst=(src+1)*mask-1:mask=1→src、mask=0→-1。mask 暂存 tmpUb(原 validMask 段,此处空闲)
+        LocalTensor<int32_t> maskI32 = tmpUb.template ReinterpretCast<int32_t>();
+        Mins(maskI32, idxULocal1, static_cast<int32_t>(0), constInfo_.sparseCount);
+        Maxs(maskI32, maskI32, static_cast<int32_t>(-1), constInfo_.sparseCount);
+        Adds(maskI32, maskI32, static_cast<int32_t>(1), constInfo_.sparseCount);
         PipeBarrier<PIPE_V>();
         Maxs(idxULocal1, idxULocal1, static_cast<int32_t>(0), constInfo_.sparseCount);
         PipeBarrier<PIPE_V>();
@@ -774,9 +790,9 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessLD()
         AscendC::Gather(truePosUb, candsFullUb, idxULocal1.template ReinterpretCast<uint32_t>(), 0,
                         constInfo_.sparseCount);
         AscendC::PipeBarrier<PIPE_MTE2>();
-        Duplicate(idxULocal1, static_cast<int32_t>(-1), constInfo_.sparseCount); // idx 段复用为 -1 常量
-        PipeBarrier<PIPE_V>();
-        Select(truePosUb, validMask, truePosUb, idxULocal1, SELMODE::VSEL_TENSOR_TENSOR_MODE, constInfo_.sparseCount);
+        Adds(truePosUb, truePosUb, static_cast<int32_t>(1), constInfo_.sparseCount);
+        Mul(truePosUb, truePosUb, maskI32, constInfo_.sparseCount);
+        Adds(truePosUb, truePosUb, static_cast<int32_t>(-1), constInfo_.sparseCount);
         PipeBarrier<PIPE_V>();
         SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
         SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);

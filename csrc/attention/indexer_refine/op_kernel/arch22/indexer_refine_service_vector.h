@@ -430,7 +430,8 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
             Mins(maskI32, maskI32, static_cast<int32_t>(1), cuS2Len);
             PipeBarrier<PIPE_V>();
             LocalTensor<int32_t> scoreI32 = sortScoreUb.template ReinterpretCast<int32_t>();
-            Subs(scoreI32, scoreI32, IndexerRefineServiceVec::NEG_INF, cuS2Len);
+            // dav_c220 缺 SubsImpl(接口声明在、实现缺失,CANN 9.1.0) → 补码等价: x - 0xFF800000 ≡ x + 0x00800000
+            Adds(scoreI32, scoreI32, static_cast<int32_t>(-IndexerRefineServiceVec::NEG_INF), cuS2Len);
             Mul(scoreI32, scoreI32, maskI32, cuS2Len);
             Adds(scoreI32, scoreI32, IndexerRefineServiceVec::NEG_INF, cuS2Len);
             PipeBarrier<PIPE_V>();

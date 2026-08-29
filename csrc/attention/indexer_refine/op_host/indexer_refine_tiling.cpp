@@ -506,7 +506,7 @@ ge::graphStatus IndexerRefineInfoParser::ValidateInputShapesMatch()
     // -----------------------check refineCount(输出 topk 宽)-------------------
     OP_CHECK_IF((opParamInfo_.attenOut.shape->GetStorageShape().GetDim(DIM_IDX_TWO) != *opParamInfo_.sparseCount),
                OP_LOGE(opName_, "output sparse_indices shape last dim must be same as attr sparse_count,"
-                       "but now they are %u, %ld respectively.", *opParamInfo_.sparseCount,
+                       "but now they are %u, %ld respectively.", static_cast<uint32_t>(*opParamInfo_.sparseCount),
                        opParamInfo_.attenOut.shape->GetStorageShape().GetDim(DIM_IDX_TWO)),
                return ge::GRAPH_FAILED);
 
@@ -599,12 +599,7 @@ ge::graphStatus IndexerRefineTiling::DoTiling(IndexerRefineTilingInfo *tilingInf
     constexpr uint32_t V1_DECODE_DATA_NUM = 2;        // Decode每个核需要存储头和尾部两块数据
     constexpr uint32_t S1_BASE_SIZE = 8;              // S1轴基本块的大小
     constexpr uint32_t TOPK_MAX_SIZE = 2048;          // TopK选取个数
-    constexpr uint32_t HEAD_DIM = 128;                // 与 kernel HEAD_DIM 一致
-    constexpr uint32_t GM_ALIGN_BYTES = 512;          // 与 kernel GM_ALIGN_BYTES 一致
     uint64_t workspaceSize = ascendcPlatform.GetLibApiWorkSpaceSize();
-    // stage-0 gather 候选 key 区(refine 新增): 前置头区 [R*coarseCount*Dh],与 kernel Init 布局一致
-    uint64_t gatheredKeySize = static_cast<uint64_t>(tilingInfo->bSize) * tilingInfo->s2Size * HEAD_DIM * sizeof(uint16_t);
-    workspaceSize += (gatheredKeySize + GM_ALIGN_BYTES - 1) / GM_ALIGN_BYTES * GM_ALIGN_BYTES;
     // 主流程需Workspace大小
     if (ascendcPlatform.GetCurNpuArch() == NpuArch::DAV_3510) {
         constexpr uint32_t s1BaseSize = 4;

@@ -33,7 +33,8 @@ public:
     __aicore__ inline IndexerRefineServiceCube(){};
     __aicore__ inline void InitBuffers(TPipe *pipe);
     __aicore__ inline void InitMm1GlobalTensor(const GlobalTensor<int32_t> &blkTableGm, const GlobalTensor<K_T> &keyGm,
-                                               const GlobalTensor<Q_T> &queryGm, const GlobalTensor<float> &mm1ResGm);
+                                               const GlobalTensor<Q_T> &queryGm, const GlobalTensor<float> &mm1ResGm,
+                                               const GlobalTensor<int32_t> &candidatesGm);
     __aicore__ inline void InitParams(const ConstInfo &constInfo);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
@@ -74,11 +75,12 @@ protected:
                                           uint64_t s1gL0RealSize, const IndexerRefineCommon::RunInfo &runInfo);
     __aicore__ inline void QueryNd2Nz(uint64_t s1gL1RealSize, uint64_t s1gL1Offset, const IndexerRefineCommon::RunInfo &runInfo);
     __aicore__ inline void KeyNd2Nz(uint64_t s2L1RealSize, uint64_t s2GmOffset, const IndexerRefineCommon::RunInfo &runInfo);
-    __aicore__ inline void KeyNd2NzForWorkspace(uint64_t s2L1RealSize, uint64_t s2GmOffset, const IndexerRefineCommon::RunInfo &runInfo);
+    __aicore__ inline void KeyNd2NzForPA(uint64_t s2L1RealSize, uint64_t s2GmOffset, const IndexerRefineCommon::RunInfo &runInfo);
     GlobalTensor<int32_t> blkTableGm_;
     GlobalTensor<K_T> keyGm_;
     GlobalTensor<Q_T> queryGm_;
     GlobalTensor<float> mm1ResGm_;
+    GlobalTensor<int32_t> candidatesGm_;
 
     TBuf<TPosition::A1> bufQL1_;
     LocalTensor<Q_T> queryL1_;
@@ -131,12 +133,14 @@ template <typename LIT>
 __aicore__ inline void
 IndexerRefineServiceCube<LIT>::InitMm1GlobalTensor(const GlobalTensor<int32_t> &blkTableGm,
                                    const GlobalTensor<K_T> &keyGm,
-                                   const GlobalTensor<Q_T> &queryGm, const GlobalTensor<float> &mm1ResGm)
+                                   const GlobalTensor<Q_T> &queryGm, const GlobalTensor<float> &mm1ResGm,
+                                   const GlobalTensor<int32_t> &candidatesGm)
 {
     blkTableGm_ = blkTableGm;
     keyGm_ = keyGm;
     queryGm_ = queryGm;
     mm1ResGm_ = mm1ResGm;
+    candidatesGm_ = candidatesGm;
 }
 
 template <typename LIT>
@@ -150,8 +154,9 @@ __aicore__ inline void IndexerRefineServiceCube<LIT>::ComputeMm1(const IndexerRe
         uint64_t s2L1RealSize =
             s2GmOffset + S2_BASIC_BLOCK > s2ProcessSize ? s2ProcessSize - s2GmOffset : S2_BASIC_BLOCK;
         if (PAGE_ATTENTION) {
-            // refine:key 已由 AIV stage-0 gather 搬入 TND workspace,按候选全局下标直读(等效 KeyNd2Nz)
-            KeyNd2NzForWorkspace(s2L1RealSize, s2GmBaseOffset + s2GmOffset, runInfo);
+            // refine:cube 侧按 candidates+块表 直读 PA cache 散行 key
+            // (生产先例:sparse_flash_attention ComputeMm1 的 topKGm.GetValue + DataCopyPA)
+            KeyNd2NzForPA(s2L1RealSize, s2GmBaseOffset + s2GmOffset, runInfo);
         }else {
             KeyNd2Nz(s2L1RealSize, s2GmOffset, runInfo);
         }
@@ -240,43 +245,49 @@ __aicore__ inline void IndexerRefineServiceCube<LIT>::KeyNd2Nz(uint64_t s2L1Real
     }
 }
 
-// blkNum, blkSize, N2, D
+// 候选行按 PA cache 直读(生产先例:sparse_flash_attention DataCopyPA + topKGm.GetValue)
 template <typename LIT>
-__aicore__ inline void IndexerRefineServiceCube<LIT>::KeyNd2NzForWorkspace(uint64_t s2L1RealSize, uint64_t s2GmOffset,
-                                                    const IndexerRefineCommon::RunInfo &runInfo)
+__aicore__ inline void IndexerRefineServiceCube<LIT>::KeyNd2NzForPA(uint64_t s2L1RealSize, uint64_t s2GmOffset,
+                                                     const IndexerRefineCommon::RunInfo &runInfo)
 {
-    // refine:key 输入 = AIV stage-0 gather 后的 workspace[TND 连续, R*coarseCount*Dh]。
-    // 原始 PA 块表语义已在上游 gather 消化,此处按候选全局下标直读,与 KeyNd2Nz 同构
-    // (不再用 blkTableGm_:PA 布局非每请求连续时块表偏移会指向错误候选,旧实现属克隆残留)。
-    uint64_t s2L1Offset = 0;
-    while (s2L1Offset < s2L1RealSize) {
-        uint64_t keyGmOffset = (runInfo.bIdx * constInfo_.kSeqSize + s2GmOffset + s2L1Offset) * constInfo_.headDim;
-        // 搬运按照S2_BASIC_BLOCK_L0*D_BASIC_BLOCK_L0的方式在l1上排布, 方便后续mte1
-        // 根据s2的offset判断当前属于前一个L0分型还是后一个L0分型，暂时只支持两个分型
-        uint64_t s2Mte2Size = (s2L1RealSize <= S2_BASIC_BLOCK_L0 || s2L1Offset >= S2_BASIC_BLOCK_L0) ?
-                                  s2L1RealSize - s2L1Offset :
-                                  S2_BASIC_BLOCK_L0 - s2L1Offset;
+    // refine:key = 原始 PA key cache。逐候选行:scalar 读 candidates(全局行号) + 块表 → PA slot,
+    // 单行 Nd2Nz 写入与 KeyNd2Nz run 版完全相同的 L1 NZ 槽位(行距 16、C0-stride 同式),
+    // 保证 LoadKeyToL0b 消费布局一致。非法候选(cand==-1)跳过搬数:matmul 读 stale L1 得任意分,
+    // vector 侧 cand==-1 mask 置 -inf 沉底(与旧 AIV gather 语义一致,无脏数据进入 GM 读)。
+    uint64_t keyBufBase = (keyL1BufIdx_ % KEY_BUF_NUM) * KEY_BUFFER_OFFSET;
+    for (uint64_t row = 0; row < s2L1RealSize; row++) {
+        int32_t cand = candidatesGm_.GetValue(runInfo.bIdx * constInfo_.kSeqSize + s2GmOffset + row);
+        if (cand < 0) {
+            continue;
+        }
+        // PA slot 计算 + 越界防御(blockIdx clamp 到块表行宽内,杜绝非法 GM 读)
+        uint32_t blockIdx = static_cast<uint32_t>(cand) / constInfo_.kCacheBlockSize;
+        uint32_t offsetInBlock = static_cast<uint32_t>(cand) % constInfo_.kCacheBlockSize;
+        if (blockIdx >= constInfo_.maxBlockNumPerBatch) {
+            blockIdx = constInfo_.maxBlockNumPerBatch - 1;
+        }
+        int32_t base = blkTableGm_.GetValue(runInfo.bIdx * constInfo_.maxBlockNumPerBatch + blockIdx);
+        uint64_t slot = (base >= 0) ? static_cast<uint64_t>(base) * constInfo_.kCacheBlockSize + offsetInBlock : 0;
 
         Nd2NzParams nd2nzPara;
         nd2nzPara.ndNum = 1;
-        nd2nzPara.nValue = s2Mte2Size; // 行数
+        nd2nzPara.nValue = 1; // 单行
         nd2nzPara.dValue = constInfo_.headDim;
         nd2nzPara.srcDValue = constInfo_.headDim;
-        nd2nzPara.dstNzC0Stride = s2L1Offset >= S2_BASIC_BLOCK_L0 ?
+        // 与 KeyNd2Nz run 版相同的 C0-stride(行间 NZ 排布,保证 L1 布局一致)
+        nd2nzPara.dstNzC0Stride = row >= S2_BASIC_BLOCK_L0 ?
                                       CeilAlign(s2L1RealSize - S2_BASIC_BLOCK_L0, (uint64_t)BLOCK_CUBE) :
                                       (s2L1RealSize > S2_BASIC_BLOCK_L0 ?
                                            S2_BASIC_BLOCK_L0 :
-                                           CeilAlign(s2L1RealSize, (uint64_t)BLOCK_CUBE)); // 对齐到16 单位block
+                                           CeilAlign(s2L1RealSize, (uint64_t)BLOCK_CUBE));
         nd2nzPara.dstNzNStride = 1;
         nd2nzPara.srcNdMatrixStride = 0;
         nd2nzPara.dstNzMatrixStride = 0;
-        DataCopy(keyL1_[(keyL1BufIdx_ % KEY_BUF_NUM) * KEY_BUFFER_OFFSET +
-                        (s2L1Offset >= S2_BASIC_BLOCK_L0 ?
-                             S2_BASIC_BLOCK_L0 * D_BASIC_BLOCK_L0 + (s2L1Offset - S2_BASIC_BLOCK_L0) * BLOCK_CUBE :
-                             s2L1Offset * BLOCK_CUBE)],
-                 keyGm_[keyGmOffset], nd2nzPara);
-
-        s2L1Offset += s2Mte2Size;
+        DataCopy(keyL1_[keyBufBase +
+                        (row >= S2_BASIC_BLOCK_L0 ?
+                             S2_BASIC_BLOCK_L0 * D_BASIC_BLOCK_L0 + (row - S2_BASIC_BLOCK_L0) * BLOCK_CUBE :
+                             row * BLOCK_CUBE)],
+                 keyGm_[slot * constInfo_.headDim], nd2nzPara);
     }
 }
 

@@ -52,7 +52,6 @@ public:
     // 中间计算数据类型为float，高精度模式
     static constexpr bool DT_W_FLAG = LIT::weightsTypeFlag;
     using Q_T = typename LIT::queryType;
-    using K_T = typename LIT::keyType;
     static constexpr LI_LAYOUT LAYOUT_T = LIT::layout;
     using W_T = typename IndexerRefineTypeTraits<Q_T,
                                          typename std::conditional<DT_W_FLAG, float, void>::type>::weightsType;
@@ -68,11 +67,8 @@ public:
                                       const IndexerRefineTilingData *__restrict tilingData);
     __aicore__ inline void InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<float> vec1ResGm,
                                                 GlobalTensor<int64_t> vec1ParamGm, GlobalTensor<W_T> weightsGm,
-                                                GlobalTensor<int32_t> indiceOutGm, GlobalTensor<int32_t> candidatesGm,
-                                                GlobalTensor<int32_t> paBlockTableGm, GlobalTensor<K_T> paKeyGm,
-                                                GlobalTensor<K_T> gatheredKeyGm);
+                                                GlobalTensor<int32_t> indiceOutGm, GlobalTensor<int32_t> candidatesGm);
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
-    __aicore__ inline void GatherCandidates(uint32_t rStart, uint32_t rEnd);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
     __aicore__ inline void InitLDBuffers(TPipe *pipe);
@@ -83,11 +79,7 @@ protected:
     GlobalTensor<int64_t> vec1ParamGm;
     GlobalTensor<W_T> weightsGm;
     GlobalTensor<int32_t> indiceOutGm;
-    // refine 新增:stage-0 gather(mask/true_pos)用的 GM tensor
-    GlobalTensor<int32_t> candidatesGm_;   // [R, coarseCount] 候选位置
-    GlobalTensor<int32_t> paBlockTableGm_; // [R, maxBlockNumPerBatch] PA block table
-    GlobalTensor<K_T> paKeyGm_;            // 原始 PA key cache(stage-0 gather 读)
-    GlobalTensor<K_T> gatheredKeyGm_;      // workspace gather 区(AIC matmul 读)
+    GlobalTensor<int32_t> candidatesGm_;   // [R, coarseCount] 候选位置(mask/true_pos 读)
     // =================================常量区=================================
 
 private:
@@ -102,7 +94,7 @@ private:
     TBuf<TPosition::VECCALC> reduceOutBuf_;
     TBuf<TPosition::VECCALC> brcBuf_;
     TBuf<TPosition::VECCALC> paramBuf_;
-    // refine 新增:candidates 行全量 + blockTable 行 + key 中转(stage-0 gather / mask / true_pos 共用)
+    // candidates 行全量(mask / true_pos 共用)
     TBuf<TPosition::VECCALC> candsFullBuf_;
 
     // tmp buff for LD
@@ -155,11 +147,8 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::InitBuffers(TPipe *pipe)
     pipe->InitBuffer(reduceOutBuf_, s2BaseSize_ * 4 * sizeof(float));                          // 8KB
     pipe->InitBuffer(brcBuf_, groupInner_ * 8 * sizeof(float));
     pipe->InitBuffer(paramBuf_, LD_PARAM_NUM * sizeof(int64_t));
-    // refine:candidates 行全量(int32,粗筛宽度) + blockTable 行 + 单候选 key 中转。
-    // key 中转段须 32B 对齐(GM→UB DataCopy 硬约束,507015 根因):offset 在 int32 元素上 Align 到 8
-    uint32_t keyTmpInt32 = IndexerRefineCommon::CeilDiv<uint32_t>(constInfo_.headDim * sizeof(K_T), sizeof(int32_t));
-    uint32_t candsFullSize =
-        IndexerRefineCommon::Align<uint32_t>(constInfo_.kSeqSize + constInfo_.maxBlockNumPerBatch, 8) + keyTmpInt32;
+    // candidates 行全量(int32,粗筛宽度);candsSeg/true_pos 均只读 [0, kSeqSize)
+    uint32_t candsFullSize = IndexerRefineCommon::Align<uint32_t>(constInfo_.kSeqSize, 8);
     pipe->InitBuffer(candsFullBuf_, candsFullSize * sizeof(int32_t));
 
     tmpUb_ = tmpBuf_.Get<float>();
@@ -197,9 +186,7 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::InitLDBuffers(TPipe *pip
     pipe->InitBuffer(ldOutValueBuf_, BASE_TOPK * sizeof(float));
     pipe->InitBuffer(ldOutIdxBuf_, BASE_TOPK * sizeof(int32_t));
     // refine:pipe->Reset() 已释放主循环 buffer,LD 阶段 true_pos 需重新申请 candidates 行缓冲
-    uint32_t keyTmpInt32 = IndexerRefineCommon::CeilDiv<uint32_t>(constInfo_.headDim * sizeof(K_T), sizeof(int32_t));
-    uint32_t candsFullSize =
-        IndexerRefineCommon::Align<uint32_t>(constInfo_.kSeqSize + constInfo_.maxBlockNumPerBatch, 8) + keyTmpInt32;
+    uint32_t candsFullSize = IndexerRefineCommon::Align<uint32_t>(constInfo_.kSeqSize, 8);
     pipe->InitBuffer(candsFullBuf_, candsFullSize * sizeof(int32_t));
 }
 
@@ -227,9 +214,7 @@ __aicore__ inline void
 IndexerRefineServiceVector<LIT>::InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm,
                                     GlobalTensor<float> vec1ResGm,
                                     GlobalTensor<int64_t> vec1ParamGm, GlobalTensor<W_T> weightsGm,
-                                    GlobalTensor<int32_t> indiceOutGm, GlobalTensor<int32_t> candidatesGm,
-                                    GlobalTensor<int32_t> paBlockTableGm, GlobalTensor<K_T> paKeyGm,
-                                    GlobalTensor<K_T> gatheredKeyGm)
+                                    GlobalTensor<int32_t> indiceOutGm, GlobalTensor<int32_t> candidatesGm)
 {
     this->mm1ResGm = mm1ResGm;
     this->vec1ResGm = vec1ResGm;
@@ -237,58 +222,6 @@ IndexerRefineServiceVector<LIT>::InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm
     this->weightsGm = weightsGm;
     this->indiceOutGm = indiceOutGm;
     this->candidatesGm_ = candidatesGm;
-    this->paBlockTableGm_ = paBlockTableGm;
-    this->paKeyGm_ = paKeyGm;
-    this->gatheredKeyGm_ = gatheredKeyGm;
-}
-
-// refine stage-0 gather:把候选 key 从 PA cache 散列搬入 workspace TND 布局。
-// 分核与生产同步对齐:只聚本块 AIC 的 bN2 范围覆盖的请求整行 [rStart, rEnd](含),
-// 两 AIV(blockId_%2)按请求奇偶各聚一半 → 本块 AIC matmul 消费的 workspace 全部由本块
-// AIV 产出,块内 syncV1C1(预置 PIPE_MTE3)握手即可闭环,无跨块依赖、无需 SyncAll
-// (生产 lightning_indexer 主流水线只有事件标志,无 SyncAll)。
-template <typename LIT>
-__aicore__ inline void IndexerRefineServiceVector<LIT>::GatherCandidates(uint32_t rStart, uint32_t rEnd)
-{
-    uint32_t bs = constInfo_.kCacheBlockSize;
-    uint32_t coarseCount = constInfo_.kSeqSize;
-    LocalTensor<int32_t> candsUb = candsFullBuf_.Get<int32_t>();
-    LocalTensor<int32_t> btRowUb = candsUb[coarseCount];
-    // key 中转段 offset 与 InitBuffers 同式, 32B 对齐(GM→UB DataCopy 硬约束,507015 根因)。
-    // Level2 DataCopy count 单位为元素(blockLen=count/GetC0Count 换算 32B),勿乘 sizeof/32
-    uint32_t keyTmpOffset = IndexerRefineCommon::Align<uint32_t>(coarseCount + constInfo_.maxBlockNumPerBatch, 8);
-    LocalTensor<K_T> keyTmpUb = candsUb[keyTmpOffset].template ReinterpretCast<K_T>();
-    uint32_t candsRowBlocks = coarseCount;
-    uint32_t keyLenBlocks = constInfo_.headDim;
-
-    for (uint32_t rIdx = rStart + (blockId_ % 2); rIdx <= rEnd; rIdx += 2) {
-        // 候选行整行入 UB;blockTable 行宽可 <8(int32 的 32B 对齐下限)且行 stride 非 32B,
-        // DataCopy 无法整行搬(旧实现 btRowBlocks=0 → 未初始化 UB → 脏 slot → 非法 GM 读,即 507015 根因),
-        // 改每 request 一次逐项 scalar 读入 UB,候选循环内改读 UB(同 AIC KeyNd2NzForPA 惯用法)
-        AscendC::DataCopy(candsUb, candidatesGm_[rIdx * coarseCount], candsRowBlocks);
-        for (uint32_t bIdx = 0; bIdx < constInfo_.maxBlockNumPerBatch; bIdx++) {
-            btRowUb.SetValue(bIdx, paBlockTableGm_.GetValue(rIdx * constInfo_.maxBlockNumPerBatch + bIdx));
-        }
-        AscendC::PipeBarrier<PIPE_MTE2>();
-        for (uint32_t cIdx = 0; cIdx < coarseCount; cIdx++) {
-            int32_t cand = candsUb.GetValue(cIdx);
-            if (cand < 0) {
-                continue; // 无效候选:分数将置 -inf 沉底,无需 gather 其 key
-            }
-            uint32_t blockIdx = (uint32_t)cand / bs;
-            uint32_t offsetInBlock = (uint32_t)cand % bs;
-            int32_t base = btRowUb.GetValue(blockIdx);
-            uint32_t slot = (base >= 0) ? (uint32_t)base * bs + offsetInBlock : 0;
-            // 逐候选 256B:paKey[slot*Dh] → UB → gatheredKey[(r*coarse+c)*Dh]
-            AscendC::DataCopy(keyTmpUb, paKeyGm_[(uint64_t)slot * constInfo_.headDim], keyLenBlocks);
-            AscendC::PipeBarrier<PIPE_MTE2>();
-            AscendC::DataCopy(gatheredKeyGm_[((uint64_t)rIdx * coarseCount + cIdx) * constInfo_.headDim], keyTmpUb,
-                              keyLenBlocks);
-        }
-    }
-    // 本核 MTE3 写 workspace 全部完成;交接由 kernel 预置 CrossCoreSetFlag(syncV1C1, PIPE_MTE3) 承担
-    // (标志的 PIPE = 产生数据的 PIPE,同 lightning_indexer_quant 的 syncV1C1/syncV0C1 于 MTE3)
-    AscendC::PipeBarrier<PIPE_MTE3>();
 }
 
 template <typename LIT>

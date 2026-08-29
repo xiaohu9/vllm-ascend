@@ -106,7 +106,6 @@ protected:
 
     // ================================Global Buffer区=================================
     GlobalTensor<Q_T> queryGm;
-    GlobalTensor<K_T> keyGm;
     GlobalTensor<W_T> weightsGm;
 
     GlobalTensor<int32_t> indiceOutGm;
@@ -114,11 +113,8 @@ protected:
 
     GlobalTensor<uint32_t> actualSeqLengthsGmQ;
     GlobalTensor<uint32_t> actualSeqLengthsGm;
-    // stage-0 gather(refine 新增):候选 key 从 PA cache 散列搬入 workspace
-    GlobalTensor<int32_t> candidatesGm;   // [R, coarseCount] int32 候选位置
-    GlobalTensor<int32_t> paBlockTableGm; // [R, maxBlockNumPerBatch] PA block table
-    GlobalTensor<K_T> paKeyGm;            // 原始 PA key cache(仅 stage-0 gather 读)
-    GlobalTensor<K_T> gatheredKeyGm;      // workspace gather 区 [R*coarseCount*Dh]
+    GlobalTensor<int32_t> candidatesGm;   // [R, coarseCount] int32 候选位置(AIV mask/true_pos + cube key 读取共用)
+    GlobalTensor<K_T> paKeyGm;            // 原始 PA key cache(cube 侧候选 key 直读)
     // workspace
     GlobalTensor<MM1_OUT_T> mm1ResGm;  // 存放S
     GlobalTensor<float> vec1ResGm;     // 存放TopK计算中间结果
@@ -147,7 +143,6 @@ protected:
     __aicore__ inline void ProcessBaseBlock(uint32_t loop, uint64_t s2LoopIdx, IndexerRefineCommon::RunInfo &runInfo);
     __aicore__ inline void ProcessDecode();
     __aicore__ inline void ProcessInvalid();
-    __aicore__ inline void GatherCandidatesToWorkspace(uint32_t rStart, uint32_t rEnd);
     // ================================Params Calc=====================================
     __aicore__ inline void CalcGS1LoopParams(uint32_t bN2Idx);
     __aicore__ inline void GetBN2Idx(uint32_t bN2Idx);
@@ -425,16 +420,10 @@ __aicore__ inline void IndexerRefineKernel<LIT>::Init(__gm__ uint8_t *query,
     SplitCore(aiCoreIdx, usedCoreNum, splitCoreInfo);
 
     pipe = tPipe;
-    // workspace 内存排布(refine 新增 gatheredKeyGm 头部区)
-    // |gatheredKeyGm(候选key R*coarseCount*Dh)|mm1ResGm(存S)|vec1ResGm(存LD中间结果)|vec1ParamGm(存LD参数)
+    // workspace 内存排布:与生产 lightning_indexer 完全一致
+    // |mm1ResGm(存S)|vec1ResGm(存LD中间结果)|vec1ParamGm(存LD参数)
     // |Core0_mm1ResDB0-Core0_mm1ResDB1-Core1_mm1ResDB0....Core23_mm1ResDB0-Core23_mm1ResDB1|Core0_vec1Res...
     uint64_t offset = 0;
-
-    // stage-0 gather 输出区:TND 布局 [R*coarseCount*Dh],AIC matmul key 输入指向此处
-    uint64_t gatheredKeySize = static_cast<uint64_t>(constInfo.batchSize) * constInfo.kSeqSize * constInfo.kHeadNum *
-                               constInfo.headDim * sizeof(K_T);
-    gatheredKeyGm.SetGlobalBuffer((__gm__ K_T *)workspace, gatheredKeySize);
-    offset += IndexerRefineCommon::Align(gatheredKeySize, static_cast<uint64_t>(GM_ALIGN_BYTES));
 
     // mm1开DoubleBuffer
     uint64_t singleCoreMm1ResSize = WS_DOUBLE * constInfo.mBaseSizeAlign * constInfo.s2BaseSize * sizeof(MM1_OUT_T);
@@ -452,25 +441,23 @@ __aicore__ inline void IndexerRefineKernel<LIT>::Init(__gm__ uint8_t *query,
     vec1ParamGm.SetGlobalBuffer((__gm__ int64_t *)(workspace + offset));
     offset += GetBlockNum() * constInfo.s1BaseSize * WS_DOUBLE * LD_PARAM_NUM * sizeof(int64_t);
 
+    // 候选位置 AIV(mask/true_pos)与 cube(key 读取)共用,统一在此注册
+    candidatesGm.SetGlobalBuffer((__gm__ int32_t *)candidates);
     if ASCEND_IS_AIV {
         vectorService.InitParams(constInfo, tiling);
         indiceOutGm.SetGlobalBuffer((__gm__ int32_t *)sparseIndices);
         weightsGm.SetGlobalBuffer((__gm__ W_T *)weights);
-        // stage-0 gather 输入(原始 PA key cache + block table + 候选位置)
-        candidatesGm.SetGlobalBuffer((__gm__ int32_t *)candidates);
-        paBlockTableGm.SetGlobalBuffer((__gm__ int32_t *)blockTable);
-        paKeyGm.SetGlobalBuffer((__gm__ K_T *)key);
-        vectorService.InitVec1GlobalTensor(mm1ResGm, vec1ResGm, vec1ParamGm, weightsGm, indiceOutGm, candidatesGm,
-                                           paBlockTableGm, paKeyGm, gatheredKeyGm);
+        vectorService.InitVec1GlobalTensor(mm1ResGm, vec1ResGm, vec1ParamGm, weightsGm, indiceOutGm, candidatesGm);
     } else {
         matmulService.InitParams(constInfo);
         queryGm.SetGlobalBuffer((__gm__ Q_T *)query);
         if constexpr (PAGE_ATTENTION) {
             blockTableGm.SetGlobalBuffer((__gm__ int32_t *)blockTable);
         }
-        // refine key 输入 = stage-0 gather 后的 workspace(gatheredKeyGm),TND 连续布局
-        keyGm.SetGlobalBuffer((__gm__ K_T *)gatheredKeyGm.GetPhyAddr());
-        matmulService.InitMm1GlobalTensor(blockTableGm, keyGm, queryGm, mm1ResGm);
+        // refine key 输入 = 原始 PA key cache,cube 侧按 candidates+块表 直读散行
+        // (注册方式与生产 lightning_indexer keyGm 一致)
+        paKeyGm.SetGlobalBuffer((__gm__ K_T *)key);
+        matmulService.InitMm1GlobalTensor(blockTableGm, paKeyGm, queryGm, mm1ResGm, candidatesGm);
     }
     InitBuffers();
 }
@@ -597,14 +584,6 @@ __aicore__ inline void IndexerRefineKernel<LIT>::Process()
 }
 
 template <typename LIT>
-__aicore__ inline void IndexerRefineKernel<LIT>::GatherCandidatesToWorkspace(uint32_t rStart, uint32_t rEnd)
-{
-    if ASCEND_IS_AIV {
-        vectorService.GatherCandidates(rStart, rEnd);
-    }
-}
-
-template <typename LIT>
 __aicore__ inline void IndexerRefineKernel<LIT>::ProcessInvalid()
 {
     if ASCEND_IS_AIV {
@@ -632,20 +611,11 @@ __aicore__ inline void IndexerRefineKernel<LIT>::ProcessMain()
     }
 
     if ASCEND_IS_AIV {
-        // stage-0:候选 key 从 PA cache 散列搬入 workspace。分核与本块 AIC matmul 任务对齐
-        // (只聚本块 bN2 范围覆盖的请求整行,两 AIV 按请求奇偶各半),故无跨块依赖、
-        // 无需 SyncAll 全局屏障(生产 lightning_indexer 主流水线只有事件标志,无 SyncAll)。
-        // gather 后以预置 syncV1C1×2 交接,AIC 首个 matmul 的 CrossCoreWaitFlag(syncV1C1) 完成屏障。
-        uint32_t rStart = splitCoreInfo.bN2Start / constInfo.kHeadNum;
-        uint32_t rEnd = splitCoreInfo.bN2End / constInfo.kHeadNum;
-        GatherCandidatesToWorkspace(rStart, rEnd);
-
+        // 与生产 lightning_indexer 逐字节一致:预置 syncV1C1×2 种子 flag(MTE2),
+        // 供 AIC 首两轮 matmul 的 CrossCoreWaitFlag 打破流水线首轮依赖。
         vectorService.AllocEventID();
-        // gather 经 MTE3 写 workspace,交接标志必须挂 PIPE_MTE3(标志的 PIPE=产生数据的 PIPE,
-        // 同 lightning_indexer_quant syncV1C1/syncV0C1 于 MTE3、sparse_attn_sharedkv syncV1C2 于 MTE3);
-        // 循环内 per-iter 的 syncV1C1 仍按生产 base 保持 PIPE_MTE2(mm1Res 槽位握手语义)。
-        CrossCoreSetFlag<IndexerRefineCommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(constInfo.syncV1C1);
-        CrossCoreSetFlag<IndexerRefineCommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(constInfo.syncV1C1);
+        CrossCoreSetFlag<IndexerRefineCommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
+        CrossCoreSetFlag<IndexerRefineCommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
     } else {
         matmulService.AllocEventID();
     }

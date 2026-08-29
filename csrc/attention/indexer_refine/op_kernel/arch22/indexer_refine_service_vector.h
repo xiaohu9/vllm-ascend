@@ -464,9 +464,12 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
                     Maxs(idxULocal1, idxULocal1, static_cast<int32_t>(0), copyLen);
                     PipeBarrier<PIPE_V>();
                     Muls(idxULocal1, idxULocal1, 4, copyLen);
+                    // dav_c220 Gather = vgather(PIPE_V),非 MTE。Muls→Gather 读依赖 + Gather→Adds
+                    // 写依赖都必须等 PIPE_V(生产参考 inplace_partial_rotary_mul 同款 Gather+PIPE_V 模式)
+                    PipeBarrier<PIPE_V>();
                     AscendC::Gather(truePosUb, candsFullUb, idxULocal1.template ReinterpretCast<uint32_t>(), 0,
                                     copyLen);
-                    PipeBarrier<PIPE_MTE2>();
+                    PipeBarrier<PIPE_V>();
                     Adds(truePosUb, truePosUb, static_cast<int32_t>(1), copyLen);
                     Mul(truePosUb, truePosUb, maskI32, copyLen);
                     Adds(truePosUb, truePosUb, static_cast<int32_t>(-1), copyLen);
@@ -729,9 +732,12 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessLD()
         PipeBarrier<PIPE_V>();
         Muls(idxULocal1, idxULocal1, 4, constInfo_.sparseCount);
         LocalTensor<int32_t> truePosUb = outValueUb.template ReinterpretCast<int32_t>(); // value 段复用
+        // dav_c220 Gather = vgather(PIPE_V),非 MTE。与 ProcessVec 同款: Muls→Gather 读依赖 +
+        // Gather→Adds 写依赖都必须等 PIPE_V(生产参考 inplace_partial_rotary_mul 同款模式)
+        PipeBarrier<PIPE_V>();
         AscendC::Gather(truePosUb, candsFullUb, idxULocal1.template ReinterpretCast<uint32_t>(), 0,
                         constInfo_.sparseCount);
-        AscendC::PipeBarrier<PIPE_MTE2>();
+        PipeBarrier<PIPE_V>();
         Adds(truePosUb, truePosUb, static_cast<int32_t>(1), constInfo_.sparseCount);
         Mul(truePosUb, truePosUb, maskI32, constInfo_.sparseCount);
         Adds(truePosUb, truePosUb, static_cast<int32_t>(-1), constInfo_.sparseCount);

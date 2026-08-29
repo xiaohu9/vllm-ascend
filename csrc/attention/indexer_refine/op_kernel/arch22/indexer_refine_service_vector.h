@@ -155,8 +155,11 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::InitBuffers(TPipe *pipe)
     pipe->InitBuffer(reduceOutBuf_, s2BaseSize_ * 4 * sizeof(float));                          // 8KB
     pipe->InitBuffer(brcBuf_, groupInner_ * 8 * sizeof(float));
     pipe->InitBuffer(paramBuf_, LD_PARAM_NUM * sizeof(int64_t));
-    // refine:candidates 行全量(int32,粗筛宽度) + blockTable 行 + 单候选 key 中转(256B)
-    uint32_t candsFullSize = constInfo_.kSeqSize + constInfo_.maxBlockNumPerBatch + 64; // int32 元素
+    // refine:candidates 行全量(int32,粗筛宽度) + blockTable 行 + 单候选 key 中转。
+    // key 中转段须 32B 对齐(GM→UB DataCopy 硬约束,507015 根因):offset 在 int32 元素上 Align 到 8
+    uint32_t keyTmpInt32 = IndexerRefineCommon::CeilDiv<uint32_t>(constInfo_.headDim * sizeof(K_T), sizeof(int32_t));
+    uint32_t candsFullSize =
+        IndexerRefineCommon::Align<uint32_t>(constInfo_.kSeqSize + constInfo_.maxBlockNumPerBatch, 8) + keyTmpInt32;
     pipe->InitBuffer(candsFullBuf_, candsFullSize * sizeof(int32_t));
 
     tmpUb_ = tmpBuf_.Get<float>();
@@ -194,7 +197,9 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::InitLDBuffers(TPipe *pip
     pipe->InitBuffer(ldOutValueBuf_, BASE_TOPK * sizeof(float));
     pipe->InitBuffer(ldOutIdxBuf_, BASE_TOPK * sizeof(int32_t));
     // refine:pipe->Reset() 已释放主循环 buffer,LD 阶段 true_pos 需重新申请 candidates 行缓冲
-    uint32_t candsFullSize = constInfo_.kSeqSize + constInfo_.maxBlockNumPerBatch + 64;
+    uint32_t keyTmpInt32 = IndexerRefineCommon::CeilDiv<uint32_t>(constInfo_.headDim * sizeof(K_T), sizeof(int32_t));
+    uint32_t candsFullSize =
+        IndexerRefineCommon::Align<uint32_t>(constInfo_.kSeqSize + constInfo_.maxBlockNumPerBatch, 8) + keyTmpInt32;
     pipe->InitBuffer(candsFullBuf_, candsFullSize * sizeof(int32_t));
 }
 
@@ -249,9 +254,12 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::GatherCandidates(uint32_
     uint32_t coarseCount = constInfo_.kSeqSize;
     LocalTensor<int32_t> candsUb = candsFullBuf_.Get<int32_t>();
     LocalTensor<int32_t> btRowUb = candsUb[coarseCount];
-    LocalTensor<K_T> keyTmpUb = candsUb[coarseCount + constInfo_.maxBlockNumPerBatch].template ReinterpretCast<K_T>();
-    uint32_t candsRowBlocks = coarseCount * sizeof(int32_t) / 32;
-    uint32_t keyLenBlocks = constInfo_.headDim * sizeof(K_T) / 32;
+    // key 中转段 offset 与 InitBuffers 同式, 32B 对齐(GM→UB DataCopy 硬约束,507015 根因)。
+    // Level2 DataCopy count 单位为元素(blockLen=count/GetC0Count 换算 32B),勿乘 sizeof/32
+    uint32_t keyTmpOffset = IndexerRefineCommon::Align<uint32_t>(coarseCount + constInfo_.maxBlockNumPerBatch, 8);
+    LocalTensor<K_T> keyTmpUb = candsUb[keyTmpOffset].template ReinterpretCast<K_T>();
+    uint32_t candsRowBlocks = coarseCount;
+    uint32_t keyLenBlocks = constInfo_.headDim;
 
     for (uint32_t rIdx = rStart + (blockId_ % 2); rIdx <= rEnd; rIdx += 2) {
         // 候选行整行入 UB;blockTable 行宽可 <8(int32 的 32B 对齐下限)且行 stride 非 32B,
@@ -358,8 +366,8 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
     // refine:candidates 行全量(scattered mask / true_pos 用),按 request 惰性加载
     LocalTensor<int32_t> candsFullUb = candsFullBuf_.Get<int32_t>();
     if (candsLoadedBIdx_ != static_cast<int32_t>(info.bIdx)) {
-        AscendC::DataCopy(candsFullUb, candidatesGm_[info.bIdx * constInfo_.kSeqSize],
-                          constInfo_.kSeqSize * sizeof(int32_t) / 32);
+        // Level2 DataCopy count 单位为元素
+        AscendC::DataCopy(candsFullUb, candidatesGm_[info.bIdx * constInfo_.kSeqSize], constInfo_.kSeqSize);
         AscendC::PipeBarrier<PIPE_MTE2>();
         candsLoadedBIdx_ = static_cast<int32_t>(info.bIdx);
     }
@@ -772,8 +780,8 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessLD()
         LocalTensor<int32_t> idxULocal1 = outIdxUb.template ReinterpretCast<int32_t>();
         // refine true_pos:LD 合并输出的列号 → candidates 值(原始 key 位置)
         LocalTensor<int32_t> candsFullUb = candsFullBuf_.Get<int32_t>();
-        AscendC::DataCopy(candsFullUb, candidatesGm_[bn2Idx * constInfo_.kSeqSize],
-                          constInfo_.kSeqSize * sizeof(int32_t) / 32);
+        // Level2 DataCopy count 单位为元素
+        AscendC::DataCopy(candsFullUb, candidatesGm_[bn2Idx * constInfo_.kSeqSize], constInfo_.kSeqSize);
         AscendC::PipeBarrier<PIPE_MTE2>();
         // refine true_pos guard:与 ProcessVec 同款 — (列号>=0) 掩码 + clamp, Gather 后无效槽写回 -1。
         // dav_c220 vsel 仅接受 __ubuf__ half*,int32 Select 无法编译 → 算术替代:

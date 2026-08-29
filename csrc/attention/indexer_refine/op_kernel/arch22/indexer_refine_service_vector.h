@@ -502,11 +502,22 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
                     // refine true_pos:topk 列号(全局 s2 位置) → candidates 值(原始 key 位置)
                     // Gather 的 srcOffset 语义 = 字节偏移,故先把列号 ×4;输出到 outValueUb[2*offset] 段
                     LocalTensor<int32_t> truePosUb = outValueUb[2 * offset].template ReinterpretCast<int32_t>();
+                    // refine true_pos guard:globalTopk init 的 (-inf,-1) 槽被 topk 选中时列号=-1,
+                    // ×4 → 0xFFFFFFFC → 4GB 字节偏移越界读。留 (列号>=0) 掩码 + clamp 列号到 0,
+                    // Gather 后按掩码把无效槽写回 -1(有效候选→真实值, 无效槽→-1, 语义不变)
+                    LocalTensor<uint8_t> validMask = outValueUb[2 * offset + copyLen].template ReinterpretCast<uint8_t>();
+                    CompareScalar(validMask, idxULocal1, static_cast<int32_t>(0), CMPMODE::GE, copyLen);
+                    PipeBarrier<PIPE_V>();
+                    Maxs(idxULocal1, idxULocal1, static_cast<int32_t>(0), copyLen);
                     PipeBarrier<PIPE_V>();
                     Muls(idxULocal1, idxULocal1, 4, copyLen);
                     AscendC::Gather(truePosUb, candsFullUb, idxULocal1.template ReinterpretCast<uint32_t>(), 0,
                                     copyLen);
                     PipeBarrier<PIPE_MTE2>();
+                    Duplicate(idxULocal1, static_cast<int32_t>(-1), copyLen); // idx 段复用为 -1 常量
+                    PipeBarrier<PIPE_V>();
+                    Select(truePosUb, validMask, truePosUb, idxULocal1, SELMODE::VSEL_TENSOR_TENSOR_MODE, copyLen);
+                    PipeBarrier<PIPE_V>();
                     outQueue_.EnQue<float>(outValueUb);
                     outValueUb = outQueue_.DeQue<float>();
 
@@ -752,11 +763,21 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessLD()
         AscendC::DataCopy(candsFullUb, candidatesGm_[bn2Idx * constInfo_.kSeqSize],
                           constInfo_.kSeqSize * sizeof(int32_t) / 32);
         AscendC::PipeBarrier<PIPE_MTE2>();
+        // refine true_pos guard:与 ProcessVec 同款 — (列号>=0) 掩码 + clamp, Gather 后无效槽写回 -1
+        LocalTensor<uint8_t> validMask = tmpUb.template ReinterpretCast<uint8_t>();
+        CompareScalar(validMask, idxULocal1, static_cast<int32_t>(0), CMPMODE::GE, constInfo_.sparseCount);
+        PipeBarrier<PIPE_V>();
+        Maxs(idxULocal1, idxULocal1, static_cast<int32_t>(0), constInfo_.sparseCount);
+        PipeBarrier<PIPE_V>();
         Muls(idxULocal1, idxULocal1, 4, constInfo_.sparseCount);
         LocalTensor<int32_t> truePosUb = outValueUb.template ReinterpretCast<int32_t>(); // value 段复用
         AscendC::Gather(truePosUb, candsFullUb, idxULocal1.template ReinterpretCast<uint32_t>(), 0,
                         constInfo_.sparseCount);
         AscendC::PipeBarrier<PIPE_MTE2>();
+        Duplicate(idxULocal1, static_cast<int32_t>(-1), constInfo_.sparseCount); // idx 段复用为 -1 常量
+        PipeBarrier<PIPE_V>();
+        Select(truePosUb, validMask, truePosUb, idxULocal1, SELMODE::VSEL_TENSOR_TENSOR_MODE, constInfo_.sparseCount);
+        PipeBarrier<PIPE_V>();
         SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
         SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
         DataCopyPad(indiceOutGm[outOffset], truePosUb,

@@ -424,6 +424,15 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
             Adds(sortIndiceUbInt, globalTopkIndice_, static_cast<int32_t>(cuBaseS2Idx), cuS2Len);
             PipeBarrier<PIPE_V>();
 
+            // TEMP DIAG(2026-08-31 v4): pre-sort 输入 dump → output row0(blockId0 首个 S1 row),
+            //   并跳过 row0 正式 CopyOut。判定 sort 输入结构:值槽是否被 mask 链打成
+            //   交错 (score_even, NEG_INF_odd) + 索引槽 (col_even, -1_odd)。
+            if (blockId_ == 0 && innerS1Idx == 0 && info.loop == 0 && info.s2Idx == 0) {
+                AscendC::PipeBarrier<PIPE_ALL>();
+                IndexerRefineServiceVec::CopyOut(indiceOutGm[info.indiceOutOffset],
+                                    reduceOutBuff.template ReinterpretCast<int32_t>(), 2 * cuS2LenVecAlign);
+            }
+
             LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
             if (info.actS1Size > 4 || constInfo_.isSparseCountOver2K) {
                 // info.actS1Size > 4 则单个vector核内处理的 s1>2，缓存方案无法处理
@@ -477,6 +486,9 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
                 int64_t copyLen = (constInfo_.sparseCount <= SPARSE_COUNT_4K)
                                 ? constInfo_.sparseCount
                                 : constInfo_.sparseCount / 2;
+                if (blockId_ == 0 && innerS1Idx == 0 && info.loop == 0 && info.s2Idx == 0) {
+                    // TEMP DIAG(v4): row0 已被 pre-sort 输入 dump 占用,跳过正式 CopyOut
+                } else {
                 // TEMP DIAG(2026-08-30 v3): 直出 globalTopkUb_ 原始交错对 (value_bits, col)
                 //   前 copyLen 个 int32 = copyLen/2 对, 不做 Extract。
                 //   v2(Extract 取窗)观测: 全部用例前 refine/2 对的 col = 真 top-refine 第二半
@@ -488,6 +500,7 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
                                                      constInfo_.sparseCount],
                                     globalTopkUb_[innerS1Idx * virTopK * 2].template ReinterpretCast<int32_t>(),
                                     copyLen);
+                }
             } else if (needCopyWsGm) {
                 // vec1Res Gm = [aic, s1BaseSize_, 2, 2, topkOut_] float32
                 // vec1Param Gm = [aic, s1BaseSize_, 2, 16] int64

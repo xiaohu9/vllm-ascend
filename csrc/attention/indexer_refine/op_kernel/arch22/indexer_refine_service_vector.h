@@ -433,8 +433,17 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
                                     reduceOutBuff.template ReinterpretCast<int32_t>(), 2 * cuS2LenVecAlign);
             }
 
+            // 2026-08-31 v5 修复: mask 链(V 写)与排序(Sort32/MrgSort)之间统一加 PIPE_ALL,
+            //   保证 reduceOutBuff 写落定后才被排序读取。
+            AscendC::PipeBarrier<PIPE_ALL>();
+
             LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
-            if (info.actS1Size > 4 || constInfo_.isSparseCountOver2K) {
+            // 2026-08-31 v5 修复: Sort<float,true>+MrgBasicBlock 缓存路径(actS1Size<=4)在
+            //   cuS2Len 全块(=512)时实证损坏(v4 输入 dump: 值槽交错(-1,-inf)+索引槽降序,
+            //   Sort<float,true> 对 reduceOutBuff 留下交错污染)。SortAll+MergeSort 生产路径
+            //   small_wide(c=512) 全对 → 全块用例强制走生产路径;部分块(<=256,精确层用例
+            //   e0/c64/c256 全过)保留缓存路径。
+            if (info.actS1Size > 4 || constInfo_.isSparseCountOver2K || cuS2Len == s2BaseSize_) {
                 // info.actS1Size > 4 则单个vector核内处理的 s1>2，缓存方案无法处理
                 IndexerRefineServiceVec::SortAll(reduceOutBuff, tmpSortBuf,
                                       cuS2LenVecAlign); //  cuS2LenVecAlign <= s2BaseSize_, fill -inf

@@ -474,40 +474,20 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
             bool needCopyWsGm = info.isAllLoopEnd || isS2End;
 
             if (needCopyOutGm) {
-                int64_t offset = (constInfo_.sparseCount <= SPARSE_COUNT_4K) ? virTopK : constInfo_.sparseCount / 2;
                 int64_t copyLen = (constInfo_.sparseCount <= SPARSE_COUNT_4K)
                                 ? constInfo_.sparseCount
                                 : constInfo_.sparseCount / 2;
-                int64_t copyNum = (constInfo_.sparseCount <= SPARSE_COUNT_4K) ? 1 : 2;
-                for (int64_t i = 0; i < copyNum; i++) {
-                    LocalTensor<float> outValueUb = outQueue_.AllocTensor<float>();
-                    LocalTensor<uint32_t> outIdxUb = outValueUb[offset].template ReinterpretCast<uint32_t>();
-                    Extract(outValueUb, outIdxUb,
-                     globalTopkUb_[innerS1Idx * virTopK * 2 + 2 * i * offset], (offset /32));
-                    // Extract 后先等 PIPE_V 再被后续 V 指令读(对齐 ProcessLD 的 Extract→barrier 模式)
-                    PipeBarrier<PIPE_V>();
-
-                    LocalTensor<int32_t> diagIdx = outValueUb[offset].template ReinterpretCast<int32_t>();
-                    // TEMP DIAG(2026-08-30): 输出 extract 值段+索引段各前 copyLen/2(拼接)替代 true_pos gather —
-                    //   [0, copyLen/2) = 前 copyLen/2 对的 值(float bit 当 int32 输出),
-                    //   [copyLen/2, copyLen) = 前 copyLen/2 对的 索引(候选列号 col)。
-                    // 一次跑批区分三种根因(仅看 col 无法区分):
-                    //   - 值段=NEG_INF(-8388608)且索引=-1       -> 该对从未被 merge 覆盖(仍初始 (-inf,-1))
-                    //   - 值段=合理分数但索引位是分数 bit        -> 值-索引对错位(SortAll/MrgSort 输出布局问题)
-                    //   - 值段=合理分数且索引=合理 col 但顺序错    -> 排序顺序错(merge 逻辑问题)
-                    // mid 实测: 每行前 256 对错(64垃圾+64错序), 后 256 对全对。PIPE_ALL 竞态修复无效。
-                    outQueue_.EnQue<float>(outValueUb);
-                    outValueUb = outQueue_.DeQue<float>();
-                    // 值段前 copyLen/2(float bit → int32 输出)
-                    IndexerRefineServiceVec::CopyOut(indiceOutGm[info.indiceOutOffset + cuS1Idx *
-                                                         constInfo_.sparseCount + i * offset],
-                                        outValueUb.template ReinterpretCast<int32_t>(), copyLen / 2);
-                    // 索引段前 copyLen/2
-                    IndexerRefineServiceVec::CopyOut(indiceOutGm[info.indiceOutOffset + cuS1Idx *
-                                                         constInfo_.sparseCount + i * offset + copyLen / 2],
-                                        diagIdx, copyLen / 2);
-                    outQueue_.FreeTensor(outValueUb);
-                }
+                // TEMP DIAG(2026-08-30 v3): 直出 globalTopkUb_ 原始交错对 (value_bits, col)
+                //   前 copyLen 个 int32 = copyLen/2 对, 不做 Extract。
+                //   v2(Extract 取窗)观测: 全部用例前 refine/2 对的 col = 真 top-refine 第二半
+                //   (rank [refine/2, refine)), 值槽 1块=0.0 / 2-4块=真实分+0.0 / 8块=NaN。
+                //   v3 直出原始对 → 判定 merge/SortAll 输出布局(半交换/值槽覆写) vs Extract 读错。
+                //   MergeSort/SparseTopK 末尾 PIPE_ALL 已保证 globalTopkUb_ 写完成 → 直接 MTE3 读安全。
+                AscendC::PipeBarrier<PIPE_ALL>();
+                IndexerRefineServiceVec::CopyOut(indiceOutGm[info.indiceOutOffset + cuS1Idx *
+                                                     constInfo_.sparseCount],
+                                    globalTopkUb_[innerS1Idx * virTopK * 2].template ReinterpretCast<int32_t>(),
+                                    copyLen);
             } else if (needCopyWsGm) {
                 // vec1Res Gm = [aic, s1BaseSize_, 2, 2, topkOut_] float32
                 // vec1Param Gm = [aic, s1BaseSize_, 2, 16] int64

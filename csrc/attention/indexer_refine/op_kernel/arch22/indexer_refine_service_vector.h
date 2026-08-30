@@ -373,19 +373,35 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
             // 与输出段同款坑:count 模式原地(dst==src)指令前 L 个元素读 src[j+1](单调分数下该位移
             // 使排序仍逐位一致 → identity 测试看不见;生产非单调分数会造成真实精度损失)→ mask/
             // score 链全部改非原地写临时段 [2V,3V) 与 [3V,4V)(原 negInfUb 段,只写未读,复用)。
-            // 2026-08-30 回退到 b48f9b176 布局:266de9558 把临时段移到 tmpUb_ + 预写段4 NEG_INF
-            // → sort 输入分数损坏([0.25,-inf]) → 回归源(经 savedReduce/savedScores 诊断实证)。
-            // 测试路径(Sort/MrgBasicBlock,actS1Size<=4)不读段4;SortAll/MergeSort 路径
-            // (actS1Size>4/sparse>2K)需段4 NEG_INF merge-list 填充 → 待生产路径回归确认。
-            //
-            // TEMP DIAG (2026-08-30 决定性二分): 绕过整条 mask/score 链,让 sortScore =
-            // 纯 reduce 拷贝直进 sort。e0 identity 无 -1 候选,mask 恒 1,绕过语义等价。
-            //  - 若 score/raw 恢复 [0.5,1.0,...] → mask 链(段4 未初始化/缺 barrier)是唯一破坏源
-            //  - 若仍常数 → 破坏在 L368 reduce→sortScore 拷贝(reduceOutInner=[128,256) 与
-            //    maskI32/sortIndiceUb 同址,缺 barrier 被 Mins 提前覆写)
-            // sortIndiceUb(段2)本就在 L404 被 globalTopkIndice_ 重写,绕过 mask 不影响段2。
+            // 2026-08-30 绕过实验(纯 reduce 拷贝直进 sort)NPU 全恢复(score=[0.5,1.0,...],
+            // cols 降序全对,determinism 256/256,fullprobe==nonid)→ 坐实 mask 链是唯一破坏源。
+            // 根因 = 链内 V 指令读-写乱序:终 Adds(scoreI32, scoreTmp2, NEG_INF) 读段4 时
+            // 前一条 Mul 的写未落定 → 读 stale 段4(02:21 的 [0.25,-inf] 正是 stale
+            // scoreTmp2=[0.5,0.0,...]+NEG_INF 的位加签名)。与临时段位置无关(b48f9b176/
+            // 266de9558 都坏) → 修复 = 链内每步显式 PipeBarrier<PIPE_V>。
+            // 段4 [3V,4V) 预写 NEG_INF:SortAll/MergeSort 路径(actS1Size>4/sparse>2K)的
+            // merge-list 填充必须保留(2026-08-29 NPU 实测复用为临时段 → 排序读 garbage)。
+            LocalTensor<int32_t> candsSeg = candsFullUb[cuBaseS2Idx];
+            LocalTensor<int32_t> maskI32 = sortIndiceUb.template ReinterpretCast<int32_t>(); // 复用 sortIndiceUb 段,L404 前会被重写
+            LocalTensor<int32_t> maskScratch = reduceOutBuff[2 * cuS2LenVecAlign].template ReinterpretCast<int32_t>();
+            LocalTensor<float> negInfUb = reduceOutBuff[3 * cuS2LenVecAlign];
+            Duplicate(negInfUb.template ReinterpretCast<int32_t>(), IndexerRefineServiceVec::NEG_INF, cuS2LenVecAlign);
             PipeBarrier<PIPE_V>();
-            // TEMP DIAG: 保存 sort 实际输入分数(=L368 reduce 拷贝,绕过 mask 链后同 reduce),dump 到 tmpUb_[3*cuS2Len+cuS2Len)
+            Adds(maskScratch, candsSeg, static_cast<int32_t>(1), cuS2Len);
+            PipeBarrier<PIPE_V>();
+            Mins(maskI32, maskScratch, static_cast<int32_t>(1), cuS2Len);
+            PipeBarrier<PIPE_V>();
+            LocalTensor<int32_t> scoreI32 = sortScoreUb.template ReinterpretCast<int32_t>();
+            // dav_c220 缺 SubsImpl(接口声明在、实现缺失,CANN 9.1.0) → 补码等价: x - 0xFF800000 ≡ x + 0x00800000
+            LocalTensor<int32_t> scoreTmp1 = maskScratch; // mask 已定,复用 [2V]
+            LocalTensor<int32_t> scoreTmp2 = reduceOutBuff[3 * cuS2LenVecAlign].template ReinterpretCast<int32_t>();
+            Adds(scoreTmp1, scoreI32, static_cast<int32_t>(-IndexerRefineServiceVec::NEG_INF), cuS2Len);
+            PipeBarrier<PIPE_V>();
+            Mul(scoreTmp2, scoreTmp1, maskI32, cuS2Len);
+            PipeBarrier<PIPE_V>();
+            Adds(scoreI32, scoreTmp2, IndexerRefineServiceVec::NEG_INF, cuS2Len);
+            PipeBarrier<PIPE_V>();
+            // TEMP DIAG: 保存 sort 实际输入分数(mask 链后),dump 到 tmpUb_[3*cuS2Len+cuS2Len)
             LocalTensor<float> savedScoresUb = tmpUb_[3 * cuS2Len + cuS2Len];
             DataCopy(savedScoresUb, reduceOutBuff, cuS2Len);
             PipeBarrier<PIPE_V>();

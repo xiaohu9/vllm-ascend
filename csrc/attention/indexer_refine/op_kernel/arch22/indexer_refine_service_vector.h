@@ -356,10 +356,6 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
             bool isS2End = cuBaseS2Idx + s2BaseSize_ >= cuRealAcSeq;
             IndexerRefineServiceVec::DoReduce(reduceCacheBuf[REDUCE_BANK_CONFLICT_NUM], reduceOutInner, gRedCnt, s2BaseSize_);
             outQueue_.FreeTensor(reduceCacheBuf);
-            // TEMP DIAG: 保存原始 reduce 分数(被 mask/identity 覆写前),dump 到 tmpUb_[3*cuS2Len)
-            LocalTensor<float> savedReduceUb = tmpUb_[3 * cuS2Len];
-            DataCopy(savedReduceUb, reduceOutInner, cuS2Len);
-            PipeBarrier<PIPE_V>();
 
             LocalTensor<float> sortScoreUb = reduceOutBuff;
             LocalTensor<float> sortIndiceUb = reduceOutBuff[cuS2LenVecAlign];
@@ -400,10 +396,6 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
             Mul(scoreTmp2, scoreTmp1, maskI32, cuS2Len);
             PipeBarrier<PIPE_V>();
             Adds(scoreI32, scoreTmp2, IndexerRefineServiceVec::NEG_INF, cuS2Len);
-            PipeBarrier<PIPE_V>();
-            // TEMP DIAG: 保存 sort 实际输入分数(mask 链后),dump 到 tmpUb_[3*cuS2Len+cuS2Len)
-            LocalTensor<float> savedScoresUb = tmpUb_[3 * cuS2Len + cuS2Len];
-            DataCopy(savedScoresUb, reduceOutBuff, cuS2Len);
             PipeBarrier<PIPE_V>();
             LocalTensor<int32_t> sortIndiceUbInt = sortIndiceUb.template ReinterpretCast<int32_t>();
             // 无效数据索引填充为-1
@@ -477,26 +469,53 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
                     // Extract 后先等 PIPE_V 再被后续 V 指令读(对齐 ProcessLD 的 Extract→barrier 模式)
                     PipeBarrier<PIPE_V>();
 
-                    // ===== TEMP DIAGNOSTIC (bisect sort/extract vs gather/transform) =====
-                    // 4 分片打包(每片 copyLen/4)进输出:
-                    //   out[0..c)   = extract cols(globalTopk 排序索引)
-                    //   out[c..2c)  = globalTopkUb_ 原始 int32 对(值|索引交错)
-                    //   out[2c..3c) = sort 实际输入分数 int32 位模式(sort 前存于 tmpUb_)
-                    //   out[3c..4c) = reduce 原始输出分数(reduce 后、mask 覆写前存于 tmpUb_)
-                    int64_t c = copyLen / 4;
-                    LocalTensor<int32_t> diagCols = outValueUb[offset].template ReinterpretCast<int32_t>();
-                    LocalTensor<int32_t> diagRaw =
-                        globalTopkUb_[innerS1Idx * virTopK * 2 + 2 * i * offset].template ReinterpretCast<int32_t>();
-                    LocalTensor<int32_t> diagScore =
-                        tmpUb_[3 * cuS2Len + cuS2Len].template ReinterpretCast<int32_t>();
-                    LocalTensor<int32_t> diagReduce = tmpUb_[3 * cuS2Len].template ReinterpretCast<int32_t>();
+                    LocalTensor<int32_t> idxULocal1 = outValueUb[offset].template ReinterpretCast<int32_t>();
+                    // refine true_pos:topk 列号(全局 s2 位置) → candidates 值(原始 key 位置)
+                    // Gather 的 srcOffset 语义 = 字节偏移,故先把列号 ×4;输出到 outValueUb[2*offset] 段
+                    LocalTensor<int32_t> truePosUb = outValueUb[2 * offset].template ReinterpretCast<int32_t>();
+                    // refine true_pos guard:globalTopk init 的 (-inf,-1) 槽被 topk 选中时列号=-1,
+                    // ×4 → 0xFFFFFFFC → 4GB 字节偏移越界读。留 (列号>=0) 掩码 + clamp 列号到 0,
+                    // Gather 后按掩码把无效槽写回 -1(有效候选→真实值, 无效槽→-1, 语义不变)。
+                    // dav_c220 vsel 仅接受 __ubuf__ half*,int32 Select 无法编译 → 算术替代:
+                    //   mask=(col>=0)?1:0 由 Adds(col,1)→Mins(1) 生成(col∈{-1}∪[0,255],与旧三段链等价),
+                    //   dst=(src+1)*mask-1:mask=1→src、mask=0→-1。mask 暂存 value 段 [0,copyLen)。
+                    // 实测坑:count 模式原地(dst==src)指令对前 L 个元素读 src[j+1](copyLen≤128 全段
+                    // 错位、copyLen=256 仅首 64 错位)→ 本段全部改非原地写临时段(sort prep 的 mask/score
+                    // 链同款坑已一并修,全文件无原地 count op)。临时段:tmpUb 复用 gather 后已死的 idx 段
+                    // [offset,);mask 段用值段 [0,copyLen)。
+                    // 与 sort-prep 同款 barrier:链内每步 PipeBarrier<PIPE_V> 防 V 指令读-写乱序
+                    // (2026-08-30 已在 sort-prep mask 链实测坐实:无 barrier 时 Adds→Mul→Adds 连发,
+                    // 终 Adds 读 stale 段 → 分数损坏)。
+                    LocalTensor<int32_t> maskI32 = outValueUb.template ReinterpretCast<int32_t>();
+                    int64_t tmpOff = (2 * copyLen <= offset) ? copyLen : (2 * offset + copyLen);
+                    LocalTensor<int32_t> tmpUb = outValueUb[tmpOff].template ReinterpretCast<int32_t>();
+                    Adds(tmpUb, idxULocal1, static_cast<int32_t>(1), copyLen);
+                    PipeBarrier<PIPE_V>();
+                    Mins(maskI32, tmpUb, static_cast<int32_t>(1), copyLen);
+                    PipeBarrier<PIPE_V>();
+                    Maxs(tmpUb, idxULocal1, static_cast<int32_t>(0), copyLen);
+                    PipeBarrier<PIPE_V>();
+                    Muls(idxULocal1, tmpUb, 4, copyLen);
+                    // dav_c220 Gather = vgather(PIPE_V),非 MTE。Muls→Gather 读依赖 + Gather→Adds
+                    // 写依赖都必须等 PIPE_V(生产参考 inplace_partial_rotary_mul 同款 Gather+PIPE_V 模式)
+                    PipeBarrier<PIPE_V>();
+                    AscendC::Gather(truePosUb, candsFullUb, idxULocal1.template ReinterpretCast<uint32_t>(), 0,
+                                    copyLen);
+                    PipeBarrier<PIPE_V>();
+                    // gather 完成后 idx 段已死,复用为 tmp2;transform 全部非原地
+                    LocalTensor<int32_t> tmp2Ub = outValueUb[offset].template ReinterpretCast<int32_t>();
+                    Adds(tmp2Ub, truePosUb, static_cast<int32_t>(1), copyLen);
+                    PipeBarrier<PIPE_V>();
+                    Mul(tmpUb, tmp2Ub, maskI32, copyLen);
+                    PipeBarrier<PIPE_V>();
+                    Adds(truePosUb, tmpUb, static_cast<int32_t>(-1), copyLen);
+                    PipeBarrier<PIPE_V>();
                     outQueue_.EnQue<float>(outValueUb);
                     outValueUb = outQueue_.DeQue<float>();
-                    auto diagDst = indiceOutGm[info.indiceOutOffset + cuS1Idx * constInfo_.sparseCount + i * offset];
-                    IndexerRefineServiceVec::CopyOut(diagDst, diagCols, c);
-                    IndexerRefineServiceVec::CopyOut(diagDst[c], diagRaw, c);
-                    IndexerRefineServiceVec::CopyOut(diagDst[2 * c], diagScore, c);
-                    IndexerRefineServiceVec::CopyOut(diagDst[3 * c], diagReduce, c);
+
+                    IndexerRefineServiceVec::CopyOut(indiceOutGm[info.indiceOutOffset + cuS1Idx *
+                                                         constInfo_.sparseCount + i * offset],
+                                        truePosUb, copyLen);
                     outQueue_.FreeTensor(outValueUb);
                 }
             } else if (needCopyWsGm) {

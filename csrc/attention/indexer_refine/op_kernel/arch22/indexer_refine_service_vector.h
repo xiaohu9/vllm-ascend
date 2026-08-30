@@ -368,7 +368,9 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
             //   位级 (score_bits-NEG_INF)*mask+NEG_INF:mask=1→原分、mask=0→NEG_INF(0xFF800000)
             // 与输出段同款坑:count 模式原地(dst==src)指令前 L 个元素读 src[j+1](单调分数下该位移
             // 使排序仍逐位一致 → identity 测试看不见;生产非单调分数会造成真实精度损失)→ mask/
-            // score 链全部改非原地写临时段 [2V,3V) 与 [3V,4V)(原 negInfUb 段,只写未读,复用)。
+            // score 链全部改非原地写临时段 [2V,3V)(maskScratch/scoreTmp1) 与 [3V,4V)(scoreTmp2)。
+            // 注意段4 同时是 SortAll/MergeSort 的 merge-list 填充区:mask 链把它写脏后,进 sort 前
+            // 必须重新预写 NEG_INF(见下方终 Adds 后的 Duplicate)。
             // 2026-08-30 绕过实验(纯 reduce 拷贝直进 sort)NPU 全恢复(score=[0.5,1.0,...],
             // cols 降序全对,determinism 256/256,fullprobe==nonid)→ 坐实 mask 链是唯一破坏源。
             // 根因 = 链内 V 指令读-写乱序:终 Adds(scoreI32, scoreTmp2, NEG_INF) 读段4 时
@@ -380,9 +382,6 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
             LocalTensor<int32_t> candsSeg = candsFullUb[cuBaseS2Idx];
             LocalTensor<int32_t> maskI32 = sortIndiceUb.template ReinterpretCast<int32_t>(); // 复用 sortIndiceUb 段,L404 前会被重写
             LocalTensor<int32_t> maskScratch = reduceOutBuff[2 * cuS2LenVecAlign].template ReinterpretCast<int32_t>();
-            LocalTensor<float> negInfUb = reduceOutBuff[3 * cuS2LenVecAlign];
-            Duplicate(negInfUb.template ReinterpretCast<int32_t>(), IndexerRefineServiceVec::NEG_INF, cuS2LenVecAlign);
-            PipeBarrier<PIPE_V>();
             Adds(maskScratch, candsSeg, static_cast<int32_t>(1), cuS2Len);
             PipeBarrier<PIPE_V>();
             Mins(maskI32, maskScratch, static_cast<int32_t>(1), cuS2Len);
@@ -396,6 +395,13 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
             Mul(scoreTmp2, scoreTmp1, maskI32, cuS2Len);
             PipeBarrier<PIPE_V>();
             Adds(scoreI32, scoreTmp2, IndexerRefineServiceVec::NEG_INF, cuS2Len);
+            PipeBarrier<PIPE_V>();
+            // 段4 [3V,4V) 同时是 SortAll/MergeSort(生产路径)的 merge-list 填充区——mask 链刚把它
+            // 当 scoreTmp2 写脏([0,cuS2Len)),必须在进 sort 前重新预写 NEG_INF。2026-08-30 回归实证:
+            // 测试路径(Sort/MrgBasicBlock)不读段4 → 污染无害;生产路径段4 脏 → SortAll/MergeSort
+            // 读 garbage 全挂。每轮循环都重新预写(下一轮 scoreTmp2 又会写脏)。
+            LocalTensor<float> negInfUb = reduceOutBuff[3 * cuS2LenVecAlign];
+            Duplicate(negInfUb.template ReinterpretCast<int32_t>(), IndexerRefineServiceVec::NEG_INF, cuS2LenVecAlign);
             PipeBarrier<PIPE_V>();
             LocalTensor<int32_t> sortIndiceUbInt = sortIndiceUb.template ReinterpretCast<int32_t>();
             // 无效数据索引填充为-1

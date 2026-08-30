@@ -488,14 +488,24 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
                     PipeBarrier<PIPE_V>();
 
                     LocalTensor<int32_t> diagIdx = outValueUb[offset].template ReinterpretCast<int32_t>();
-                    // TEMP DIAG(2026-08-30): 输出 extract 索引段(候选列号)替代 true_pos gather —
-                    // 二分 合并阶段(globalTopkUb_ 索引脏 → col 越界/错位) vs gather/transform 阶段(col 净)。
-                    // 诊断脚本复刻 cands[req][col.clamp(0)] masked col<0→-1 与 golden 对比。
+                    // TEMP DIAG(2026-08-30): 输出 extract 值段+索引段各前 copyLen/2(拼接)替代 true_pos gather —
+                    //   [0, copyLen/2) = 前 copyLen/2 对的 值(float bit 当 int32 输出),
+                    //   [copyLen/2, copyLen) = 前 copyLen/2 对的 索引(候选列号 col)。
+                    // 一次跑批区分三种根因(仅看 col 无法区分):
+                    //   - 值段=NEG_INF(-8388608)且索引=-1       -> 该对从未被 merge 覆盖(仍初始 (-inf,-1))
+                    //   - 值段=合理分数但索引位是分数 bit        -> 值-索引对错位(SortAll/MrgSort 输出布局问题)
+                    //   - 值段=合理分数且索引=合理 col 但顺序错    -> 排序顺序错(merge 逻辑问题)
+                    // mid 实测: 每行前 256 对错(64垃圾+64错序), 后 256 对全对。PIPE_ALL 竞态修复无效。
                     outQueue_.EnQue<float>(outValueUb);
                     outValueUb = outQueue_.DeQue<float>();
+                    // 值段前 copyLen/2(float bit → int32 输出)
                     IndexerRefineServiceVec::CopyOut(indiceOutGm[info.indiceOutOffset + cuS1Idx *
                                                          constInfo_.sparseCount + i * offset],
-                                        diagIdx, copyLen);
+                                        outValueUb.template ReinterpretCast<int32_t>(), copyLen / 2);
+                    // 索引段前 copyLen/2
+                    IndexerRefineServiceVec::CopyOut(indiceOutGm[info.indiceOutOffset + cuS1Idx *
+                                                         constInfo_.sparseCount + i * offset + copyLen / 2],
+                                        diagIdx, copyLen / 2);
                     outQueue_.FreeTensor(outValueUb);
                 }
             } else if (needCopyWsGm) {

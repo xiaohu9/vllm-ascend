@@ -601,7 +601,6 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessLD()
     int64_t s2Start;
     int64_t s2End;
     int64_t isS2End;
-    int64_t bn2Idx;
     int64_t s1Idx;
     uint32_t acc_list_num = 0;
     int64_t bIdx = 0;
@@ -661,7 +660,6 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessLD()
         wsInfoOffset = tmpCubeId * s1BaseSize_ * 2 * paramNum_ + innerS1Idx * 2 * paramNum_;
         needFd = vec1ParamGm.GetValue(wsInfoOffset);
         isS2End = vec1ParamGm.GetValue(wsInfoOffset + 4);
-        bn2Idx = vec1ParamGm.GetValue(wsInfoOffset + 5); // refine:true_pos 需按 request 定位 candidates 行
         s1Idx = vec1ParamGm.GetValue(wsInfoOffset + 6);
         outOffset = vec1ParamGm.GetValue(wsInfoOffset + 8);
 
@@ -711,7 +709,6 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessLD()
             wsInfoOffset = tmpCubeId * s1BaseSize_ * 2 * paramNum_ + innerS1Idx * 2 * paramNum_;
             needFd = vec1ParamGm.GetValue(wsInfoOffset);
             isS2End = vec1ParamGm.GetValue(wsInfoOffset + 4);
-            bn2Idx = vec1ParamGm.GetValue(wsInfoOffset + 5);
         }
 
         // mrg不足4个list的数据
@@ -741,49 +738,16 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessLD()
             PipeBarrier<PIPE_V>();
         }
 
-        // 搬出
+        // 搬出(生产 lightning_indexer ProcessLD returnValue=false 同款):
+        //   Extract 分离 (value,index) → 直拷 idx(列号)。无效候选已由评分链
+        //   (service_cube.h:256 cand==-1 置 -inf)沉底, 尾部空槽 = InitSortOutBuf 的 -1。
         LocalTensor<float> outValueUb = ldOutValueBuf_.Get<float>();
         LocalTensor<uint32_t> outIdxUb = ldOutIdxBuf_.Get<uint32_t>();
         Extract(outValueUb, outIdxUb, curValueIdxUb, (BASE_TOPK / 32));
-        // Extract 后先等 PIPE_V 再被后续 V 指令读(与 ProcessVec 同款)
-        PipeBarrier<PIPE_V>();
         LocalTensor<int32_t> idxULocal1 = outIdxUb.template ReinterpretCast<int32_t>();
-        // refine true_pos:LD 合并输出的列号 → candidates 值(原始 key 位置)
-        LocalTensor<int32_t> candsFullUb = candsFullBuf_.Get<int32_t>();
-        // Level2 DataCopy count 单位为元素
-        AscendC::DataCopy(candsFullUb, candidatesGm_[bn2Idx * constInfo_.kSeqSize], constInfo_.kSeqSize);
-        AscendC::PipeBarrier<PIPE_MTE2>();
-        // refine true_pos guard:与 ProcessVec 同款 — (列号>=0) 掩码 + clamp, Gather 后无效槽写回 -1。
-        // dav_c220 vsel 仅接受 __ubuf__ half*,int32 Select 无法编译 → 算术替代:
-        //   mask=(col>=0)?1:0 由 Adds(col,1)→Mins(1) 生成(col∈{-1}∪[0,255],与旧三段链等价),
-        //   dst=(src+1)*mask-1:mask=1→src、mask=0→-1。
-        // 与 ProcessVec 同款坑:count 模式原地(dst==src)指令前 L 个元素读 src[j+1] → 全部改
-        // 非原地。临时段全部放 tmpUb(原 validMask 段,此处空闲;mrgListNum_=4 容量足够):
-        //   mask [0,sparseCount),T1 [sparseCount,2*sparseCount),T2 [2*sparseCount,3*sparseCount)
-        LocalTensor<int32_t> tmpI32 = tmpUb.template ReinterpretCast<int32_t>();
-        LocalTensor<int32_t> maskI32 = tmpI32;
-        LocalTensor<int32_t> tmpUb1 = tmpI32[constInfo_.sparseCount];
-        LocalTensor<int32_t> tmpUb2 = tmpI32[2 * constInfo_.sparseCount];
-        Adds(tmpUb1, idxULocal1, static_cast<int32_t>(1), constInfo_.sparseCount);
-        Mins(maskI32, tmpUb1, static_cast<int32_t>(1), constInfo_.sparseCount);
-        PipeBarrier<PIPE_V>();
-        Maxs(tmpUb1, idxULocal1, static_cast<int32_t>(0), constInfo_.sparseCount);
-        Muls(idxULocal1, tmpUb1, 4, constInfo_.sparseCount);
-        LocalTensor<int32_t> truePosUb = outValueUb.template ReinterpretCast<int32_t>(); // value 段复用
-        // dav_c220 Gather = vgather(PIPE_V),非 MTE。与 ProcessVec 同款: Muls→Gather 读依赖 +
-        // Gather→Adds 写依赖都必须等 PIPE_V(生产参考 inplace_partial_rotary_mul 同款模式)
-        PipeBarrier<PIPE_V>();
-        AscendC::Gather(truePosUb, candsFullUb, idxULocal1.template ReinterpretCast<uint32_t>(), 0,
-                        constInfo_.sparseCount);
-        PipeBarrier<PIPE_V>();
-        // gather 完成后 idx 段已死;transform 全部非原地
-        Adds(tmpUb2, truePosUb, static_cast<int32_t>(1), constInfo_.sparseCount);
-        Mul(tmpUb1, tmpUb2, maskI32, constInfo_.sparseCount);
-        Adds(truePosUb, tmpUb1, static_cast<int32_t>(-1), constInfo_.sparseCount);
-        PipeBarrier<PIPE_V>();
         SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
         SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
-        DataCopyPad(indiceOutGm[outOffset], truePosUb,
+        DataCopyPad(indiceOutGm[outOffset], idxULocal1,
                     {1, static_cast<uint16_t>(constInfo_.sparseCount * sizeof(int32_t)), 0, 0});
         SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
     }

@@ -435,7 +435,30 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
             //   全过)保留缓存路径。v6 mask 链修复后此强制仍无害,保留待回归再评估。
             if (info.actS1Size > 4 || constInfo_.isSparseCountOver2K || cuS2Len == s2BaseSize_) {
                 // info.actS1Size > 4 则单个vector核内处理的 s1>2，缓存方案无法处理
-                if (cuS2LenVecAlign == s2BaseSize_) {
+                if (constInfo_.isSparseCountOver2K) {
+                    // 2026-08-31 v11 根因修复: over2k 归并只用 2-list。旧路径
+                    //   MergeSort(acc, mrgDstNum=virTopK=4096, chunk, ...) 的 mrgDstNum=4096>3072
+                    //   进 MergeSort 3-segment 分支(4 路 MrgSort, elementLengths=[2048,1024,1024,chunk]),
+                    //   该分支 ~50% 数据相关单相邻 swap —— over2k/prod_wide NPU 实证, 2-list 分支
+                    //   全用例 100% 可靠。v10(拆 2×256)只改了 chunk 排序, 归并仍 3-segment → 无效,
+                    //   且把 prod_wide 暴露成同源失败(其 v9 通过纯属种子运气, 位置随数据漂移)。
+                    //   方案: 双累积 acc_U(排名1-2048)+acc_L(排名2049-4096)。每 chunk SortAll(512)
+                    //   后两次 2-list 归并(mrgDstNum=virTopK/2=2048≤3072, 永不进 3-segment):
+                    //     MergeSort(acc_U, 2048, chunk, len, tmpUb_): 被丢弃的 len 个最小对留在
+                    //       tmpUb_[virTopK, virTopK+2*len)(MrgSort 全量输出, DataCopy 只拷回前 2048)
+                    //     MergeSort(acc_L, 2048, tmpUb_[virTopK], len, tmpUb_[virTopK+2*len])
+                    //   集合恒等: 各次丢弃尾之并 == 全部非 top-2048 元素 → acc_L==排名2049-4096;
+                    //   输出 = acc_U+acc_L 拼接 == top-4096, 布局与旧单次 4096 归并逐位一致,
+                    //   CopyOut(Extract 按 virTopK 宽读) 不变。CPU 逐位验证 3 形态全过:
+                    //   plans/indexer_refine_v11_twopass_verify.py。virTopK/2 仍 >3072(sparseCount
+                    //   >6144)需丢尾级联扩展, 当前未触达。
+                    SortAll(reduceOutBuff, tmpSortBuf, cuS2LenVecAlign); // 恢复整块 512 排序(probe prod 同款, 实证可靠)
+                    PipeBarrier<PIPE_V>();
+                    IndexerRefineServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK / 2,
+                                            reduceOutBuff, cuS2LenVecAlign, tmpUb_);
+                    IndexerRefineServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2 + virTopK], virTopK / 2,
+                                            tmpUb_[virTopK], cuS2LenVecAlign, tmpUb_[virTopK + 2 * cuS2LenVecAlign]);
+                } else if (cuS2LenVecAlign == s2BaseSize_) {
                     // 2026-08-31 v10 修复: 全块 512 排序拆 2×256。Sort32/MrgSort 硬件在 512 粒度
                     //   存在数据相关腐蚀(over2k 随机数据单相邻 swap 实证: 分数严格单调却被换序,
                     //   位置随数据漂移 102/252; Sort<float,true> 全块损坏同源, 见上 v5 注),

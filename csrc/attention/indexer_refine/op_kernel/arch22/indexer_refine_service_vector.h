@@ -133,12 +133,11 @@ private:
 template <typename LIT>
 __aicore__ inline void IndexerRefineServiceVector<LIT>::InitBuffers(TPipe *pipe)
 {
-    // CopyOut 段需求(单 outValueUb): 值[0,offset) + 索引[offset,2offset) + truePos[2offset,2offset+copyLen)
-    //   + tmpUb[tmpOff,tmpOff+copyLen), tmpOff = (2*copyLen<=offset)? copyLen : 2*offset+copyLen
-    //   → 最坏 2*offset + 2*copyLen floats。non-Over2K: offset=virTopK=2048, copyLen<=2048 → 8192。
-    //   Over2K copyNum=1: offset=copyLen=sparseCount → 4*sparseCount;copyNum=2: offset=copyLen=sparseCount/2 → 2*sparseCount。
-    // 2026-08-30 修复: 默认 8192 floats 仅覆盖 refine<=2048;refine=4096(over2k 用例) truePos[8192,12288)+
-    //   tmpUb[12288,16384) 越界写相邻 buffer → 输出 NEG_INF 位模式垃圾。按 4*offset 扩容。
+    // CopyOut 段需求(单 outValueUb,Extract 形态): 值[0,offset) + 索引[offset,2offset) = 2*offset floats。
+    //   non-Over2K: offset=virTopK=2048, copyLen<=2048 → 4096;Over2K: offset=copyOff, copyNum=2 → 4096。
+    //   reduceCacheBuf(groupInner_*s2BaseSize_+offsets) 更大,outQueue_ 按其取 max,富余充足。
+    // 2026-08-30 修复: 默认 8192 floats 仅覆盖 refine<=2048;refine=4096(over2k 用例) 旧 DIAG 直出
+    //   truePos/tmpUb 越界 → 输出 NEG_INF 位模式垃圾。按 4*offset 扩容。
     uint32_t outNeedBufSize = (BASE_TOPK * 2) * 2 * sizeof(float);
     if (constInfo_.isSparseCountOver2K) {
         int64_t copyOff = (constInfo_.sparseCount <= SPARSE_COUNT_4K)
@@ -155,12 +154,15 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::InitBuffers(TPipe *pipe)
     pipe->InitBuffer(tmpBuf_, (groupInner_ * s2BaseSize_ + s2BaseSize_) * 2 * sizeof(float));
     pipe->InitBuffer(sortOutBuf_, CeilDiv(s1BaseSize_, 2) * virTopK * 2 * sizeof(float));    // 64KB
     pipe->InitBuffer(indexBuf_, s2BaseSize_ * sizeof(int32_t));                                // 2KB
-    // refine:reduceOutBuf_ 扩到 4×s2BaseSize_ — 段1 [0,V) sort 分数、段2 [V,2V) mask→sort 索引、
-    // 段3 [2V,3V) + 段4 [3V,4V) mask/score 链临时段(b48f9b176 布局)。注意:266de9558 曾把临时段
-    // 移到 tmpUb_ 并预写段4 NEG_INF → sort 输入分数损坏 → 2026-08-30 已回退。段4 原 NEG_INF 向量
-    // 是 SortAll/MergeSort(actS1Size>4 或 sparse>2K)的 merge-list 填充,该路径复用段4 待回归确认;
-    // 测试路径(Sort/MrgBasicBlock)不读段4,安全。
-    pipe->InitBuffer(reduceOutBuf_, s2BaseSize_ * 4 * sizeof(float));                          // 8KB
+    // refine:reduceOutBuf_ 扩到 5×s2BaseSize_(v6 2026-08-31) — 段1 [0,V) sort 分数(掩码后)、
+    // 段2 [V,2V) sort 索引(cols,只写一次)、段3 [2V,3V)+段4 [3V,4V)+段5 [4V,5V) mask/score 链
+    // 专用 scratch(mask / (score-NEG_INF)*mask 积 / score-NEG_INF 各占一段,全程非原地,规避
+    // count 模式 dst==src 的 src[j+1] 位移坑)。v5(4 段)把 mask 写进 [V,2V) 再重写 cols + 链尾
+    // 二次覆写 [0,V) → 多 chunk 下 sort 输入被双重写击穿(输出值槽=候选索引)。v6 终写只落
+    // [0,V)+[V,2V),identity 下与生产(lightning_indexer,2 段)逐位一致。sort 硬件 merge-list 在
+    // dst[dstSize+8](≈[2V,3V) 内),write-only,scratch 复用无害;2026-08-30 的"段4 是 merge-list
+    // 区必须预写 NEG_INF"为误诊,已移除。
+    pipe->InitBuffer(reduceOutBuf_, s2BaseSize_ * 5 * sizeof(float));                          // 10KB
     pipe->InitBuffer(brcBuf_, groupInner_ * 8 * sizeof(float));
     pipe->InitBuffer(paramBuf_, LD_PARAM_NUM * sizeof(int64_t));
     // candidates 行全量(int32,粗筛宽度);candsSeg/true_pos 均只读 [0, kSeqSize)
@@ -371,78 +373,54 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
 
             LocalTensor<float> sortScoreUb = reduceOutBuff;
             LocalTensor<float> sortIndiceUb = reduceOutBuff[cuS2LenVecAlign];
-            Duplicate(sortScoreUb.template ReinterpretCast<int32_t>(), IndexerRefineServiceVec::NEG_INF, cuS2LenVecAlign);
+            LocalTensor<int32_t> scoreI32 = sortScoreUb.template ReinterpretCast<int32_t>();
+            LocalTensor<int32_t> sortIndiceUbInt = sortIndiceUb.template ReinterpretCast<int32_t>();
+            // [0,V) 先全宽预填 NEG_INF(部分块尾对齐,与生产同),数据写只有一次(链尾 Adds)。
+            Duplicate(scoreI32, IndexerRefineServiceVec::NEG_INF, cuS2LenVecAlign);
             PipeBarrier<PIPE_V>();
-            Adds(sortScoreUb, reduceOutInner, 0.0f, cuS2Len);
             // refine scattered mask:cand==-1 的列分数置 -inf → topk 沉底 → 尾部输出自动 -1。
             // dav_c220 vsel 仅接受 __ubuf__ half*,float Select 同样无法编译 → 算术替代:
             //   mask=(cand!=-1):cand≥-1 ⇒ t=cand+1≥0,mask=(t>=1)?1:0 = Mins(t,1)(免 bit-mask)
             //   位级 (score_bits-NEG_INF)*mask+NEG_INF:mask=1→原分、mask=0→NEG_INF(0xFF800000)
-            // 与输出段同款坑:count 模式原地(dst==src)指令前 L 个元素读 src[j+1](单调分数下该位移
-            // 使排序仍逐位一致 → identity 测试看不见;生产非单调分数会造成真实精度损失)→ mask/
-            // score 链全部改非原地写临时段 [2V,3V)(maskScratch/scoreTmp1) 与 [3V,4V)(scoreTmp2)。
-            // 注意段4 同时是 SortAll/MergeSort 的 merge-list 填充区:mask 链把它写脏后,进 sort 前
-            // 必须重新预写 NEG_INF(见下方终 Adds 后的 Duplicate)。
-            // 2026-08-30 绕过实验(纯 reduce 拷贝直进 sort)NPU 全恢复(score=[0.5,1.0,...],
-            // cols 降序全对,determinism 256/256,fullprobe==nonid)→ 坐实 mask 链是唯一破坏源。
-            // 根因 = 链内 V 指令读-写乱序:终 Adds(scoreI32, scoreTmp2, NEG_INF) 读段4 时
-            // 前一条 Mul 的写未落定 → 读 stale 段4(02:21 的 [0.25,-inf] 正是 stale
-            // scoreTmp2=[0.5,0.0,...]+NEG_INF 的位加签名)。与临时段位置无关(b48f9b176/
-            // 266de9558 都坏) → 修复 = 链内每步显式 PipeBarrier<PIPE_V>。
-            // 段4 [3V,4V) 预写 NEG_INF:SortAll/MergeSort 路径(actS1Size>4/sparse>2K)的
-            // merge-list 填充必须保留(2026-08-29 NPU 实测复用为临时段 → 排序读 garbage)。
+            // v6(2026-08-31) 根因修复: 前版(v5)把 mask 写进 sort 索引槽 [V,2V) 再重写 cols,
+            //   且链尾对 [0,V) 二次覆写 → 多 chunk 下 sort 输入被双重写击穿(绕过实验坐实 mask
+            //   链是唯一破坏源)。本版 [0,V) 数据只写一次(掩码后分数,Duplicate 仅预填尾对齐)、
+            //   [V,2V) 只写一次(cols)、mask/(score-NEG_INF)*mask 积/score-NEG_INF 全部走
+            //   [2V,5V) 专用 scratch 且每步非原地(规避 count 模式 dst==src 的 src[j+1] 位移坑)。
+            //   identity(全有效 cand)下 [0,V)=原始分数位模式,[V,2V)=cols → 与生产逐位一致,
+            //   sort 输入恢复生产形态。sort 硬件 merge-list 在 dst[dstSize+8](≈[2V,3V) 内),
+            //   write-only,scratch 复用无害;2026-08-30 的"段4 merge-list 区必须预写 NEG_INF"
+            //   为误诊,已移除。
             LocalTensor<int32_t> candsSeg = candsFullUb[cuBaseS2Idx];
-            LocalTensor<int32_t> maskI32 = sortIndiceUb.template ReinterpretCast<int32_t>(); // 复用 sortIndiceUb 段,L404 前会被重写
-            LocalTensor<int32_t> maskScratch = reduceOutBuff[2 * cuS2LenVecAlign].template ReinterpretCast<int32_t>();
-            Adds(maskScratch, candsSeg, static_cast<int32_t>(1), cuS2Len);
+            LocalTensor<int32_t> sMask = reduceOutBuff[2 * cuS2LenVecAlign].template ReinterpretCast<int32_t>();
+            LocalTensor<int32_t> sTmp = reduceOutBuff[3 * cuS2LenVecAlign].template ReinterpretCast<int32_t>();
+            LocalTensor<int32_t> sScr = reduceOutBuff[4 * cuS2LenVecAlign].template ReinterpretCast<int32_t>();
+            Adds(sMask, candsSeg, static_cast<int32_t>(1), cuS2Len);                 // [2V] = cand+1
             PipeBarrier<PIPE_V>();
-            Mins(maskI32, maskScratch, static_cast<int32_t>(1), cuS2Len);
+            Mins(sTmp, sMask, static_cast<int32_t>(1), cuS2Len);                     // [3V] = mask
             PipeBarrier<PIPE_V>();
-            LocalTensor<int32_t> scoreI32 = sortScoreUb.template ReinterpretCast<int32_t>();
             // dav_c220 缺 SubsImpl(接口声明在、实现缺失,CANN 9.1.0) → 补码等价: x - 0xFF800000 ≡ x + 0x00800000
-            LocalTensor<int32_t> scoreTmp1 = maskScratch; // mask 已定,复用 [2V]
-            LocalTensor<int32_t> scoreTmp2 = reduceOutBuff[3 * cuS2LenVecAlign].template ReinterpretCast<int32_t>();
-            Adds(scoreTmp1, scoreI32, static_cast<int32_t>(-IndexerRefineServiceVec::NEG_INF), cuS2Len);
+            Adds(sScr, reduceOutInner.template ReinterpretCast<int32_t>(),
+                 static_cast<int32_t>(-IndexerRefineServiceVec::NEG_INF), cuS2Len); // [4V] = score-NEG_INF
             PipeBarrier<PIPE_V>();
-            Mul(scoreTmp2, scoreTmp1, maskI32, cuS2Len);
+            Mul(sMask, sScr, sTmp, cuS2Len);                                         // [2V] = (score-NEG_INF)*mask
             PipeBarrier<PIPE_V>();
-            Adds(scoreI32, scoreTmp2, IndexerRefineServiceVec::NEG_INF, cuS2Len);
+            Adds(scoreI32, sMask, IndexerRefineServiceVec::NEG_INF, cuS2Len);        // [0,V) 前 cuS2Len = 掩码后分数
             PipeBarrier<PIPE_V>();
-            // 段4 [3V,4V) 同时是 SortAll/MergeSort(生产路径)的 merge-list 填充区——mask 链刚把它
-            // 当 scoreTmp2 写脏([0,cuS2Len)),必须在进 sort 前重新预写 NEG_INF。2026-08-30 回归实证:
-            // 测试路径(Sort/MrgBasicBlock)不读段4 → 污染无害;生产路径段4 脏 → SortAll/MergeSort
-            // 读 garbage 全挂。每轮循环都重新预写(下一轮 scoreTmp2 又会写脏)。
-            LocalTensor<float> negInfUb = reduceOutBuff[3 * cuS2LenVecAlign];
-            Duplicate(negInfUb.template ReinterpretCast<int32_t>(), IndexerRefineServiceVec::NEG_INF, cuS2LenVecAlign);
-            PipeBarrier<PIPE_V>();
-            LocalTensor<int32_t> sortIndiceUbInt = sortIndiceUb.template ReinterpretCast<int32_t>();
-            // 无效数据索引填充为-1
+            // [V,2V) sort 索引槽:只写一次(cols);部分块尾对齐补 -1。
             if (cuS2LenVecAlign != cuS2Len) {
                 Duplicate(sortIndiceUbInt, -1, cuS2LenVecAlign);
             }
             PipeBarrier<PIPE_V>();
             Adds(sortIndiceUbInt, globalTopkIndice_, static_cast<int32_t>(cuBaseS2Idx), cuS2Len);
-            PipeBarrier<PIPE_V>();
-
-            // TEMP DIAG(2026-08-31 v4): pre-sort 输入 dump → output row0(blockId0 首个 S1 row),
-            //   并跳过 row0 正式 CopyOut。判定 sort 输入结构:值槽是否被 mask 链打成
-            //   交错 (score_even, NEG_INF_odd) + 索引槽 (col_even, -1_odd)。
-            if (blockId_ == 0 && innerS1Idx == 0 && info.loop == 0 && info.s2Idx == 0) {
-                AscendC::PipeBarrier<PIPE_ALL>();
-                IndexerRefineServiceVec::CopyOut(indiceOutGm[info.indiceOutOffset],
-                                    reduceOutBuff.template ReinterpretCast<int32_t>(), 2 * cuS2LenVecAlign);
-            }
-
-            // 2026-08-31 v5 修复: mask 链(V 写)与排序(Sort32/MrgSort)之间统一加 PIPE_ALL,
-            //   保证 reduceOutBuff 写落定后才被排序读取。
+            // 进 sort 前统一同步:reduceOutBuff 写(V/MTE)全部落定后才被排序读取。
             AscendC::PipeBarrier<PIPE_ALL>();
 
             LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
-            // 2026-08-31 v5 修复: Sort<float,true>+MrgBasicBlock 缓存路径(actS1Size<=4)在
-            //   cuS2Len 全块(=512)时实证损坏(v4 输入 dump: 值槽交错(-1,-inf)+索引槽降序,
-            //   Sort<float,true> 对 reduceOutBuff 留下交错污染)。SortAll+MergeSort 生产路径
-            //   small_wide(c=512) 全对 → 全块用例强制走生产路径;部分块(<=256,精确层用例
-            //   e0/c64/c256 全过)保留缓存路径。
+            // 2026-08-31 v5 修复(保留): Sort<float,true>+MrgBasicBlock 缓存路径(actS1Size<=4)在
+            //   cuS2Len 全块(=512)时曾实证损坏 → 全块用例强制走 SortAll+MergeSort 生产路径
+            //   (绕过实验证明该路径对 identity 全对);部分块(<=256,精确层用例 e0/c64/c256
+            //   全过)保留缓存路径。v6 mask 链修复后此强制仍无害,保留待回归再评估。
             if (info.actS1Size > 4 || constInfo_.isSparseCountOver2K || cuS2Len == s2BaseSize_) {
                 // info.actS1Size > 4 则单个vector核内处理的 s1>2，缓存方案无法处理
                 IndexerRefineServiceVec::SortAll(reduceOutBuff, tmpSortBuf,
@@ -492,23 +470,27 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
             bool needCopyWsGm = info.isAllLoopEnd || isS2End;
 
             if (needCopyOutGm) {
+                // 生产形态 CopyOut(2026-08-31 v6 恢复): Extract 分离 globalTopkUb_ 的 (value,index)
+                //   交错对,经 outQueue_ EnQue/DeQue 缓冲后拷贝 idx 到输出。取代 v3/v4 TEMP DIAG
+                //   直出 raw 对(其 MTE3 直读 globalTopkUb_ 与下块 InitSortOutBuf 竞态,且污染输出
+                //   格式)。refine 无 value 输出(returnValue=false),只拷贝索引。
+                int64_t offset = (constInfo_.sparseCount <= SPARSE_COUNT_4K) ? virTopK : constInfo_.sparseCount / 2;
                 int64_t copyLen = (constInfo_.sparseCount <= SPARSE_COUNT_4K)
                                 ? constInfo_.sparseCount
                                 : constInfo_.sparseCount / 2;
-                if (blockId_ == 0 && innerS1Idx == 0 && info.loop == 0 && info.s2Idx == 0) {
-                    // TEMP DIAG(v4): row0 已被 pre-sort 输入 dump 占用,跳过正式 CopyOut
-                } else {
-                // TEMP DIAG(2026-08-30 v3): 直出 globalTopkUb_ 原始交错对 (value_bits, col)
-                //   前 copyLen 个 int32 = copyLen/2 对, 不做 Extract。
-                //   v2(Extract 取窗)观测: 全部用例前 refine/2 对的 col = 真 top-refine 第二半
-                //   (rank [refine/2, refine)), 值槽 1块=0.0 / 2-4块=真实分+0.0 / 8块=NaN。
-                //   v3 直出原始对 → 判定 merge/SortAll 输出布局(半交换/值槽覆写) vs Extract 读错。
-                //   MergeSort/SparseTopK 末尾 PIPE_ALL 已保证 globalTopkUb_ 写完成 → 直接 MTE3 读安全。
-                AscendC::PipeBarrier<PIPE_ALL>();
-                IndexerRefineServiceVec::CopyOut(indiceOutGm[info.indiceOutOffset + cuS1Idx *
-                                                     constInfo_.sparseCount],
-                                    globalTopkUb_[innerS1Idx * virTopK * 2].template ReinterpretCast<int32_t>(),
-                                    copyLen);
+                int64_t copyNum = (constInfo_.sparseCount <= SPARSE_COUNT_4K) ? 1 : 2;
+                for (int64_t i = 0; i < copyNum; i++) {
+                    LocalTensor<float> outValueUb = outQueue_.AllocTensor<float>();
+                    LocalTensor<uint32_t> outIdxUb = outValueUb[offset].template ReinterpretCast<uint32_t>();
+                    Extract(outValueUb, outIdxUb,
+                            globalTopkUb_[innerS1Idx * virTopK * 2 + 2 * i * offset], offset / 32);
+                    LocalTensor<int32_t> idxULocal1 = outValueUb[offset].template ReinterpretCast<int32_t>();
+                    outQueue_.EnQue<float>(outValueUb);
+                    outValueUb = outQueue_.DeQue<float>();
+                    IndexerRefineServiceVec::CopyOut(indiceOutGm[info.indiceOutOffset + cuS1Idx *
+                                                                 constInfo_.sparseCount + i * offset],
+                                        idxULocal1, copyLen);
+                    outQueue_.FreeTensor(outValueUb);
                 }
             } else if (needCopyWsGm) {
                 // vec1Res Gm = [aic, s1BaseSize_, 2, 2, topkOut_] float32

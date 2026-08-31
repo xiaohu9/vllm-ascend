@@ -356,9 +356,12 @@ def _refine_topk(
     """Per-query top-k over the broadcast candidate set, native formula.
 
     score[n, j] = sum_h w[n, h] * ReLU(q[n, h] . k_cand[req(n), j]) -- the
-    exact formula the BF16 indexer computes. -1 candidate slots are masked to
-    -inf before top-k (no causal mask here: the native indexer scans the full
-    [0, L+g) domain and lets the SFA attention kernel apply causality).
+    exact formula the indexer computes, scored in fp32: bf16 q/k/weights in,
+    fp32 MM accumulate and fp32 scale+reduce, mirroring the native
+    npu_lightning_indexer / npu_indexer_refine op (Mmad -> fp32 L0C, fp32 GM
+    writeback). -1 candidate slots are masked to -inf before top-k (no causal
+    mask here: the native indexer scans the full [0, L+g) domain and lets the
+    SFA attention kernel apply causality).
     """
     device = q_dq.device
     R, c = C.shape
@@ -375,15 +378,23 @@ def _refine_topk(
 
     # Broadcast candidates to query rows and score in one bmm per chunk:
     # [N, H, D] x [N, D, c] -> [N, H, c].
+    # Score in fp32 (was bf16 via q_dq.dtype). At production score magnitude
+    # ~1.9e6 a bf16 buffer's ulp is ~14844 while the adjacent-column gap is a
+    # few hundred -> ~56 columns collapse to one bf16 value and the top-k is
+    # destroyed; fp32 keeps them distinct and matches the fp32 op (see
+    # memory: indexer-refine-tie-root-cause).
+    q32 = q_dq.to(torch.float32)
+    w32 = weights.to(torch.float32)
+    k32 = k_cand.to(torch.float32)
     C_n = C[req_ids]  # [N, c]
-    score = torch.empty(N, c, dtype=q_dq.dtype, device=device)
+    score = torch.empty(N, c, dtype=torch.float32, device=device)
     chunk = 256
     for s in range(0, N, chunk):
         e = min(s + chunk, N)
         att = torch.relu(
-            torch.bmm(q_dq[s:e], k_cand[req_ids[s:e]].transpose(1, 2))
+            torch.bmm(q32[s:e], k32[req_ids[s:e]].transpose(1, 2))
         )  # [chunk, H, c]
-        score[s:e] = (att * weights[s:e].unsqueeze(-1)).sum(dim=1)
+        score[s:e] = (att * w32[s:e].unsqueeze(-1)).sum(dim=1)
 
     invalid = C_n < 0
     score = score.masked_fill(invalid, float("-inf"))

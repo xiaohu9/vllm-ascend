@@ -117,7 +117,8 @@ private:
     int32_t kHeadNum_ = 0;
     int32_t s1BaseSize_ = 0;
     int32_t s2BaseSize_ = 0;
-    int32_t candsLoadedBIdx_ = -1; // refine:candsFullUb_ 已加载的 request 行号(惰性加载去重)
+    int32_t candsLoadedBIdx_ = -1;  // refine:candsFullUb_ 已加载的 request 行号(惰性加载,双 key)
+    int32_t candsLoadedS2Idx_ = -1; // refine:candsFullUb_ 已加载的 S2 chunk 基址(惰性加载,双 key)
 
     // para for LD
     uint32_t mrgListNum_ = 4;
@@ -137,13 +138,14 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::InitBuffers(TPipe *pipe)
     //   non-Over2K: offset=virTopK=2048, copyLen<=2048 → 4096;Over2K: offset=copyOff, copyNum=2 → 4096。
     //   reduceCacheBuf(groupInner_*s2BaseSize_+offsets) 更大,outQueue_ 按其取 max,富余充足。
     // 2026-08-30 修复: 默认 8192 floats 仅覆盖 refine<=2048;refine=4096(over2k 用例) 旧 DIAG 直出
-    //   truePos/tmpUb 越界 → 输出 NEG_INF 位模式垃圾。按 4*offset 扩容。
+    //   truePos/tmpUb 越界 → 输出 NEG_INF 位模式垃圾。按 2*offset 扩容(Extract dst 需求 =
+    //   dstValue[0,offset)+dstIndex[0,offset),前版 4*offset 是过度分配)。
     uint32_t outNeedBufSize = (BASE_TOPK * 2) * 2 * sizeof(float);
     if (constInfo_.isSparseCountOver2K) {
         int64_t copyOff = (constInfo_.sparseCount <= SPARSE_COUNT_4K)
                               ? constInfo_.sparseCount
                               : constInfo_.sparseCount / 2;
-        outNeedBufSize = 4 * copyOff * sizeof(float);
+        outNeedBufSize = 2 * copyOff * sizeof(float);
     }
     uint32_t reduceCacheSize = REDUCE_BANK_CONFLICT_OFFSETS + groupInner_ * s2BaseSize_ * sizeof(float);
     outNeedBufSize = reduceCacheSize > outNeedBufSize ? reduceCacheSize : outNeedBufSize;
@@ -165,9 +167,11 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::InitBuffers(TPipe *pipe)
     pipe->InitBuffer(reduceOutBuf_, s2BaseSize_ * 5 * sizeof(float));                          // 10KB
     pipe->InitBuffer(brcBuf_, groupInner_ * 8 * sizeof(float));
     pipe->InitBuffer(paramBuf_, LD_PARAM_NUM * sizeof(int64_t));
-    // candidates 行全量(int32,粗筛宽度);candsSeg/true_pos 均只读 [0, kSeqSize)
-    uint32_t candsFullSize = IndexerRefineCommon::Align<uint32_t>(constInfo_.kSeqSize, 8);
-    pipe->InitBuffer(candsFullBuf_, candsFullSize * sizeof(int32_t));
+    // candidates 行 chunk 级(int32):主循环只读当前 S2 chunk(≤512 int32=2KB)。v7(2026-08-31)
+    //   UB 超限修复 — 前版整行(16KB@c=4096)使 v6 prod 主循环 UB 总需求 197.5KB 超 A3 910B 的
+    //   192KB → VEC 读写越界(507015)。整行载入移入 InitLDBuffers(LD 阶段,pipe->Reset() 后独立,
+    //   不受影响);ProcessVec 按 (request, chunk) 双 key 惰性载入,见 ProcessVec。
+    pipe->InitBuffer(candsFullBuf_, s2BaseSize_ * sizeof(int32_t));
 
     tmpUb_ = tmpBuf_.Get<float>();
     globalTopkIndice_ = indexBuf_.Get<int32_t>();
@@ -314,13 +318,21 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
     }
     LocalTensor<float> reduceOutBuff = reduceOutBuf_.Get<float>();
     LocalTensor<float> brcBuf = brcBuf_.Get<float>();
-    // refine:candidates 行全量(scattered mask / true_pos 用),按 request 惰性加载
+    // refine:candidates 行 chunk 级(scattered mask / true_pos 用),按 (request, S2-chunk) 双 key
+    //   惰性加载。v7(2026-08-31) 与 InitBuffers 配套:主循环不持整行,candsFullUb 只装当前 chunk。
     LocalTensor<int32_t> candsFullUb = candsFullBuf_.Get<int32_t>();
-    if (candsLoadedBIdx_ != static_cast<int32_t>(info.bIdx)) {
-        // Level2 DataCopy count 单位为元素
-        AscendC::DataCopy(candsFullUb, candidatesGm_[info.bIdx * constInfo_.kSeqSize], constInfo_.kSeqSize);
+    int32_t cuS2LenChunk = cuBaseS2Idx + s2BaseSize_ >= info.actS2Size ? info.actS2Size - cuBaseS2Idx
+                                                                       : s2BaseSize_;
+    if (candsLoadedBIdx_ != static_cast<int32_t>(info.bIdx) ||
+        candsLoadedS2Idx_ != cuBaseS2Idx) {
+        // Level2 DataCopy count 单位为元素;count 按 8(int32=32B)对齐(部分尾块,读入同行的
+        //   padding 元素无副作用)。chunkAligned≤s2BaseSize_=512=buffer 容量。
+        int32_t chunkAligned = static_cast<int32_t>(IndexerRefineCommon::Align<uint32_t>(cuS2LenChunk, 8));
+        AscendC::DataCopy(candsFullUb,
+                          candidatesGm_[info.bIdx * constInfo_.kSeqSize + cuBaseS2Idx], chunkAligned);
         AscendC::PipeBarrier<PIPE_MTE2>();
         candsLoadedBIdx_ = static_cast<int32_t>(info.bIdx);
+        candsLoadedS2Idx_ = cuBaseS2Idx;
     }
     // LD输出S1方向偏移，保证2个Vector输出的内容连续
     uint32_t ldS1Offset = (blockId_ % 2 == 0) ? s1BaseSize_ / 2 - cuS1ProcNumPerAiv : 0;
@@ -391,7 +403,7 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
             //   sort 输入恢复生产形态。sort 硬件 merge-list 在 dst[dstSize+8](≈[2V,3V) 内),
             //   write-only,scratch 复用无害;2026-08-30 的"段4 merge-list 区必须预写 NEG_INF"
             //   为误诊,已移除。
-            LocalTensor<int32_t> candsSeg = candsFullUb[cuBaseS2Idx];
+            LocalTensor<int32_t> candsSeg = candsFullUb; // v7: chunk 级 buffer 基址,去 cuBaseS2Idx 偏移
             LocalTensor<int32_t> sMask = reduceOutBuff[2 * cuS2LenVecAlign].template ReinterpretCast<int32_t>();
             LocalTensor<int32_t> sTmp = reduceOutBuff[3 * cuS2LenVecAlign].template ReinterpretCast<int32_t>();
             LocalTensor<int32_t> sScr = reduceOutBuff[4 * cuS2LenVecAlign].template ReinterpretCast<int32_t>();

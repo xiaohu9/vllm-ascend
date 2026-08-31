@@ -435,12 +435,37 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
             //   全过)保留缓存路径。v6 mask 链修复后此强制仍无害,保留待回归再评估。
             if (info.actS1Size > 4 || constInfo_.isSparseCountOver2K || cuS2Len == s2BaseSize_) {
                 // info.actS1Size > 4 则单个vector核内处理的 s1>2，缓存方案无法处理
-                IndexerRefineServiceVec::SortAll(reduceOutBuff, tmpSortBuf,
-                                      cuS2LenVecAlign); //  cuS2LenVecAlign <= s2BaseSize_, fill -inf
-                PipeBarrier<PIPE_V>();
-                LocalTensor<float> UbTmpSort = constInfo_.isSparseCountOver2K ? tmpUb_ : tmpSortBuf;
-                IndexerRefineServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK, reduceOutBuff,
-                                        cuS2LenVecAlign, UbTmpSort);
+                if (cuS2LenVecAlign == s2BaseSize_) {
+                    // 2026-08-31 v10 修复: 全块 512 排序拆 2×256。Sort32/MrgSort 硬件在 512 粒度
+                    //   存在数据相关腐蚀(over2k 随机数据单相邻 swap 实证: 分数严格单调却被换序,
+                    //   位置随数据漂移 102/252; Sort<float,true> 全块损坏同源, 见上 v5 注),
+                    //   ≤256 实测可靠。此处: Sort<float,true> 各排 256 半, 经既有 MergeSort 分
+                    //   两次并入累积(top-k 结合律 → 与整体 512 排序逐位一致), 永不构造 512 排序
+                    //   列表、永不触发 4 路 128→512 归并层。
+                    LocalTensor<uint32_t> idxU32 =
+                        reduceOutBuff[s2BaseSize_].template ReinterpretCast<uint32_t>();
+                    // 半A: 值 reduceOutBuff[0,256) + 索引 [512,768) → tmpSortBuf[0,512)
+                    AscendC::Sort<float, true>(tmpSortBuf, reduceOutBuff, idxU32,
+                                              tmpSortBuf[s2BaseSize_], cuS2LenVecAlign / 64);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    // 半B: 值 reduceOutBuff[256,512) + 索引 [768,1024) → tmpSortBuf[512,1024)
+                    AscendC::Sort<float, true>(tmpSortBuf[s2BaseSize_], reduceOutBuff[s2BaseSize_ / 2],
+                                              idxU32[s2BaseSize_ / 2], tmpSortBuf[2 * s2BaseSize_],
+                                              cuS2LenVecAlign / 64);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    // 两半分别并入累积(半A 存于 tmpSortBuf, 故 tmpTensor 用 tmpUb_ 不可复用 tmpSortBuf)
+                    IndexerRefineServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK,
+                                            tmpSortBuf, cuS2LenVecAlign / 2, tmpUb_);
+                    IndexerRefineServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK,
+                                            tmpSortBuf[s2BaseSize_], cuS2LenVecAlign / 2, tmpUb_);
+                } else {
+                    IndexerRefineServiceVec::SortAll(reduceOutBuff, tmpSortBuf,
+                                          cuS2LenVecAlign); //  cuS2LenVecAlign <= s2BaseSize_, fill -inf
+                    PipeBarrier<PIPE_V>();
+                    LocalTensor<float> UbTmpSort = constInfo_.isSparseCountOver2K ? tmpUb_ : tmpSortBuf;
+                    IndexerRefineServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK, reduceOutBuff,
+                                            cuS2LenVecAlign, UbTmpSort);
+                }
             } else {
                 int64_t globalTopkUbCacheIdx = (info.s2Idx - blockS2StartIdx_) % 4;
                 Sort<float, true>(

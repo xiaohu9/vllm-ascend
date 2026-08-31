@@ -479,7 +479,17 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
             bool needCopyOutGm = blockS2StartIdx_ == 0 && isS2End;
 
             // 中间结果保存
-            bool needCopyWsGm = info.isAllLoopEnd || isS2End;
+            // v8(2026-08-31) 根因修复: 原门控 isAllLoopEnd || isS2End 只在请求末 chunk 触发,
+            //   而 S2 被 SplitCore 拆到多核时(probe prod 32块/24核、mid 8块/8核, 请求 S2 落多核),
+            //   中间核的 accumulated globalTopkUb_ 从不写 ws → ProcessLD 链读到未初始化垃圾。
+            //   正确门控 = 每核自身 s2 范围末 chunk(isLastS2InnerLoop, CalcS2LoopParams 的
+            //   s2LoopEnd): 起始核(blockS2StartIdx_==0)→tail 槽「跟后面块做规约」,续核
+            //   (blockS2StartIdx_!=0)→head 槽「跟前面块做规约」, 与下方 WS 偏移规则注释一致。
+            //   单 chunk / 整请求单核路径 blockS2StartIdx_==0 && isS2End → needCopyOutGm 优先
+            //   走 CopyOut, 不受影响(已验证 small/small_wide/over2k/prod_wide)。
+            //   仿真 plans/indexer_refine_ws_emulation.py 复现: 现行门控 5 个多 chunk 用例全丢数据
+            //   (与 NPU 0% 吻合), 修复后 9/9 全对。
+            bool needCopyWsGm = info.isLastS2InnerLoop;
 
             if (needCopyOutGm) {
                 // 生产形态 CopyOut(2026-08-31 v6 恢复): Extract 分离 globalTopkUb_ 的 (value,index)

@@ -456,31 +456,28 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
                     PipeBarrier<PIPE_V>();
                     IndexerRefineServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK / 2,
                                             reduceOutBuff, cuS2LenVecAlign, tmpUb_);
+                    // 2026-09-01 aarch64 原生工具链(严格模式)拒收 LocalTensor::operator[] 临时量作
+                    //   非 const 左值引用形参(mrgSrc/tmpTensor): x86_64 容器工具链宽松头文件放行,
+                    //   容器 BUILD_EXIT=0 ≠ 节点可编译 —— NPU 节点(CANN 9.1.0 aarch64)报
+                    //   "non-const lvalue reference cannot bind to a temporary"(L460)。先提命名变量。
+                    LocalTensor<float> ubTail = tmpUb_[virTopK];
+                    LocalTensor<float> ubScratch = tmpUb_[virTopK + 2 * cuS2LenVecAlign];
                     IndexerRefineServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2 + virTopK], virTopK / 2,
-                                            tmpUb_[virTopK], cuS2LenVecAlign, tmpUb_[virTopK + 2 * cuS2LenVecAlign]);
+                                            ubTail, cuS2LenVecAlign, ubScratch);
                 } else if (cuS2LenVecAlign == s2BaseSize_) {
-                    // 2026-08-31 v10 修复: 全块 512 排序拆 2×256。Sort32/MrgSort 硬件在 512 粒度
-                    //   存在数据相关腐蚀(over2k 随机数据单相邻 swap 实证: 分数严格单调却被换序,
-                    //   位置随数据漂移 102/252; Sort<float,true> 全块损坏同源, 见上 v5 注),
-                    //   ≤256 实测可靠。此处: Sort<float,true> 各排 256 半, 经既有 MergeSort 分
-                    //   两次并入累积(top-k 结合律 → 与整体 512 排序逐位一致), 永不构造 512 排序
-                    //   列表、永不触发 4 路 128→512 归并层。
-                    LocalTensor<uint32_t> idxU32 =
-                        reduceOutBuff[s2BaseSize_].template ReinterpretCast<uint32_t>();
-                    // 半A: 值 reduceOutBuff[0,256) + 索引 [512,768) → tmpSortBuf[0,512)
-                    AscendC::Sort<float, true>(tmpSortBuf, reduceOutBuff, idxU32,
-                                              tmpSortBuf[s2BaseSize_], cuS2LenVecAlign / 64);
-                    AscendC::PipeBarrier<PIPE_V>();
-                    // 半B: 值 reduceOutBuff[256,512) + 索引 [768,1024) → tmpSortBuf[512,1024)
-                    AscendC::Sort<float, true>(tmpSortBuf[s2BaseSize_], reduceOutBuff[s2BaseSize_ / 2],
-                                              idxU32[s2BaseSize_ / 2], tmpSortBuf[2 * s2BaseSize_],
-                                              cuS2LenVecAlign / 64);
-                    AscendC::PipeBarrier<PIPE_V>();
-                    // 两半分别并入累积(半A 存于 tmpSortBuf, 故 tmpTensor 用 tmpUb_ 不可复用 tmpSortBuf)
-                    IndexerRefineServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK,
-                                            tmpSortBuf, cuS2LenVecAlign / 2, tmpUb_);
-                    IndexerRefineServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK,
-                                            tmpSortBuf[s2BaseSize_], cuS2LenVecAlign / 2, tmpUb_);
+                    // 2026-09-01 回退 v10 的 2×256 拆排, 恢复 v9 = 原生产路径(SortAll(512) +
+                    //   2-list MergeSort, probe prod 同款, NPU 实证可靠)。回退原因二:
+                    //   ① 前提被 v11 证伪 —— 腐蚀在 MergeSort 3-segment 分支(mrgDstNum>3072),
+                    //      不在 512 粒度 chunk 排序(prod 全块用 SortAll(512) 从不败); v10 只改
+                    //      了 chunk 排序层, 归并仍传 mrgDstNum=virTopK=4096 → 仍 3-segment,
+                    //      故 NPU 7/9 回归(over2k+prod_wide 同源失败)。
+                    //   ② 该分支把 operator[] 临时量传非 const 左值引用(L471/475/483 的
+                    //      Sort<float,true> 4/1 参 + MergeSort mrgSrc), aarch64 原生工具链
+                    //      编译失败, 而容器 x86_64 宽松头文件放行 → 本地 BUILD_EXIT=0 无效。
+                    IndexerRefineServiceVec::SortAll(reduceOutBuff, tmpSortBuf, cuS2LenVecAlign);
+                    PipeBarrier<PIPE_V>();
+                    IndexerRefineServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK, reduceOutBuff,
+                                            cuS2LenVecAlign, tmpSortBuf);
                 } else {
                     IndexerRefineServiceVec::SortAll(reduceOutBuff, tmpSortBuf,
                                           cuS2LenVecAlign); //  cuS2LenVecAlign <= s2BaseSize_, fill -inf

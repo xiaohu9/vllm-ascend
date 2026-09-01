@@ -180,15 +180,18 @@ class PivotIndexer:
         )  # [D]
         if envs.VLLM_ASCEND_PIVOT_REFINE_USE_OP:
             # Validated op (NPU 9/9 tie-aware PASS). The op groups the
-            # per-request candidates C via the cumulative aslq internally, so
-            # req_ids is not needed here. Fall back to the torch reference on
-            # any op failure so the decode path keeps serving.
+            # per-request candidates C via the cumulative aslq internally.
+            # Fall back to the torch reference on any op failure so the
+            # decode path keeps serving.
             try:
+                # Op prototype requires candidates DT_INT32; _coarse_screen
+                # returns torch.topk indices (int64). Cast only on the op
+                # path -- the torch reference below consumes C as-is.
                 topk_dec = torch.ops._C_ascend.npu_indexer_refine(
                     q_dq,
                     kv_cache[2],
                     weights[:D],
-                    C,
+                    C.to(torch.int32),
                     actual_seq_lengths_query=cum[:K],
                     actual_seq_lengths_key=seq_lens[:K],
                     block_table=attn_metadata.block_table[:K],
@@ -196,6 +199,21 @@ class PivotIndexer:
                     layout_key="PA_BSND",
                     sparse_count=_REFINE_BUDGET,
                 )  # [D, 1, _REFINE_BUDGET] int32
+                # CRITICAL: the refine op's S2 axis is the CANDIDATE LIST, so
+                # it sorts and emits the candidate COLUMN index -- unlike the
+                # native indexer where column == KV position. _coarse_screen
+                # returns score-ordered positions (C[r, j] = j-th best
+                # position, NOT identity), so a raw column value is useless to
+                # the SFA kernel unless mapped back to the position value.
+                # Missing this gather is why the op path read wrong keys and
+                # produced the massive repetition loops in gsm8k.
+                cols = topk_dec.view(D, _REFINE_BUDGET).to(torch.int64)
+                pos = C[req_ids].gather(1, cols.clamp(min=0))  # [D, 2048]
+                topk_dec = (
+                    torch.where(cols < 0, -1, pos)
+                    .view(D, 1, _REFINE_BUDGET)
+                    .to(torch.int32)
+                )
             except Exception as e:
                 logger.warning("PIVOT refine op failed, falling back to torch: %s", e)
                 topk_dec = _refine_topk(
@@ -219,6 +237,18 @@ class PivotIndexer:
                 attn_metadata.block_size,
                 D,
             )
+
+        # ---- 4. causality is enforced by the SFA kernel, not here ----------
+        # sparse_mode=3 gives the SFA kernel a per-row threshold
+        # (nextTokensPerBatch + gS1Idx/gSize + 1 == L+i+1, the query row's
+        # causal prefix) that it enforces in all three consumption points
+        # (CalcSinnerTopKBegin / CalcTopKBlockInfo / CopyInKv): positions >=
+        # L+i+1 are skipped, never attended. Do NOT inject -1 sentinels here
+        # -- the kernel breaks its sparse scan at the first -1
+        # (kernel_mla.h CalcSinnerTopKBegin), so a mid-list -1 silently drops
+        # every later valid candidate and collapses attention (this was the
+        # repetition seen even on the torch path). Both paths emit valid
+        # positions in score order; the kernel handles causality.
 
         if K == R_all:
             topk_indices = topk_dec

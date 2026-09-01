@@ -115,6 +115,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (attn_state DecodeOnly/SpecDecoding, g >= 2) take this path; everything
     # else falls back to the native per-query indexer. BF16 indexer only.
     "VLLM_ASCEND_ENABLE_PIVOT_REFINE": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_PIVOT_REFINE", "0"))),
+    # Use the validated npu_indexer_refine op (instead of the torch
+    # _refine_topk reference) for the PIVOT refine step inside select_topk.
+    # The torch implementation stays as the reference/fallback. Set to "0" to
+    # force the torch path (e.g. for P2 gate cross-checks on the NPU box).
+    "VLLM_ASCEND_PIVOT_REFINE_USE_OP": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_REFINE_USE_OP", "1"))),
+    # Use the npu_indexer_coarse_screen op (once validated on NPU) instead of
+    # the torch _coarse_screen reference for the PIVOT coarse step. Off by
+    # default until the op passes its NPU probe (P1 gate).
+    "VLLM_ASCEND_PIVOT_COARSE_USE_OP": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_COARSE_USE_OP", "0"))),
 }
 
 # end-env-vars-definition

@@ -43,6 +43,7 @@ import dataclasses
 import torch
 
 from vllm.logger import logger
+from vllm_ascend import envs
 
 # PIVOT-Refine budget split. The proxy screen returns a _COARSE_BUDGET
 # candidate superset (4096, the paper's number); per-query refine narrows to
@@ -177,16 +178,47 @@ class PivotIndexer:
         req_ids = torch.repeat_interleave(
             torch.arange(K, dtype=torch.int64, device=device), counts[:K]
         )  # [D]
-        topk_dec = _refine_topk(
-            q_dq,
-            weights[:D],
-            C,
-            req_ids,
-            kv_cache,
-            attn_metadata.block_table[:K],
-            attn_metadata.block_size,
-            D,
-        )
+        if envs.VLLM_ASCEND_PIVOT_REFINE_USE_OP:
+            # Validated op (NPU 9/9 tie-aware PASS). The op groups the
+            # per-request candidates C via the cumulative aslq internally, so
+            # req_ids is not needed here. Fall back to the torch reference on
+            # any op failure so the decode path keeps serving.
+            try:
+                topk_dec = torch.ops._C_ascend.npu_indexer_refine(
+                    q_dq,
+                    kv_cache[2],
+                    weights[:D],
+                    C,
+                    actual_seq_lengths_query=cum[:K],
+                    actual_seq_lengths_key=seq_lens[:K],
+                    block_table=attn_metadata.block_table[:K],
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=_REFINE_BUDGET,
+                )  # [D, 1, _REFINE_BUDGET] int32
+            except Exception as e:
+                logger.warning("PIVOT refine op failed, falling back to torch: %s", e)
+                topk_dec = _refine_topk(
+                    q_dq,
+                    weights[:D],
+                    C,
+                    req_ids,
+                    kv_cache,
+                    attn_metadata.block_table[:K],
+                    attn_metadata.block_size,
+                    D,
+                )
+        else:
+            topk_dec = _refine_topk(
+                q_dq,
+                weights[:D],
+                C,
+                req_ids,
+                kv_cache,
+                attn_metadata.block_table[:K],
+                attn_metadata.block_size,
+                D,
+            )
 
         if K == R_all:
             topk_indices = topk_dec

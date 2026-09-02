@@ -116,6 +116,53 @@ def _layer_num(name: str) -> int | None:
     return int(name[j + 1:i + 1])
 
 
+def _dump_gate(layer_name: str) -> bool:
+    """Decide whether to capture THIS (step, layer) invocation.
+
+    Combines the one-layer filter and the stride sampler. Only indexer layers
+    ever call in (sfa_v1.py:1496 has_indexer hard gate), so layer_name is
+    always a real indexer layer; an explicit DUMP_LAYER that names no indexer
+    layer logs the real roster and falls back to the current layer instead of
+    silently capturing nothing. Diagnostics only -- never raises.
+    """
+    global _dump_hits, _dump_layer, _dump_seen, _dump_miss_warned
+    if not envs.VLLM_ASCEND_PIVOT_REFINE_DUMP:
+        return False
+    if _dump_count >= envs.VLLM_ASCEND_PIVOT_REFINE_DUMP_MAX:
+        return False
+    if _dump_layer is None:
+        want = envs.VLLM_ASCEND_PIVOT_REFINE_DUMP_LAYER
+        if want == "first" or want in layer_name:
+            _dump_layer = layer_name
+        elif want != "first":
+            # _dump_seen doubles as the model's real indexer-layer roster.
+            if layer_name not in _dump_seen:
+                _dump_seen.append(layer_name)
+                logger.info_once(
+                    "PIVOT dump: DUMP_LAYER=%r not matched yet; indexer "
+                    "layer %s present (real indexer layers so far: %s)",
+                    want, layer_name, ", ".join(_dump_seen))
+            # Layers run in ascending index order each step: once a layer
+            # numerically past the target has appeared, the target (a dense
+            # layer) can never come. Fall back to the current real indexer
+            # layer so the run still captures data.
+            tw = _layer_num(want)
+            if (not _dump_miss_warned and tw is not None
+                    and any(_layer_num(l) is not None and _layer_num(l) > tw
+                            for l in _dump_seen)):
+                _dump_miss_warned = True
+                logger.warning(
+                    "PIVOT dump: DUMP_LAYER=%r matches no indexer layer "
+                    "(real ones seen: %s); falling back to %s so the run "
+                    "still captures data.",
+                    want, ", ".join(_dump_seen), layer_name)
+                _dump_layer = layer_name
+    if _dump_layer != layer_name:
+        return False
+    _dump_hits += 1
+    return (_dump_hits - 1) % envs.VLLM_ASCEND_PIVOT_REFINE_DUMP_STRIDE == 0
+
+
 def _dump_real_inputs(q_dq, weights, C, req_ids, aslq, aslk, kv_cache,
                       block_table, block_size, layer_hint, op_topk):
     """Persist one real op invocation + BOTH outputs for offline replay.
@@ -326,55 +373,17 @@ class PivotIndexer:
                 logger.info_once(
                     "PIVOT refine: using npu_indexer_refine op "
                     "(VLLM_ASCEND_PIVOT_REFINE_USE_OP=1).")
+                # Dump is diagnostics: guarded so a dump bug can never read
+                # "op failed", never trigger the torch fallback, never break
+                # the decode path. _dump_real_inputs self-protects too.
                 _do_dump = False
                 _layer = getattr(sfa_impl, "layer_name", "unknown")
-                if (envs.VLLM_ASCEND_PIVOT_REFINE_DUMP
-                        and _dump_count < envs.VLLM_ASCEND_PIVOT_REFINE_DUMP_MAX):
-                    # 层过滤: 同一步各 indexer 层输入高度相似, 全采只稀释
-                    # stride 覆盖。DUMP_LAYER="first"(默认)钉住第一个遇到的
-                    # 层; 显式子串(如 "layers.5")需等它出现才 pin —— 首个层
-                    # 不匹配时不能 pin 成空(否则永远采不到)。其余层直接跳过。
-                    global _dump_layer, _dump_seen, _dump_miss_warned
-                    if _dump_layer is None:
-                        want = envs.VLLM_ASCEND_PIVOT_REFINE_DUMP_LAYER
-                        if want == "first" or want in _layer:
-                            _dump_layer = _layer
-                        elif want != "first":
-                            # 能走到这里的层必然带 indexer(sfa_v1.py:1496
-                            # has_indexer 硬门), 所以 _dump_seen 即该模型真实
-                            # indexer 层名清单。显式 env 猜错(如想抓 layers.7
-                            # 但该层无 indexer)会一直等不到 → 记真实层名 +
-                            # 越位检测, 别让整个 run 静默白跑。
-                            if _layer not in _dump_seen:
-                                _dump_seen.append(_layer)
-                                logger.info_once(
-                                    "PIVOT dump: DUMP_LAYER=%r not matched yet; "
-                                    "indexer layer %s present (real indexer "
-                                    "layers so far: %s)",
-                                    want, _layer, ", ".join(_dump_seen))
-                            # 层每步按数值升序执行: 已见过 >target 的层而
-                            # target 仍未出现 → target 不是 indexer 层, 不会
-                            # 再出现。回退到当前真实 indexer 层并告警。
-                            tw = _layer_num(want)
-                            if (not _dump_miss_warned and tw is not None
-                                    and any(_layer_num(l) is not None
-                                            and _layer_num(l) > tw
-                                            for l in _dump_seen)):
-                                _dump_miss_warned = True
-                                logger.warning(
-                                    "PIVOT dump: DUMP_LAYER=%r matches no "
-                                    "indexer layer (real ones seen: %s); "
-                                    "falling back to %s so the run still "
-                                    "captures data.",
-                                    want, ", ".join(_dump_seen), _layer)
-                                _dump_layer = _layer
-                    if _dump_layer == _layer:
-                        # stride 门控: 每第 N 次命中采 1 个, 把 MAX 配额摊到整个
-                        # run(只采前 N 命中时全是 sub-512 安全窗, 尾块/截断区
-                        # 永远采不到 — L+g 随步数增长, 早期步全在安全区)。
-                        _dump_hits += 1
-                        _do_dump = (
-                            (_dump_hits - 1) % envs.VLLM_ASCEND_PIVOT_REFINE_DUMP_STRIDE == 0)
+                if envs.VLLM_ASCEND_PIVOT_REFINE_DUMP:
+                    try:
+                        _do_dump = _dump_gate(_layer)
+                    except Exception as e:
+                        logger.warning_once(
+                            "PIVOT refine dump gate error (%s); skipping dump", e)
                 if _do_dump:
                     # Dump AFTER the op returned, so the capture holds inputs
                     # + the op's raw output (pre-gather cols) + the python
@@ -402,7 +411,7 @@ class PivotIndexer:
                     .to(torch.int32)
                 )
             except Exception as e:
-                logger.warning("PIVOT refine op failed, falling back to torch: %s", e)
+                logger.warning("PIVOT refine op/gather failed, recomputing via torch: %s", e)
                 topk_dec = _refine_topk(
                     q_dq,
                     weights[:D],

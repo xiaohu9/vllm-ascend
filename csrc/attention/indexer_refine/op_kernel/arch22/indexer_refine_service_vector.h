@@ -429,11 +429,20 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
             AscendC::PipeBarrier<PIPE_ALL>();
 
             LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
-            // 2026-08-31 v5 修复(保留): Sort<float,true>+MrgBasicBlock 缓存路径(actS1Size<=4)在
-            //   cuS2Len 全块(=512)时曾实证损坏 → 全块用例强制走 SortAll+MergeSort 生产路径
-            //   (绕过实验证明该路径对 identity 全对);部分块(<=256,精确层用例 e0/c64/c256
-            //   全过)保留缓存路径。v6 mask 链修复后此强制仍无害,保留待回归再评估。
-            if (info.actS1Size > 4 || constInfo_.isSparseCountOver2K || cuS2Len == s2BaseSize_) {
+            // 2026-09-02 撤销 v5 的"全块强制 SortAll", 恢复原生路由(与生产
+            //   lightning_indexer_service_vector.h:294 同款条件, 仅 actS1Size>4)。
+            //   v5 加 `cuS2Len == s2BaseSize_` 把全块 chunk 改道 SortAll+MergeSort 后,
+            //   actS1Size<=4 的请求出现混合路径: 全块 chunk 累积进 globalTopkUb_, 而末尾
+            //   部分块 chunk 走缓存路径, 其 isS2End 归并在 `s2Idx - blockS2StartIdx_ < 4`
+            //   分支用 MrgBasicBlock(dst=globalTopkUb_) 直接覆写 globalTopkUb_ → 已累积
+            //   top-2048 全部丢失, 输出只剩末 chunk 候选 + -1 尾(SFA 扫描在首个 -1 break
+            //   → 注意力塌缩)。生产 g=4 + aslk=L+g 非 512 倍数必踩, 命中窗口 L+g∈(512,2048];
+            //   ≥5 chunk 走 else 分支 SparseTopK 归并(stale 槽被 InitSortOutBuf 预填 -inf/-1,
+            //   无害)不受影响。v5 观察到的"缓存路径全块损坏"实为同期 v5 mask 链双重写 bug
+            //   (v6 已修, 绕过实验已证 mask 链是唯一破坏源), 非缓存路径本身; 旧探针 aslk 恒
+            //   =c(512 倍数)使缓存路径从未在部分块混合序列下被测过。原生路由下同请求全部
+            //   chunk 统一走缓存路径, 4 槽位不变量成立。
+            if (info.actS1Size > 4 || constInfo_.isSparseCountOver2K) {
                 // info.actS1Size > 4 则单个vector核内处理的 s1>2，缓存方案无法处理
                 if (constInfo_.isSparseCountOver2K) {
                     // 2026-08-31 v11 根因修复: over2k 归并只用 2-list。旧路径

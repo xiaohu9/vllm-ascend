@@ -193,7 +193,15 @@ class PivotIndexer:
                     weights[:D],
                     C.to(torch.int32),
                     actual_seq_lengths_query=cum[:K],
-                    actual_seq_lengths_key=seq_lens[:K],
+                    # aslk drives the per-request S2 chunk loop over the
+                    # CANDIDATE LIST (row width = C.shape[1] = 4096). In the
+                    # truncated region L+g > 4096, an unclamped aslk makes the
+                    # kernel read candidate columns [4096, L+g) -- past the
+                    # row end (garbage/adjacent rows). Clamp to the row width;
+                    # the torch reference scores exactly the c candidates.
+                    actual_seq_lengths_key=torch.clamp(
+                        seq_lens[:K], max=C.shape[1]
+                    ),
                     block_table=attn_metadata.block_table[:K],
                     layout_query="TND",
                     layout_key="PA_BSND",
@@ -441,19 +449,19 @@ def _refine_topk(
     """
     device = q_dq.device
     R, c = C.shape
-    D = q_dq.shape[2]
-    k_cache = kv_cache[2]  # [B, S, 1, D] BF16 (PA_BSND)
-    kc = k_cache.view(-1, k_cache.shape[-1])  # [B*S, D]
+    Dh = q_dq.shape[2]  # head_dim (NOT the query row count `D` of select_topk)
+    k_cache = kv_cache[2]  # [B, S, 1, Dh] BF16 (PA_BSND)
+    kc = k_cache.view(-1, k_cache.shape[-1])  # [B*S, Dh]
 
     r = torch.arange(R, dtype=torch.int64, device=device)
     c_safe = C.clamp(min=0).to(torch.int64)  # -1 slots clamped for gather
     slots_c = (
         block_table[r.unsqueeze(1), c_safe // block_size] * block_size + c_safe % block_size
     )  # [R, c]
-    k_cand = kc[slots_c.reshape(-1)].view(R, c, D)  # [R, c, D]
+    k_cand = kc[slots_c.reshape(-1)].view(R, c, Dh)  # [R, c, Dh]
 
     # Broadcast candidates to query rows and score in one bmm per chunk:
-    # [N, H, D] x [N, D, c] -> [N, H, c].
+    # [N, H, Dh] x [N, Dh, c] -> [N, H, c].
     # Score in fp32 (was bf16 via q_dq.dtype). At production score magnitude
     # ~1.9e6 a bf16 buffer's ulp is ~14844 while the adjacent-column gap is a
     # few hundred -> ~56 columns collapse to one bf16 value and the top-k is

@@ -368,11 +368,15 @@ def _coarse_screen(
 
     Replaces the native npu_lightning_indexer proxy scan so the candidate
     superset is _COARSE_BUDGET (4096, the paper's number) rather than the
-    native 2048 sparse_count hard limit. Score formula matches the BF16
-    indexer: score[r, p] = sum_h w_bar[r, h] * relu(q_bar[r, h] . k[r, p])
+    native 2048 sparse_count hard limit. Score formula matches the native
+    fp32 indexer: score[r, p] = sum_h w_bar[r, h] * relu(q_bar[r, h] . k[r, p])
     over p in [0, seq_lens[r]) (= L + g, the full prefix; causality is left
-    to the SFA attention kernel). Returns [R, _COARSE_BUDGET] 0-based
-    positions, -1 padded where the prefix is shorter than the budget.
+    to the SFA attention kernel). NOTE: unlike the native indexer, which
+    scores each query row independently with that row's own q/w, this
+    screen scores a REQUEST-LEVEL mean proxy (q_bar/w_bar averaged over the
+    request's g queries -- the PIVOT paper's design) so each request shares
+    one candidate set. Returns [R, _COARSE_BUDGET] 0-based positions, -1
+    padded where the prefix is shorter than the budget.
     """
     device = q_bar.device
     R = q_bar.shape[0]
@@ -390,8 +394,18 @@ def _coarse_screen(
     slots = block_table[:, pos // block_size] * block_size + pos % block_size
     k_all = kc[slots.reshape(-1)].view(R, L_max, -1)  # [R, L_max, D]
 
-    score = torch.relu(torch.bmm(q_bar, k_all.transpose(1, 2)))  # [R, H, L_max]
-    score = (score * w_bar.unsqueeze(-1)).sum(dim=1)  # [R, L_max]
+    # Score in fp32 (was bf16 via q_bar.dtype): the native indexer is fp32
+    # end to end (Mmad fp32 accumulate -> Fixp NoQuant fp32 writeback), and
+    # at production score magnitude a bf16 score collapses adjacent columns
+    # (gaps of a few hundred) to one bf16 value, distorting the top-4096
+    # candidate set -- same bug class as the old bf16 _refine_topk (see
+    # memory: indexer-refine-tie-root-cause). R is the decode batch request
+    # count (small), so a single bmm is fine memory-wise.
+    q32 = q_bar.to(torch.float32)  # [R, H, Dh]
+    w32 = w_bar.to(torch.float32)  # [R, H]
+    k32 = k_all.to(torch.float32)  # [R, L_max, Dh]
+    score = torch.relu(torch.bmm(q32, k32.transpose(1, 2)))  # [R, H, L_max]
+    score = (score * w32.unsqueeze(-1)).sum(dim=1)  # [R, L_max]
 
     beyond = pos.unsqueeze(0) >= seq_i64.unsqueeze(1)  # [R, L_max]
     score = score.masked_fill(beyond, float("-inf"))

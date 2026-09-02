@@ -128,6 +128,9 @@ class PivotIndexer:
         if int(cum[-1]) != N:
             # TND row count must match the last cumulative boundary; if not,
             # the caller's grouping is not what we assume -- bail to native.
+            logger.warning_once(
+                "PIVOT: actual_seq_lengths_query[-1]=%d != num_actual_tokens=%d; "
+                "bailing the whole batch to the native indexer.", int(cum[-1]), N)
             return None
 
         counts = _request_counts(cum)  # [R]
@@ -135,6 +138,11 @@ class PivotIndexer:
         if not 2 <= g <= _MAX_GROUP:
             # Not a grouped-decode head (single-token decode, or a prefill
             # leading the batch): nothing to amortize.
+            logger.warning_once(
+                "PIVOT: leading request carries g=%d query rows (not a "
+                "grouped-decode head); bailing the whole batch to the native "
+                "indexer. If this fires in PD co-location, the decode->prefill "
+                "reorder did not put decodes at the batch head.", g)
             return None
 
         # Decode segment: the leading run of requests carrying g query rows.
@@ -150,6 +158,10 @@ class PivotIndexer:
             # (needs prefix caching / chunked prefill to arise): PIVOT's
             # proxy adds nothing there and could approximate past the
             # lossless window, so keep it on the native indexer.
+            logger.warning_once(
+                "PIVOT: uniform batch (g=%d) in attn_state=%s; keeping the "
+                "whole batch on the native indexer.", g,
+                attn_metadata.attn_state)
             return None
 
         device = q_li.device
@@ -207,6 +219,12 @@ class PivotIndexer:
                     layout_key="PA_BSND",
                     sparse_count=_REFINE_BUDGET,
                 )  # [D, 1, _REFINE_BUDGET] int32
+                # One-shot confirmation that the op path (not the torch
+                # fallback below) is live -- without this a silently failing
+                # op would make gsm8k runs indistinguishable from USE_OP=0.
+                logger.info_once(
+                    "PIVOT refine: using npu_indexer_refine op "
+                    "(VLLM_ASCEND_PIVOT_REFINE_USE_OP=1).")
                 # CRITICAL: the refine op's S2 axis is the CANDIDATE LIST, so
                 # it sorts and emits the candidate COLUMN index -- unlike the
                 # native indexer where column == KV position. _coarse_screen

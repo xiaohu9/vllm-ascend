@@ -190,7 +190,13 @@ def _dump_real_inputs(q_dq, weights, C, req_ids, aslq, aslk, kv_cache,
         out_dir = os.path.join(
             envs.VLLM_ASCEND_PIVOT_REFINE_DUMP_DIR, f"rank{_local_rank()}")
         os.makedirs(out_dir, exist_ok=True)
-        kc = kv_cache[2].view(kv_cache[2].shape[0], -1)  # [B*bs, Dh]
+        # Token-major rows of the PA_BSND K cache, flattened EXACTLY as
+        # _refine_topk consumes it (view(-1, Dh), slot = block_table[r,
+        # pos//bs]*bs + pos%bs). NOT view(kv_cache[2].shape[0], -1): that
+        # flattens on the BLOCK axis and leaves each row a whole block
+        # (bs * Dh wide), which the replay rebuild (token rows of Dh) cannot
+        # scatter back -- that shape mismatch was the dump bug.
+        kc = kv_cache[2].view(-1, kv_cache[2].shape[-1])  # [B*bs, Dh]
         # slots referenced by valid candidate positions (per request)
         c64 = C.to(torch.int64).clamp(min=0)
         blk = (c64 // block_size)

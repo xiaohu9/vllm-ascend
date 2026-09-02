@@ -139,8 +139,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_PIVOT_REFINE_DUMP_STRIDE": lambda: int(os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP_STRIDE", "1")),
     # Dump only ONE indexer layer (all indexer layers in a step see highly
     # similar inputs, so sampling them all just dilutes the stride coverage).
-    # "first" (default) pins the first layer that shows up; otherwise an
-    # exact layer-name substring to match (e.g. "layers.7").
+    # Only layers that own an indexer ever reach the dump code, so the value
+    # must be the layer_name of a real indexer layer. "first" (default) pins
+    # the first indexer layer that shows up. Otherwise an exact layer-name
+    # substring (e.g. "layers.7"). If the substring matches no indexer layer,
+    # the dump logs the real indexer-layer names it sees and falls back to the
+    # current one instead of silently capturing nothing.
     "VLLM_ASCEND_PIVOT_REFINE_DUMP_LAYER": lambda: os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP_LAYER", "first"),
 }
 

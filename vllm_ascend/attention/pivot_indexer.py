@@ -75,6 +75,11 @@ _MAX_GROUP = 16
 _dump_count = 0
 _dump_hits = 0
 _dump_layer = None  # pinned at first dump-eligible invocation (or from env)
+# Distinct indexer-layer names first seen (only indexer layers ever reach the
+# dump code, so this doubles as the model's real indexer-layer roster when an
+# explicit DUMP_LAYER guess is wrong).
+_dump_seen: list[str] = []
+_dump_miss_warned = False
 
 
 def _local_rank() -> str:
@@ -89,6 +94,26 @@ def _local_rank() -> str:
     import os
 
     return os.getenv("RANK", os.getenv("LOCAL_RANK", "0"))
+
+
+def _layer_num(name: str) -> int | None:
+    """Last integer run in a layer name, or None if it has no digits.
+
+    Model layer prefixes carry an index (e.g. ``model.layers.7`` or
+    ``model.layers.7.self_attn``); indexer layers execute in ascending index
+    order each decode step. Used to detect when an explicit DUMP_LAYER guess
+    names a layer that does not exist (we pass its index position without ever
+    seeing it) so the dump can warn and fall back instead of capturing nothing.
+    """
+    i = len(name) - 1
+    while i >= 0 and not name[i].isdigit():
+        i -= 1
+    if i < 0:
+        return None
+    j = i
+    while j >= 0 and name[j].isdigit():
+        j -= 1
+    return int(name[j + 1:i + 1])
 
 
 def _dump_real_inputs(q_dq, weights, C, req_ids, aslq, aslk, kv_cache,
@@ -309,11 +334,40 @@ class PivotIndexer:
                     # stride 覆盖。DUMP_LAYER="first"(默认)钉住第一个遇到的
                     # 层; 显式子串(如 "layers.5")需等它出现才 pin —— 首个层
                     # 不匹配时不能 pin 成空(否则永远采不到)。其余层直接跳过。
-                    global _dump_layer
+                    global _dump_layer, _dump_seen, _dump_miss_warned
                     if _dump_layer is None:
                         want = envs.VLLM_ASCEND_PIVOT_REFINE_DUMP_LAYER
                         if want == "first" or want in _layer:
                             _dump_layer = _layer
+                        elif want != "first":
+                            # 能走到这里的层必然带 indexer(sfa_v1.py:1496
+                            # has_indexer 硬门), 所以 _dump_seen 即该模型真实
+                            # indexer 层名清单。显式 env 猜错(如想抓 layers.7
+                            # 但该层无 indexer)会一直等不到 → 记真实层名 +
+                            # 越位检测, 别让整个 run 静默白跑。
+                            if _layer not in _dump_seen:
+                                _dump_seen.append(_layer)
+                                logger.info_once(
+                                    "PIVOT dump: DUMP_LAYER=%r not matched yet; "
+                                    "indexer layer %s present (real indexer "
+                                    "layers so far: %s)",
+                                    want, _layer, ", ".join(_dump_seen))
+                            # 层每步按数值升序执行: 已见过 >target 的层而
+                            # target 仍未出现 → target 不是 indexer 层, 不会
+                            # 再出现。回退到当前真实 indexer 层并告警。
+                            tw = _layer_num(want)
+                            if (not _dump_miss_warned and tw is not None
+                                    and any(_layer_num(l) is not None
+                                            and _layer_num(l) > tw
+                                            for l in _dump_seen)):
+                                _dump_miss_warned = True
+                                logger.warning(
+                                    "PIVOT dump: DUMP_LAYER=%r matches no "
+                                    "indexer layer (real ones seen: %s); "
+                                    "falling back to %s so the run still "
+                                    "captures data.",
+                                    want, ", ".join(_dump_seen), _layer)
+                                _dump_layer = _layer
                     if _dump_layer == _layer:
                         # stride 门控: 每第 N 次命中采 1 个, 把 MAX 配额摊到整个
                         # run(只采前 N 命中时全是 sub-512 安全窗, 尾块/截断区

@@ -131,6 +131,17 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_PIVOT_REFINE_DUMP": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP", "0"))),
     "VLLM_ASCEND_PIVOT_REFINE_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP_DIR", "/tmp/pivot_refine_dump"),
     "VLLM_ASCEND_PIVOT_REFINE_DUMP_MAX": lambda: int(os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP_MAX", "8")),
+    # Sample every Nth op invocation (per rank). Without a stride the MAX
+    # quota is consumed by the EARLIEST (step, layer) hits -- early steps
+    # where L+g is still in the sub-512 safe window -- and the interesting
+    # prefix lengths (tail-chunk mixes, >4096 truncation) never get captured.
+    # Example: STRIDE=20, MAX=200 spreads captures over ~4000 invocations.
+    "VLLM_ASCEND_PIVOT_REFINE_DUMP_STRIDE": lambda: int(os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP_STRIDE", "1")),
+    # Dump only ONE indexer layer (all indexer layers in a step see highly
+    # similar inputs, so sampling them all just dilutes the stride coverage).
+    # "first" (default) pins the first layer that shows up; otherwise an
+    # exact layer-name substring to match (e.g. "layers.7").
+    "VLLM_ASCEND_PIVOT_REFINE_DUMP_LAYER": lambda: os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP_LAYER", "first"),
 }
 
 # end-env-vars-definition

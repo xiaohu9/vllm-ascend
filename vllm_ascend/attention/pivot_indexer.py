@@ -69,8 +69,12 @@ _MAX_GROUP = 16
 
 # Real-data capture state (VLLM_ASCEND_PIVOT_REFINE_DUMP): bounded count, no
 # queue, no background thread -- each capture is one synchronous torch.save
-# of a few MB on the first DUMP_MAX (layer, step) hits. Diagnostics only.
+# of a few MB. STRIDE samples every Nth hit so the MAX quota spreads over the
+# whole run (first-N-hits-only would miss the long-prefix windows entirely).
+# Diagnostics only.
 _dump_count = 0
+_dump_hits = 0
+_dump_layer = None  # pinned at first dump-eligible invocation (or from env)
 
 
 def _local_rank() -> str:
@@ -297,8 +301,27 @@ class PivotIndexer:
                 logger.info_once(
                     "PIVOT refine: using npu_indexer_refine op "
                     "(VLLM_ASCEND_PIVOT_REFINE_USE_OP=1).")
+                _do_dump = False
+                _layer = getattr(sfa_impl, "layer_name", "unknown")
                 if (envs.VLLM_ASCEND_PIVOT_REFINE_DUMP
                         and _dump_count < envs.VLLM_ASCEND_PIVOT_REFINE_DUMP_MAX):
+                    # 层过滤: 同一步各 indexer 层输入高度相似, 全采只稀释
+                    # stride 覆盖。DUMP_LAYER="first"(默认)钉住第一个遇到的
+                    # 层; 显式子串(如 "layers.5")需等它出现才 pin —— 首个层
+                    # 不匹配时不能 pin 成空(否则永远采不到)。其余层直接跳过。
+                    global _dump_layer
+                    if _dump_layer is None:
+                        want = envs.VLLM_ASCEND_PIVOT_REFINE_DUMP_LAYER
+                        if want == "first" or want in _layer:
+                            _dump_layer = _layer
+                    if _dump_layer == _layer:
+                        # stride 门控: 每第 N 次命中采 1 个, 把 MAX 配额摊到整个
+                        # run(只采前 N 命中时全是 sub-512 安全窗, 尾块/截断区
+                        # 永远采不到 — L+g 随步数增长, 早期步全在安全区)。
+                        _dump_hits += 1
+                        _do_dump = (
+                            (_dump_hits - 1) % envs.VLLM_ASCEND_PIVOT_REFINE_DUMP_STRIDE == 0)
+                if _do_dump:
                     # Dump AFTER the op returned, so the capture holds inputs
                     # + the op's raw output (pre-gather cols) + the python
                     # reference output computed from the same tensors.
@@ -306,7 +329,7 @@ class PivotIndexer:
                         q_dq, weights[:D], C, req_ids, cum[:K], seq_lens[:K],
                         kv_cache, attn_metadata.block_table[:K],
                         attn_metadata.block_size,
-                        getattr(sfa_impl, "layer_name", "unknown"),
+                        _layer,
                         op_topk=topk_dec,
                     )
                 # CRITICAL: the refine op's S2 axis is the CANDIDATE LIST, so

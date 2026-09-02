@@ -67,6 +67,78 @@ _ENABLE_REPORT = False
 # (their whole prefix fits the lossless window), so admitting them is safe.
 _MAX_GROUP = 16
 
+# Real-data capture state (VLLM_ASCEND_PIVOT_REFINE_DUMP): bounded count, no
+# queue, no background thread -- each capture is one synchronous torch.save
+# of a few MB on the first DUMP_MAX (layer, step) hits. Diagnostics only.
+_dump_count = 0
+
+
+def _local_rank() -> str:
+    """TP rank for dump sharding (multi-rank writes must not collide)."""
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return str(dist.get_rank())
+    except Exception:
+        pass
+    import os
+
+    return os.getenv("RANK", os.getenv("LOCAL_RANK", "0"))
+
+
+def _dump_real_inputs(q_dq, weights, C, req_ids, aslq, aslk, kv_cache,
+                      block_table, block_size, layer_hint, op_topk):
+    """Persist one real op invocation + BOTH outputs for offline replay.
+
+    Saves the exact tensors the op consumes (query/weights/candidates/aslq/
+    aslk) plus the KV rows the op can reach (only slots referenced by
+    candidates, ~c rows per request) and the REAL block table, so the replay
+    harness rebuilds the production PA layout faithfully. Saves BOTH
+    outputs for the same inputs:
+      - op_topk: the op's raw answer ([D, 1, 2048] candidate COLUMN indices,
+        before the caller gather) -- replaying the same inputs and diffing
+        against this catches nondeterminism/races bit-exactly;
+      - ref_topk: the python _refine_topk answer (positions) -- the
+        precision reference the op is supposed to match after gather.
+    TP safe: files land in <dir>/rank<N>/ so concurrent ranks never
+    overwrite each other (each rank's inputs differ under TP).
+    Never raises -- diagnostics must not take down the decode path.
+    """
+    global _dump_count
+    import os
+
+    _dump_count += 1
+    idx = _dump_count
+    try:
+        out_dir = os.path.join(
+            envs.VLLM_ASCEND_PIVOT_REFINE_DUMP_DIR, f"rank{_local_rank()}")
+        os.makedirs(out_dir, exist_ok=True)
+        kc = kv_cache[2].view(kv_cache[2].shape[0], -1)  # [B*bs, Dh]
+        # slots referenced by valid candidate positions (per request)
+        c64 = C.to(torch.int64).clamp(min=0)
+        blk = (c64 // block_size)
+        slots = (block_table.to(torch.int64).gather(1, blk) * block_size
+                 + c64 % block_size).reshape(-1)
+        slots = slots.unique()
+        ref = _refine_topk(q_dq, weights, C, req_ids, kv_cache, block_table,
+                           block_size, q_dq.shape[0])
+        torch.save(
+            {
+                "q_dq": q_dq.cpu(), "weights": weights.cpu(),
+                "C": C.cpu(), "aslq": aslq.cpu(), "aslk": aslk.cpu(),
+                "block_table": block_table.cpu(), "block_size": block_size,
+                "kv_slots": slots.cpu(), "kv_rows": kc[slots].cpu(),
+                "kv_num_rows": kc.shape[0],
+                "op_topk": op_topk.detach().cpu(),  # raw cols, pre-gather
+                "ref_topk": ref.cpu(), "layer": layer_hint,
+            },
+            os.path.join(out_dir, f"cap_{idx:04d}.pt"))
+        logger.info("PIVOT refine dump %d saved to %s (layer=%s, D=%d)",
+                    idx, out_dir, layer_hint, q_dq.shape[0])
+    except Exception as e:
+        logger.warning("PIVOT refine dump %d failed: %s", idx, e)
+
 
 def _capturing() -> bool:
     try:
@@ -225,6 +297,18 @@ class PivotIndexer:
                 logger.info_once(
                     "PIVOT refine: using npu_indexer_refine op "
                     "(VLLM_ASCEND_PIVOT_REFINE_USE_OP=1).")
+                if (envs.VLLM_ASCEND_PIVOT_REFINE_DUMP
+                        and _dump_count < envs.VLLM_ASCEND_PIVOT_REFINE_DUMP_MAX):
+                    # Dump AFTER the op returned, so the capture holds inputs
+                    # + the op's raw output (pre-gather cols) + the python
+                    # reference output computed from the same tensors.
+                    _dump_real_inputs(
+                        q_dq, weights[:D], C, req_ids, cum[:K], seq_lens[:K],
+                        kv_cache, attn_metadata.block_table[:K],
+                        attn_metadata.block_size,
+                        getattr(sfa_impl, "layer_name", "unknown"),
+                        op_topk=topk_dec,
+                    )
                 # CRITICAL: the refine op's S2 axis is the CANDIDATE LIST, so
                 # it sorts and emits the candidate COLUMN index -- unlike the
                 # native indexer where column == KV position. _coarse_screen

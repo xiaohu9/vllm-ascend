@@ -124,6 +124,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # the torch _coarse_screen reference for the PIVOT coarse step. Off by
     # default until the op passes its NPU probe (P1 gate).
     "VLLM_ASCEND_PIVOT_COARSE_USE_OP": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_COARSE_USE_OP", "0"))),
+    # Capture real PIVOT refine op inputs (+ the torch reference output) to
+    # disk so the single-op replay harness (plans/indexer_refine_realdata_replay.py)
+    # can reproduce a production (step, layer) exactly: precision diff vs the
+    # python implementation AND op-level perf isolation on real shapes.
+    "VLLM_ASCEND_PIVOT_REFINE_DUMP": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP", "0"))),
+    "VLLM_ASCEND_PIVOT_REFINE_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP_DIR", "/tmp/pivot_refine_dump"),
+    "VLLM_ASCEND_PIVOT_REFINE_DUMP_MAX": lambda: int(os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP_MAX", "8")),
 }
 
 # end-env-vars-definition

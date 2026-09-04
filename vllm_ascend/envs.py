@@ -124,6 +124,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     # the torch _coarse_screen reference for the PIVOT coarse step. Off by
     # default until the op passes its NPU probe (P1 gate).
     "VLLM_ASCEND_PIVOT_COARSE_USE_OP": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_COARSE_USE_OP", "0"))),
+    # Per-query local window (paper Appendix B, decode variant) in the PIVOT
+    # refine DOMAIN: each decode step's pool (proxy top-4096 over [0, L), L =
+    # prefix before this step) is widened by the group's window union
+    # [L-g+1, L+g) -- the g own tokens plus the last g-1 prefix tokens -- and
+    # those entries COMPETE BY SCORE in the refine (paper semantics, not a
+    # forced reserve slot). Off = ablation / rollback switch; the lossless
+    # region (L+g <= 2048) still reproduces the native full prefix
+    # bit-identically either way.
+    "VLLM_ASCEND_PIVOT_LOCAL_WINDOW": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_LOCAL_WINDOW", "1"))),
     # Capture real PIVOT refine op inputs (+ the torch reference output) to
     # disk so the single-op replay harness (plans/indexer_refine_realdata_replay.py)
     # can reproduce a production (step, layer) exactly: precision diff vs the

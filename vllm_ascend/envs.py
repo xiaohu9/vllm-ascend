@@ -155,6 +155,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # the dump logs the real indexer-layer names it sees and falls back to the
     # current one instead of silently capturing nothing.
     "VLLM_ASCEND_PIVOT_REFINE_DUMP_LAYER": lambda: os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP_LAYER", "first"),
+    # ---- T5: baseline (non-PIVOT native path) topk characteristic probe ----
+    # Single gate (dump dir / layer roster / rank are module constants inside
+    # pivot_topk_probe.py, not env vars). When on, baseline_topk_probe.capture in
+    # indexer_select_post_process records the native top-2048 indices VERBATIM
+    # (no fp32 re-score -- the baseline output is kept as-is, never touched).
+    # The analyzer emits a TEXT report (json/markdown, no figures) so the
+    # numbers survive off-box transport and can be re-plotted locally.
+    "VLLM_ASCEND_TOPK_PROBE": lambda: bool(int(os.getenv("VLLM_ASCEND_TOPK_PROBE", "0"))),
 }
 
 # end-env-vars-definition

@@ -23,6 +23,7 @@ import torch.nn.functional as F
 import torch_npu
 from vllm.triton_utils import HAS_TRITON
 
+from vllm_ascend.attention.baseline_topk_probe import capture as topk_probe_capture
 from vllm_ascend.device import utils as device_utils
 from vllm_ascend.device.mxfp_compat import (
     FLOAT8_E8M0FNU_DTYPE,
@@ -640,6 +641,9 @@ class BaseDeviceAdaptor:
                 sparse_count=2048,
                 sparse_mode=3,
             )
+        # T5 probe: record the native top-2048 indices verbatim (baseline
+        # untouched, no score re-computation). Gate off = zero cost.
+        topk_probe_capture(sfa_impl, topk_indices)
         return topk_indices
 
     @classmethod

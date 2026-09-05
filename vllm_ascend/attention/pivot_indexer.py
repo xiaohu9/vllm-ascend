@@ -350,10 +350,25 @@ class PivotIndexer:
         # this step's own g tokens never enter the proxy pool (they are the
         # worst-represented entries of a mean proxy anyway); the local
         # window below supplies them to the refine domain instead.
-        C = _coarse_screen(
-            q_bar, w_bar, kv_cache, attn_metadata.block_table[:K],
-            attn_metadata.block_size, seq_lens[:K] - g,
-        )
+        # Lossless fast path: if every decode request's prefix length
+        # L = seq_lens - g is within _COARSE_BUDGET, the coarse top-4096 over
+        # [0, L) already covers the whole prefix (top-4096 over < 4096
+        # distinct positions is the whole set), so the proxy bmm + topk are
+        # pure overhead -- build the full-prefix candidate set directly.
+        # Ascending (not score-descending) column order is irrelevant
+        # downstream: the refine op re-sorts by score, so the emitted
+        # topk_indices are bit-identical to the coarse-screened path
+        # (candidate set [0, L+g) unchanged).
+        L = seq_lens[:K].to(torch.int64) - g  # [K] per-request prefix length
+        if int(L.max()) <= _COARSE_BUDGET:
+            col = torch.arange(
+                _COARSE_BUDGET, dtype=torch.int64, device=device)
+            C = torch.where(col[None, :] < L[:, None], col[None, :], -1)
+        else:
+            C = _coarse_screen(
+                q_bar, w_bar, kv_cache, attn_metadata.block_table[:K],
+                attn_metadata.block_size, seq_lens[:K] - g,
+            )
 
         # ---- 2b. per-query local window (paper Appendix B, decode) -------
         # The paper's decode refine domain is (pool U W_t) per query, with
@@ -720,14 +735,15 @@ def _inject_local_window(
     win = L.view(R, 1) + win.view(1, -1)  # [R, 2g-1] absolute positions
     valid = (win >= 0) & (win < Lg.view(R, 1))
 
-    # Dedup against C: C's valid entries are unique, so membership of each
-    # window position in the request's row is one searchsorted against the
-    # sorted row (its -1 head never equals a non-negative window entry).
-    sorted_C = C.sort(dim=1).values  # [R, c] (-1s sort to the front)
-    idx = torch.searchsorted(sorted_C, win)  # [R, 2g-1]
-    lo = (idx > 0) & (sorted_C.gather(1, (idx - 1).clamp(min=0)) == win)
-    hi = (idx < c) & (sorted_C.gather(1, idx.clamp(max=c - 1)) == win)
-    new = valid & ~(lo | hi)  # [R, 2g-1] window entries not already in C
+    # Dedup against C: C's valid entries are unique positions, so membership
+    # of each window position in the request's row is an elementwise
+    # broadcast compare + any-reduce -- no sort, no index search. Exactness:
+    # the row's -1 padding never equals a valid (>= 0) window entry, and
+    # `valid` already drops the window's own negative positions, so
+    # `present` is exactly set-membership. (Alternative bitmap membership in
+    # git history; broadcast-compare measured fastest on CPU.)
+    present = (C[:, None, :] == win[:, :, None]).any(dim=2)  # [R, 2g-1]
+    new = valid & ~present  # [R, 2g-1] window entries not already in C
 
     max_new = int(new.sum(dim=1).max()) if R else 0
     if max_new == 0:
@@ -738,29 +754,25 @@ def _inject_local_window(
         # rows (valid front, -1 tail) is exact.
         return C, torch.clamp(seq_lens, max=c)
 
-    # Order new entries by descending recency (newest first) for a
-    # deterministic append; pad each row to a uniform block width. The key
-    # puts the "is new" flag far above the position bits so rank is
-    # (new desc, position desc); positions are < 2^31, safe within int64.
-    key = new.to(torch.int64) * (1 << 40) - win
-    rank = key.argsort(dim=1, descending=True)  # [R, 2g-1] column order
-    sorted_win = win.gather(1, rank)[:, :max_new]  # [R, max_new]
-    sorted_new = new.gather(1, rank)[:, :max_new]  # [R, max_new] validity
-    appended = torch.where(sorted_new, sorted_win, -1)  # [R, max_new]
+    # Append the genuinely-new entries in natural ascending position order.
+    # The old key=new<<40 - win descending argsort actually yields ASCENDING
+    # positions (smaller win => larger key => ranked first; verified bitwise
+    # against the live pipeline), and win is ascending by construction -- so
+    # new entries need no sort at all, they write by their running index.
+    W = c + max_new
+    out = C.new_full((R, W), -1)
+    out[:, :c] = C  # C's own valid entries already sit at the row front
+    valid_C = (C >= 0).sum(dim=1)  # [R] C's valid prefix length
 
-    # Compact: gather valid candidates to the row front (C's score-ordered
-    # prefix first, appended recency order second -- order is irrelevant to
-    # scoring, only the candidate SET matters) and pad -1 to the uniform
-    # width. Advanced-index scatter preserves relative order.
-    combined = torch.cat([C, appended], dim=1)  # [R, c + max_new]
-    keep = combined >= 0  # [R, c + max_new] valid-candidate mask
-    W = combined.shape[1]
-    dst = keep.cumsum(dim=1) - 1  # [R, W] target column per valid entry
-    out = combined.new_full((R, W), -1)
-    rows = torch.arange(R, device=device).repeat_interleave(
-        keep.sum(dim=1))  # one row id per valid entry (row-major order)
-    out[rows, dst[keep]] = combined[keep]
-    aslk_out = keep.sum(dim=1).to(aslk_dtype)  # [R] per-row valid count
+    # Compact via a micro-scatter: only the <= 2g-1 new columns per row move.
+    # dst = valid_C + running-new-index is consecutive (no collisions) and
+    # stays in [valid_C, W); non-new window columns write -1 to the dead pad
+    # column W-1 (W-1 >= c here, so C's copy is never overwritten). Order is
+    # irrelevant to scoring -- only the candidate SET matters.
+    new_idx = torch.cumsum(new.to(torch.int32), dim=1) - 1  # 0..new_count-1
+    dst = valid_C[:, None] + new_idx  # [R, 2g-1] target column per entry
+    out.scatter_(1, torch.where(new, dst, W - 1), torch.where(new, win, -1))
+    aslk_out = (valid_C + new.sum(dim=1)).to(aslk_dtype)  # [R] valid count
     return out, aslk_out
 
 

@@ -104,6 +104,7 @@ from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
+from vllm_ascend.attention.baseline_topk_probe import set_step_request_ids
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
@@ -1987,6 +1988,9 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         self._start_dump_data()
+        # T5 probe: feed the current step's real request ids (batch order) for
+        # exact cross-step matching. No-op (env gate off) = zero cost.
+        set_step_request_ids(self.input_batch.req_ids)
         # self._draft_token_ids is None when `input_fits_in_drafter=False`
         # and there is no draft tokens scheduled. so it need to update the
         # spec_decoding info in scheduler_output with async_scheduling.

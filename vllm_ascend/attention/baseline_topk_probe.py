@@ -34,21 +34,29 @@ from vllm_ascend import envs
 
 # ---- module constants (not env vars) -------------------------------------
 _DUMP_DIR = "/tmp/topk_probe"
-# Layer selector: "first" pins the first indexer layer seen; otherwise an exact
-# layer-name substring (e.g. "layers.7"). Only indexer layers reach capture.
+# Layer selector: comma-separated substrings (e.g. "layers.1,layers.30,
+# layers.60" for shallow/mid/deep). A layer is captured when it matches ANY
+# substring. "first" pins the very first indexer layer seen -- the default
+# keeps the original single-layer behavior. Only indexer layers reach capture.
 _LAYER_SELECTOR = "first"
 # TP rank that writes to disk. With SP/CP off, TP data is replicated across
 # ranks, so a single rank suffices.
 _WRITE_RANK = "0"
-# Bounded sampling knobs.
-_MAX_REQS = 8          # distinct requests tracked (first-seen, in step order)
+# Bounded sampling knobs. Memory bound = bounded queue (maxsize) + request
+# cap; there is deliberately no per-request step cap (the queue is the bound).
+_MAX_REQS = 10         # distinct requests tracked (first-seen, in step order)
 _STRIDE = 1            # capture every Nth (layer, step) hit
-_MAX_STEPS_PER_REQ = 256  # hard cap on queued records per request (memory bound)
 
 # ---- module state (mirrors pivot_indexer._dump_*) ------------------------
-_probe_layer = None  # pinned indexer layer (None until first call)
+_probe_layers: set[str] = set()  # pinned indexer layers (fill as they match)
 _probe_seen: list[str] = []
 _probe_hits = 0
+# Real decode step counter (incremented once per step by set_step_request_ids,
+# which the model runner calls before each step's execution). All indexer
+# layers in one step share the same value, so it is the cross-layer alignment
+# key for per-step IoU (shallow vs mid vs deep) -- _probe_hits is global and
+# cannot align layers.
+_real_step = 0
 _probe_miss_warned = False
 _step_req_ids: list[str] = []  # set per step by model_runner, batch order
 _queue: "queue.Queue[tuple] | None" = None
@@ -91,13 +99,20 @@ def _write_worker():
             item = _queue.get()
             if item is None:  # sentinel from atexit flush
                 break
-            req_id, step, layer_name, positions = item
-            # sanitize req_id for use as a file name (ids may contain colons)
-            safe = req_id.replace(":", "_").replace("/", "_")
-            path = os.path.join(_DUMP_DIR, f"{safe}__{layer_name}.bin")
-            with open(path, "ab") as f:
-                f.write(step.to_bytes(8, "little"))
-                f.write(positions.tobytes())
+            try:
+                req_id, step, layer_name, positions = item
+                # sanitize req_id for use as a file name (ids may contain colons)
+                safe = req_id.replace(":", "_").replace("/", "_")
+                path = os.path.join(_DUMP_DIR, f"{safe}__{layer_name}.bin")
+                with open(path, "ab") as f:
+                    f.write(step.to_bytes(8, "little"))
+                    # positions is a CPU int32 tensor (rows[i].clone()); numpy()
+                    # is the only byte-dump path -- torch.Tensor has no tobytes().
+                    f.write(positions.cpu().numpy().tobytes())
+            except Exception:
+                # one bad record must not kill the writer thread and lose the
+                # rest of the queue (that would silently empty the capture).
+                logger.exception("PIVOT topk probe writer failed on one record")
     except Exception:
         logger.exception("PIVOT topk probe writer failed")
 
@@ -115,35 +130,40 @@ def _ensure_writer():
 def _gate(layer_name: str) -> bool:
     """Decide whether to capture THIS (layer, step) invocation. Never raises.
 
-    Mirrors pivot_indexer._dump_gate: one-layer filter + stride sampler, with
-    the real indexer-layer roster tracked so a bad selector warns instead of
-    silently capturing nothing.
+    Mirrors pivot_indexer._dump_gate: LAYER_SELECTOR is a comma-separated list
+    of substrings, a layer is captured when it matches ANY of them, and "first"
+    pins the very first indexer layer (so the default keeps single-layer
+    behavior). The real indexer-layer roster is tracked so a selector naming no
+    indexer layer warns instead of silently capturing nothing -- there is
+    deliberately NO fallback pin (multi-layer selection must not drift onto
+    unrequested layers).
     """
-    global _probe_layer, _probe_seen, _probe_miss_warned, _probe_hits
+    global _probe_layers, _probe_seen, _probe_miss_warned, _probe_hits
     if not envs.VLLM_ASCEND_TOPK_PROBE:
         return False
-    if _probe_layer is None:
-        want = _LAYER_SELECTOR
-        if want == "first" or want in layer_name:
-            _probe_layer = layer_name
-        elif want != "first":
-            if layer_name not in _probe_seen:
-                _probe_seen.append(layer_name)
-                logger.info_once(
-                    "PIVOT probe: LAYER_SELECTOR=%r not matched yet; indexer "
-                    "layer %s present (real indexer layers so far: %s)",
-                    want, layer_name, ", ".join(_probe_seen))
-            tw = _layer_num(want)
-            if (not _probe_miss_warned and tw is not None
+    wants = [w.strip() for w in _LAYER_SELECTOR.split(",") if w.strip()]
+    if any(w == "first" for w in wants) and not _probe_layers:
+        _probe_layers.add(layer_name)  # "first": pin the first indexer layer
+    if any(w != "first" and w in layer_name for w in wants):
+        _probe_layers.add(layer_name)
+    if layer_name not in _probe_layers:
+        if layer_name not in _probe_seen:
+            _probe_seen.append(layer_name)
+            logger.info_once(
+                "PIVOT probe: LAYER_SELECTOR=%r not matched yet; indexer "
+                "layer %s present (real indexer layers so far: %s)",
+                _LAYER_SELECTOR, layer_name, ", ".join(_probe_seen))
+        explicit = [w for w in wants if w != "first"]
+        if not _probe_miss_warned and explicit:
+            tw = _layer_num(explicit[0])
+            if (tw is not None
                     and any(_layer_num(l) is not None and _layer_num(l) > tw
                             for l in _probe_seen)):
                 _probe_miss_warned = True
                 logger.warning(
                     "PIVOT probe: LAYER_SELECTOR=%r matches no indexer layer "
-                    "(real ones seen: %s); falling back to %s",
-                    want, ", ".join(_probe_seen), layer_name)
-                _probe_layer = layer_name
-    if _probe_layer != layer_name:
+                    "(real ones seen: %s)",
+                    _LAYER_SELECTOR, ", ".join(_probe_seen))
         return False
     _probe_hits += 1
     return (_probe_hits - 1) % _STRIDE == 0
@@ -152,10 +172,12 @@ def _gate(layer_name: str) -> bool:
 def set_step_request_ids(req_ids: list[str]) -> None:
     """Model runner feeds the current batch's request ids (batch order, global
     unique strings) once per step before execution. Used to map captured
-    rows back to real requests -- never inferred from position."""
-    global _step_req_ids
+    rows back to real requests -- never inferred from position. Also advances
+    the real-step counter, the cross-layer alignment key."""
+    global _step_req_ids, _real_step
     if envs.VLLM_ASCEND_TOPK_PROBE:
         _step_req_ids = list(req_ids)
+        _real_step += 1
 
 
 def capture(sfa_impl, topk_indices: torch.Tensor) -> None:
@@ -166,7 +188,7 @@ def capture(sfa_impl, topk_indices: torch.Tensor) -> None:
     Keeps one representative query row per tracked request; queue + daemon
     writer bound memory. Never raises.
     """
-    global _step_req_ids
+    global _step_req_ids, _real_step
     if not envs.VLLM_ASCEND_TOPK_PROBE:
         return
     try:
@@ -188,7 +210,7 @@ def capture(sfa_impl, topk_indices: torch.Tensor) -> None:
         n = min(topk_indices.shape[0], _MAX_REQS, len(_step_req_ids))
         if n == 0:
             return
-        step = _probe_hits
+        step = _real_step  # real decode step: same value for every layer in one step
         rows = topk_indices[:n, 0, :].cpu()  # [n, 2048] int32 (one D2H)
         for i in range(n):
             req_id = _step_req_ids[i]

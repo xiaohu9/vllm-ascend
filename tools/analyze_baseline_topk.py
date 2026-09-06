@@ -8,8 +8,13 @@ This analyzer reads all captures and emits:
   * report.json  -- full structured statistics (enough to re-plot locally)
   * report.txt   -- human-readable summary with decision-line comparisons
 
-No PNG / matplotlib output: collection artifacts cannot be shipped off the
-work server, but text can -- plots are rebuilt locally from the JSON numbers.
+report.json carries the COMPLETE per-step adjacent-IoU trajectory: each
+per_request[req][layer] block includes ``iou1_series`` (one value per
+adjacent step pair, length n_steps-1) and ``steps`` (the real decode step
+numbers), so the full decode curve can be re-plotted offline -- the "16" in
+decay/retention is only the step-distance window W=16 (M3), not a cap on
+captured steps. Plots are rebuilt locally from the JSON numbers (no PNG
+shipped off the work server).
 
 Usage:
   python tools/analyze_baseline_topk.py <dump_dir> --out report.json --txt report.txt
@@ -24,6 +29,23 @@ import struct
 
 RECORD_BYTES = 8 + 2048 * 4
 TOP_K = 2048
+
+# Metric glossary embedded in report.txt so the output is self-explanatory.
+_METRICS_GLOSSARY = (
+    "METRICS (A_t = top-2048 position set at decode step t, |A_t|=2048):\n"
+    "  symmetric IoU(d) = |A_t ∩ A_{t+d}| / |A_t ∪ A_{t+d}|, averaged over all t.\n"
+    "  IoU(1)           = the d=1 case (adjacent steps); >=0.7 -> incremental\n"
+    "                     top-k maintenance viable.\n"
+    "  retention(d)     = |A_0 ∩ A_d| / |A_0|, one-sided survival of the step-0\n"
+    "                     set (old positions only, new entries excluded).\n"
+    "  churn            ~= retention - symmetric IoU gap ~= new entries per step.\n"
+    "  streak/residency = longest consecutive run of one position in top-2048.\n"
+    "  min-IoU          = worst adjacent-step IoU across a request.\n"
+    "Example (this report): L6 IoU(1)=0.7324 -> ~1731 shared positions, ~317\n"
+    "swapped per step; L38 IoU(1)=0.5725 -> ~1491 shared, ~557 swapped per step.\n"
+    "Reading: IoU(1)<0.7 = incremental not worthwhile; min-IoU~0.01 = a near-full\n"
+    "reshuffle step exists -> keep a full-recompute fallback."
+)
 
 
 def _read_records(path: str) -> list[tuple[int, list[int]]]:
@@ -55,14 +77,16 @@ def _analyze_series(records: list[tuple[int, list[int]]], max_dist: int = 16):
     if len(records) < 2:
         return None
     iou1 = [_iou(records[t][1], records[t + 1][1]) for t in range(len(records) - 1)]
+    # Largest valid step distance: records[t] vs records[t+d] needs t+d <= len-1.
+    dmax = min(max_dist, len(records) - 1)
     decay = {}
-    for d in range(1, min(max_dist, len(records)) + 1):
+    for d in range(1, dmax + 1):
         pairs = [_iou(records[t][1], records[t + d][1]) for t in range(len(records) - d)]
-        decay[d] = (sum(pairs) / len(pairs)) if pairs else 1.0
+        decay[d] = sum(pairs) / len(pairs)
     # M4 retention: fraction of the step-0 set still present at distance d.
     s0 = set(records[0][1])
     retention = {}
-    for d in range(1, min(max_dist, len(records)) + 1):
+    for d in range(1, dmax + 1):
         if len(s0) == 0:
             retention[d] = 1.0
         else:
@@ -91,6 +115,11 @@ def _analyze_series(records: list[tuple[int, list[int]]], max_dist: int = 16):
         "iou1_mean": sum(iou1) / len(iou1),
         "iou1_min": min(iou1),
         "iou1_median": sorted(iou1)[len(iou1) // 2],
+        # full per-step trajectory (complete decode; NOT the W=16 window):
+        # iou1_series[t] = IoU between records[t] and records[t+1]; steps[t+1]
+        # is the later step of that pair. len(series) == n_steps - 1.
+        "iou1_series": [round(v, 4) for v in iou1],
+        "steps": [records[t][0] for t in range(len(records))],
         "decay": {str(d): round(v, 4) for d, v in decay.items()},
         "retention": {str(d): round(v, 4) for d, v in retention.items()},
         "streak_mean": round(mean, 2),
@@ -133,12 +162,19 @@ def main():
     layer_agg = {}
     for layer, stats in layers.items():
         good = [s for s in stats if s]
+        # decay_mean per distance d: average only over requests that actually
+        # reach distance d (short requests stop earlier than max_dist).
+        decay_mean = {}
+        for d in range(1, args.max_dist + 1):
+            have = [s["decay"][str(d)] for s in good if str(d) in s["decay"]]
+            if have:
+                decay_mean[str(d)] = round(sum(have) / len(have), 4)
         layer_agg[layer] = {
             "n_requests": len(good),
             "iou1_mean": round(sum(s["iou1_mean"] for s in good) / len(good), 4),
             "iou1_min": min(s["iou1_min"] for s in good),
             "streak_mean": round(sum(s["streak_mean"] for s in good) / len(good), 2),
-            "decay_mean": {str(d): round(sum(s["decay"][str(d)] for s in good) / len(good), 4) for d in range(1, args.max_dist + 1) if good and str(d) in good[0]["decay"]},
+            "decay_mean": decay_mean,
         }
 
     report = {
@@ -158,6 +194,7 @@ def main():
     with open(args.txt, "w", encoding="utf-8") as f:
         f.write("=== PIVOT baseline topk probe report (text; plots rebuilt locally from report.json) ===\n\n")
         f.write(f"top_k={TOP_K}  layers={len(layers)}  requests={len(per_req)}\n\n")
+        f.write(_METRICS_GLOSSARY + "\n\n")
         for layer, agg in layer_agg.items():
             f.write(f"[layer {layer}] requests={agg['n_requests']}\n")
             f.write(f"  adjacent-step IoU mean={agg['iou1_mean']:.4f} (min {agg['iou1_min']:.4f})  "

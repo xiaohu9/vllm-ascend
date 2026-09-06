@@ -765,13 +765,22 @@ def _inject_local_window(
     valid_C = (C >= 0).sum(dim=1)  # [R] C's valid prefix length
 
     # Compact via a micro-scatter: only the <= 2g-1 new columns per row move.
-    # dst = valid_C + running-new-index is consecutive (no collisions) and
-    # stays in [valid_C, W); non-new window columns write -1 to the dead pad
-    # column W-1 (W-1 >= c here, so C's copy is never overwritten). Order is
-    # irrelevant to scoring -- only the candidate SET matters.
+    # dst = valid_C + running-new-index is UNIQUE per row (the cumsum over new
+    # entries is 1:1), so every write targets a distinct column -- no duplicate
+    # index writes. The previous version also wrote -1 to the dead pad column
+    # W-1 for non-new columns; when a row's new_count hit max_new, that dead
+    # column coincided with the last new entry's target (win == L+g-1, the
+    # newest own token), producing duplicate-index writes whose order torch's
+    # scatter_ leaves unspecified. On CPU the row-major order happened to let
+    # the last column (always new=True) win, so bitwise tests passed; on NPU
+    # torch_npu the collision is a real race -- the newest own token could be
+    # overwritten with -1 and silently dropped from the refine domain. Writing
+    # ONLY the new entries (out is pre-filled with -1) removes the collision.
     new_idx = torch.cumsum(new.to(torch.int32), dim=1) - 1  # 0..new_count-1
     dst = valid_C[:, None] + new_idx  # [R, 2g-1] target column per entry
-    out.scatter_(1, torch.where(new, dst, W - 1), torch.where(new, win, -1))
+    nz_r, nz_c = new.nonzero(as_tuple=True)
+    if nz_r.numel():
+        out[nz_r, dst[nz_r, nz_c]] = win[nz_r, nz_c]
     aslk_out = (valid_C + new.sum(dim=1)).to(aslk_dtype)  # [R] valid count
     return out, aslk_out
 

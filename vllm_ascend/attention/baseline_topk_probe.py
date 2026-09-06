@@ -44,7 +44,7 @@ _LAYER_SELECTOR = "first"
 _WRITE_RANK = "0"
 # Bounded sampling knobs. Memory bound = bounded queue (maxsize) + request
 # cap; there is deliberately no per-request step cap (the queue is the bound).
-_MAX_REQS = 10         # distinct requests tracked (first-seen, in step order)
+_MAX_REQS = 64         # distinct requests tracked (first-seen, in step order)
 _STRIDE = 1            # capture every Nth (layer, step) hit
 
 # ---- module state (mirrors pivot_indexer._dump_*) ------------------------
@@ -58,6 +58,7 @@ _probe_hits = 0
 # cannot align layers.
 _real_step = 0
 _probe_miss_warned = False
+_probe_map_warned = False  # once: topk rows could not be mapped to requests
 _step_req_ids: list[str] = []  # set per step by model_runner, batch order
 _queue: "queue.Queue[tuple] | None" = None
 _writer_thread = None
@@ -180,15 +181,52 @@ def set_step_request_ids(req_ids: list[str]) -> None:
         _real_step += 1
 
 
-def capture(sfa_impl, topk_indices: torch.Tensor) -> None:
+def _request_row_offsets(query_start_loc, n_requests: int, total_rows: int):
+    """First-query-row offset per request (batch order) from the indexer's
+    ``actual_seq_lengths_query`` (cumulative per-request query-row counts:
+    [0, g, 2g, ..., Kg] with a leading 0), or None if it cannot be derived.
+    With MTP g > 1, TND topk_indices carries g rows per request and row i
+    belongs to request i // g -- request r's rows are [starts[r], starts[r+1])
+    and its first query row sits at starts[r]. Never guesses: a malformed /
+    misaligned tensor yields None, never a fabricated mapping."""
+    if query_start_loc is None or n_requests <= 0:
+        return None
+    try:
+        vals = [int(x) for x in query_start_loc.detach().cpu().tolist()]
+    except Exception:
+        return None
+    if len(vals) == n_requests + 1 and vals[0] == 0:
+        starts = vals[:-1]          # start-loc form (leading 0)
+    elif len(vals) == n_requests and vals[0] != 0:
+        starts = [0] + vals[:-1]    # cumulative ends without the leading 0
+    else:
+        return None
+    if (len(starts) != n_requests or starts[0] != 0
+            or any(b <= a for a, b in zip(starts, starts[1:]))
+            or starts[-1] >= total_rows):
+        return None
+    return starts
+
+
+def capture(sfa_impl, topk_indices: torch.Tensor, query_start_loc=None) -> None:
     """Record one native indexer invocation's top-2048 indices verbatim.
 
     Called from indexer_select_post_process right after the op returns, on the
-    two BF16 branches. ``topk_indices`` is [D, 1, 2048] int32 (TND decode).
-    Keeps one representative query row per tracked request; queue + daemon
-    writer bound memory. Never raises.
+    two BF16 branches. ``topk_indices`` is [D, 1, 2048] int32 (TND decode: g
+    query rows per request). Keeps the first query row of each tracked request,
+    labelled with its real request id; queue + daemon writer bound memory.
+    Never raises.
+
+    ``query_start_loc`` is the indexer's ``actual_seq_lengths_query`` (cumulative
+    per-request query-row counts, [0, g, 2g, ...]) -- the only reliable way to
+    map TND rows back to requests: with MTP g > 1 row i belongs to request
+    i // g, NOT request i, so labelling rows by leading index mislabels every
+    request past the first group (the pre-fix behaviour turned g=4 captures
+    into "8 requests" that were really 2). When it is unavailable we fall back
+    to a uniform g = D // K only on exact division, and otherwise skip the step
+    rather than guess a mapping.
     """
-    global _step_req_ids, _real_step
+    global _step_req_ids, _real_step, _probe_map_warned
     if not envs.VLLM_ASCEND_TOPK_PROBE:
         return
     try:
@@ -202,21 +240,33 @@ def capture(sfa_impl, topk_indices: torch.Tensor) -> None:
         if torch.npu.is_current_stream_capturing():
             return  # graph capture is unsafe for D2H + I/O; eager runs only
 
-        # Capture the first query row (row0) of the first _MAX_REQS requests.
-        # topk_indices rows are TND (decode: g rows per request); row0 of
-        # request r sits at row r * g. Without per-request g here we take the
-        # leading _MAX_REQS rows of the batch -- batch order == request order,
-        # so row i belongs to request _step_req_ids[i]'s first group row.
-        n = min(topk_indices.shape[0], _MAX_REQS, len(_step_req_ids))
-        if n == 0:
+        n_reqs = min(len(_step_req_ids), _MAX_REQS)
+        if n_reqs == 0:
             return
         step = _real_step  # real decode step: same value for every layer in one step
-        rows = topk_indices[:n, 0, :].cpu()  # [n, 2048] int32 (one D2H)
-        for i in range(n):
-            req_id = _step_req_ids[i]
+        starts = _request_row_offsets(query_start_loc, len(_step_req_ids),
+                                      topk_indices.shape[0])
+        if starts is None and topk_indices.shape[0] % len(_step_req_ids) == 0:
+            # no per-request lens, but exact division implies uniform MTP decode
+            g = topk_indices.shape[0] // len(_step_req_ids)
+            starts = [r * g for r in range(len(_step_req_ids))]
+        if starts is None:
+            if not _probe_map_warned:
+                _probe_map_warned = True
+                logger.warning(
+                    "PIVOT probe: cannot map topk rows to requests "
+                    "(D=%d, K=%d) -- skipping this step",
+                    topk_indices.shape[0], len(_step_req_ids))
+            return  # never guess a mapping
+        row_idx = torch.tensor([starts[r] for r in range(n_reqs)],
+                               dtype=torch.long, device=topk_indices.device)
+        rows = topk_indices.index_select(0, row_idx)[:, 0, :].cpu()
+        # [n_reqs, 2048] int32 -- one D2H; row r == request r's first query row
+        for i in range(n_reqs):
             if _queue.full():
                 return  # bounded memory: drop rather than grow unboundedly
-            _queue.put((req_id, step, sfa_impl.layer_name, rows[i].clone()))
+            _queue.put((_step_req_ids[i], step, sfa_impl.layer_name,
+                        rows[i].clone()))
     except Exception:
         # self-protect: a probe bug must never take down the server
         logger.exception("PIVOT topk probe capture failed")

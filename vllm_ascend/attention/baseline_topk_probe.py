@@ -34,10 +34,13 @@ from vllm_ascend import envs
 
 # ---- module constants (not env vars) -------------------------------------
 _DUMP_DIR = "/tmp/topk_probe"
-# Layer selector: comma-separated substrings (e.g. "layers.1,layers.30,
+# Layer selector: comma-separated entries (e.g. "layers.1,layers.30,
 # layers.60" for shallow/mid/deep). A layer is captured when it matches ANY
-# substring. "first" pins the very first indexer layer seen -- the default
-# keeps the original single-layer behavior. Only indexer layers reach capture.
+# entry. A bare-integer entry ("2,22,26") is an EXACT layer-number match
+# ("22" hits model.layers.22.self_attn.attn but never layers.2x/222);
+# anything else ("layers.38", "first") keeps substring semantics. "first"
+# pins the very first indexer layer seen -- the default keeps the original
+# single-layer behavior. Only indexer layers reach capture.
 _LAYER_SELECTOR = "first"
 # TP rank that writes to disk. With SP/CP off, TP data is replicated across
 # ranks, so a single rank suffices.
@@ -63,6 +66,7 @@ _step_req_ids: list[str] = []  # set per step by model_runner, batch order
 _queue: "queue.Queue[tuple] | None" = None
 _writer_thread = None
 _writer_started = False
+_dump_cleaned = False  # once: wiped stale captures from a previous run
 
 
 def _local_rank() -> str:
@@ -88,6 +92,17 @@ def _layer_num(name: str) -> int | None:
     while j >= 0 and name[j].isdigit():
         j -= 1
     return int(name[j + 1:i + 1])
+
+
+def _match(w: str, layer_name: str) -> bool:
+    """Selector-entry match. Bare integers are EXACT layer-number matches
+    (w="22" hits layer_name "model.layers.22.self_attn.attn" -> _layer_num 22,
+    never "model.layers.222..." nor "model.layers.2x..."); any other entry
+    ("layers.38", "attn", ...) keeps substring semantics. Never raises."""
+    if w.isdigit():
+        n = _layer_num(layer_name)
+        return n is not None and n == int(w)
+    return w in layer_name
 
 
 def _write_worker():
@@ -119,10 +134,26 @@ def _write_worker():
 
 
 def _ensure_writer():
-    global _queue, _writer_thread, _writer_started
+    global _queue, _writer_thread, _writer_started, _dump_cleaned
     if _writer_started:
         return
     _writer_started = True
+    # Fresh dump per run: the writer APPENDS to per-request files, so captures
+    # from a previous process (possibly a different model / layer selector)
+    # would otherwise persist and mix into this run's report, looking like
+    # layers the probe "self-selected" (e.g. 2/22/26/30 that the current model
+    # never routes through capture). Wipe once at startup -- only the rank-0
+    # writer reaches this point (rank check precedes _ensure_writer in
+    # capture), so this cannot collide with another process.
+    if not _dump_cleaned:
+        _dump_cleaned = True
+        try:
+            if os.path.isdir(_DUMP_DIR):
+                for fn in os.listdir(_DUMP_DIR):
+                    if fn.endswith(".bin"):
+                        os.remove(os.path.join(_DUMP_DIR, fn))
+        except Exception:
+            logger.exception("PIVOT topk probe: failed to clean old captures")
     _queue = queue.Queue(maxsize=4096)
     _writer_thread = threading.Thread(target=_write_worker, daemon=True)
     _writer_thread.start()
@@ -132,7 +163,8 @@ def _gate(layer_name: str) -> bool:
     """Decide whether to capture THIS (layer, step) invocation. Never raises.
 
     Mirrors pivot_indexer._dump_gate: LAYER_SELECTOR is a comma-separated list
-    of substrings, a layer is captured when it matches ANY of them, and "first"
+    of entries, a layer is captured when it matches ANY of them (_match: bare
+    integers are exact layer numbers, everything else substring), and "first"
     pins the very first indexer layer (so the default keeps single-layer
     behavior). The real indexer-layer roster is tracked so a selector naming no
     indexer layer warns instead of silently capturing nothing -- there is
@@ -145,7 +177,7 @@ def _gate(layer_name: str) -> bool:
     wants = [w.strip() for w in _LAYER_SELECTOR.split(",") if w.strip()]
     if any(w == "first" for w in wants) and not _probe_layers:
         _probe_layers.add(layer_name)  # "first": pin the first indexer layer
-    if any(w != "first" and w in layer_name for w in wants):
+    if any(w != "first" and _match(w, layer_name) for w in wants):
         _probe_layers.add(layer_name)
     if layer_name not in _probe_layers:
         if layer_name not in _probe_seen:
@@ -258,6 +290,10 @@ def capture(sfa_impl, topk_indices: torch.Tensor, query_start_loc=None) -> None:
                     "(D=%d, K=%d) -- skipping this step",
                     topk_indices.shape[0], len(_step_req_ids))
             return  # never guess a mapping
+        # row-0 only: with MTP OFF (g=1) each decode step is exactly one token,
+        # so the adjacent-step IoU computed offline IS the adjacent-token IoU.
+        # (To compare parallelisms, re-run the probe under different g rather
+        # than capturing all rows -- keeps this capture single-row & minimal.)
         row_idx = torch.tensor([starts[r] for r in range(n_reqs)],
                                dtype=torch.long, device=topk_indices.device)
         rows = topk_indices.index_select(0, row_idx)[:, 0, :].cpu()

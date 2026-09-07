@@ -31,10 +31,24 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import struct
 
 RECORD_BYTES = 8 + 2048 * 4
 TOP_K = 2048
+
+
+def _layer_short(name: str) -> str:
+    """Short layer label ('38') from either '38' or
+    'model.layers.38.self_attn.attn'-style names; non-numeric -> as-is."""
+    m = re.search(r"\d+", name or "")
+    return m.group(0) if m else name
+
+
+def _layer_key(name: str):
+    """Sort key: numeric layers first in numeric order, others after."""
+    m = re.search(r"\d+", name or "")
+    return (int(m.group(0)), name) if m else (1 << 60, name)
 
 
 def _read_records(path: str) -> list[tuple[int, list[int]]]:
@@ -117,7 +131,7 @@ def _cross_layer(per_req_layer: dict[str, dict[str, list]]) -> dict:
     """Per (req, layer-pair): mean IoU over steps aligned exactly by number."""
     pairs: dict[str, dict] = {}
     for layer_recs in per_req_layer.values():
-        layers = sorted(layer_recs)
+        layers = sorted(layer_recs, key=_layer_key)
         for i in range(len(layers)):
             for j in range(i + 1, len(layers)):
                 la, lb = layers[i], layers[j]
@@ -151,16 +165,27 @@ def _cross_layer(per_req_layer: dict[str, dict[str, list]]) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("dump_dir")
+    ap.add_argument("src",
+                    help="capture dump_dir (analyze) OR an existing "
+                         "report_extra.json (re-plot from json)")
     ap.add_argument("--out", default="report_extra.json")
     ap.add_argument("--txt", default="report_extra.txt")
     ap.add_argument("--png", default="", help="optional 2x2 figure")
     args = ap.parse_args()
 
-    files = sorted(f for f in os.listdir(args.dump_dir)
-                   if f.endswith(".bin")) if os.path.isdir(args.dump_dir) else []
+    # Mode 2: src is an already-produced report_extra.json -> text + png only.
+    if os.path.isfile(args.src) and args.src.endswith(".json"):
+        with open(args.src, encoding="utf-8") as f:
+            loaded = json.load(f)
+        layer_stab = loaded.get("stability", {})
+        xl = loaded.get("cross_layer", {"layer_pairs": [], "pairs": {}})
+        n_req = loaded.get("n_requests_total", 0)
+        return _emit(layer_stab, xl, n_req, args)
+
+    files = sorted(f for f in os.listdir(args.src)
+                   if f.endswith(".bin")) if os.path.isdir(args.src) else []
     if not files:
-        print(f"no captures found under {args.dump_dir}")
+        print(f"no captures found under {args.src}")
         return 1
 
     # req -> layer -> [(step, positions), ...] (only requests with >=2 steps)
@@ -168,7 +193,7 @@ def main() -> int:
     for fn in files:
         base = fn[:-4]
         req_id, _, layer = base.rpartition("__")
-        recs = _read_records(os.path.join(args.dump_dir, fn))
+        recs = _read_records(os.path.join(args.src, fn))
         if len(recs) >= 2:
             per_req.setdefault(req_id, {})[layer] = recs
 
@@ -194,6 +219,8 @@ def main() -> int:
         for k, v in agg["_sum"].items():
             if isinstance(v, dict):
                 agg[k] = {t: round(val / nr, 4) for t, val in v.items()}
+        if "n_steps" in agg:
+            agg["n_steps"] = round(agg["n_steps"])  # mean steps -> int
         del agg["_sum"]
 
     xl = _cross_layer(per_req)
@@ -206,29 +233,36 @@ def main() -> int:
     }
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
+    return _emit(layer_stab, xl, len(per_req), args)
 
+
+def _emit(layer_stab: dict[str, dict], xl: dict, n_req: int,
+          args: argparse.Namespace) -> int:
+    """Shared text + figure output for both the dump and json-input modes."""
     lines = [
         "=== PIVOT baseline topk EXTRA (same captures, new claims; no re-probe) ===",
-        f"top_k={TOP_K}  requests={len(per_req)}  layers={len(layer_stab)}",
+        f"top_k={TOP_K}  requests={n_req}  layers={len(layer_stab)}",
         "",
         "-- cross-layer IoU (same decode step, layer i vs j): top-2048 跨层相似度 --",
         "   高 => 跨层候选共享可行;低 => 各层候选彼此独立,共享收益有限。",
     ]
     for key in xl["layer_pairs"]:
         p = xl["pairs"][key]
+        la, _, lb = key.partition("__")
+        disp = f"{_layer_short(la)} vs {_layer_short(lb)}"
         if p["iou_mean"] is None:
-            lines.append(f"  {key}: {p['note']}")
+            lines.append(f"  {disp}: {p['note']}")
         else:
-            lines.append(f"  {key}: mean={p['iou_mean']:.4f}  min={p['iou_min']:.4f}  "
+            lines.append(f"  {disp}: mean={p['iou_mean']:.4f}  min={p['iou_min']:.4f}  "
                          f"(aligned steps x{p['n_pairs']})")
     lines.append("")
     lines.append("-- stability per layer (anchors vs transients, churn size) --")
     lines.append("   core>=90%步, stable>=50%, transient<10%, churn=每步换新数, "
                  "streak=最长连续段>=阈值的占比")
-    for layer, s in sorted(layer_stab.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 1e9):
+    for layer, s in sorted(layer_stab.items(), key=lambda kv: _layer_key(kv[0])):
         st = s.get("streak", {})
         lines.append(
-            f"  L{layer}: core={s['core_frac']:.2f} stable={s['stable_frac']:.2f} "
+            f"  L{_layer_short(layer)}: core={s['core_frac']:.2f} stable={s['stable_frac']:.2f} "
             f"transient={s['transient_frac']:.2f} churn/step={s['churn_new_per_step']:.0f} "
             f"| streak>=5:{st.get('ge_5', float('nan')):.2f} >=16:{st.get('ge_16', float('nan')):.2f} "
             f"==full:{st.get('ge_full', float('nan')):.2f}")
@@ -261,7 +295,7 @@ def _draw(stab: dict[str, dict], xl: dict, out: str) -> None:
         plt.rcParams["axes.unicode_minus"] = False
     cap = lambda zh, en: zh if cjk else en  # noqa: E731
 
-    layers = sorted(stab, key=int)
+    layers = sorted(stab, key=_layer_key)
     fig, axs = plt.subplots(2, 2, figsize=(12.4, 8.6))
     fig.suptitle(cap("PIVOT 基线 topk 追加实验(同一批探针数据,无重跑)",
                      "PIVOT baseline topk EXTRA (same captures, no re-probe)"),
@@ -277,7 +311,10 @@ def _draw(stab: dict[str, dict], xl: dict, out: str) -> None:
         if v is not None:
             ax.text(i, v + 0.01, f"{v:.2f}", ha="center", fontsize=8.5)
     ax.set_xticks(range(len(keys)))
-    ax.set_xticklabels([k.replace("__", " vs ") for k in keys], fontsize=8)
+    # short labels like "6 vs 38" (was full module names -> overlap/garble)
+    ax.set_xticklabels(
+        ["%s vs %s" % (_layer_short(k.split("__")[0]), _layer_short(k.split("__")[1]))
+         for k in keys], fontsize=8, rotation=30, ha="right")
     ax.set_ylim(0, 1)
     ax.set_title(cap("(a) 跨层 IoU(同时刻 top-2048 重合)\n高=跨层候选共享可行",
                      "(a) cross-layer IoU at the same step\nhigh = cross-layer sharing viable",
@@ -287,15 +324,15 @@ def _draw(stab: dict[str, dict], xl: dict, out: str) -> None:
     # (b) core/stable/transient stacked bars per layer
     ax = axs[0, 1]
     x = range(len(layers))
-    ax.bar(x, [stab[l]["core_frac"] for l in layers], 0.5, label="core ≥90%",
+    ax.bar(x, [stab[l]["core_frac"] for l in layers], 0.5, label="core >=90%",
            color="#2f9e44")
     ax.bar(x, [stab[l]["stable_frac"] - stab[l]["core_frac"] for l in layers], 0.5,
-           bottom=[stab[l]["core_frac"] for l in layers], label="stable 50–90%",
+           bottom=[stab[l]["core_frac"] for l in layers], label="stable 50-90%",
            color="#e8590c", alpha=0.8)
     ax.bar(x, [stab[l]["transient_frac"] for l in layers], 0.5,
            bottom=[stab[l]["stable_frac"] for l in layers], label="transient <10%",
            color="#adb5bd")
-    ax.set_xticks(list(x)); ax.set_xticklabels(["L" + l for l in layers])
+    ax.set_xticks(list(x)); ax.set_xticklabels(["L" + _layer_short(l) for l in layers])
     ax.set_ylim(0, 1.05)
     ax.set_title(cap("(b) 位置驻留分层:锚点 vs 瞬态\n(按出现步数占比)",
                      "(b) position residency: anchors vs transients\n(by fraction of steps present)",
@@ -310,9 +347,12 @@ def _draw(stab: dict[str, dict], xl: dict, out: str) -> None:
         st = stab[l]["streak"]
         vals = [st.get("ge_%d" % t) if t != "full" else st.get("ge_full")
                 for t in thrs]
-        ax.plot(range(len(thrs)), vals, marker="o", ms=3, lw=1.5, label="L" + l)
+        # legend label was the FULL module name -> garble; use short "L38"
+        ax.plot(range(len(thrs)), vals, marker="o", ms=3, lw=1.5,
+                label="L" + _layer_short(l))
     ax.set_xticks(range(len(thrs)))
-    ax.set_xticklabels([f"≥{t}" if t != "full" else "==全长" for t in thrs])
+    ax.set_xticklabels([cap(f">={t}", f">={t}") if t != "full"
+                        else cap("==全长", "==full run") for t in thrs])
     ax.set_ylim(0, 1.05)
     ax.set_ylabel(cap("位置占比", "fraction of positions"))
     ax.set_title(cap("(c) 最长驻留段分布:越陡=越多人短驻留\n(右端==全长=全程锚点)",
@@ -326,7 +366,7 @@ def _draw(stab: dict[str, dict], xl: dict, out: str) -> None:
     ax.bar(x, vals, 0.5, color="#3b5bdb", alpha=0.85)
     for i, v in enumerate(vals):
         ax.text(i, v + 5, f"{v:.0f}", ha="center", fontsize=8.5)
-    ax.set_xticks(list(x)); ax.set_xticklabels(["L" + l for l in layers])
+    ax.set_xticks(list(x)); ax.set_xticklabels(["L" + _layer_short(l) for l in layers])
     ax.set_ylabel(cap("每步换新位置数", "new entries per step"))
     ax.set_ylim(0, max(vals) * 1.2)
     ax.set_title(cap("(d) 每步换新量(=驱逐量)\n2048 槽里每步换掉多少",

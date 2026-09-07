@@ -13,10 +13,13 @@ Design constraints (user-specified, 2026-09-05):
 
 Sampling model (mirrors pivot_indexer._dump_gate): only indexer layers ever
 call in, layer selector is "first" or a layer-name substring, stride spreads
-captures over the run. Per (req, step) we keep the 2048 int32 positions of one
-representative query row of the group; the analyzer derives IoU / decay /
-residency / heatmap statistics offline. Bounded memory: a small bounded queue +
-a daemon writer thread; nothing is kept per step beyond the captured row.
+captures over the run. Two admission gates bound the workload: a request is
+tracked only once its seq_len (prompt+generated) exceeds _MIN_LEN, and at most
+_MAX_REQS distinct requests are followed (then the probe stops). Per (req, step)
+we keep the 2048 int32 positions of one representative query row of the group;
+the analyzer derives IoU / decay / residency / heatmap statistics offline.
+Bounded memory: a small bounded queue + a daemon writer thread; nothing is kept
+per step beyond the captured row.
 
 Diagnostics only -- never raises, zero hot-path cost when the gate is off.
 """
@@ -47,13 +50,17 @@ _LAYER_SELECTOR = "first"
 _WRITE_RANK = "0"
 # Bounded sampling knobs. Memory bound = bounded queue (maxsize) + request
 # cap; there is deliberately no per-request step cap (the queue is the bound).
-_MAX_REQS = 64         # distinct requests tracked (first-seen, in step order)
+_MAX_REQS = 64         # distinct requests tracked; once reached, capture stops
+_MIN_LEN = 4096        # only admit a request once seq_len (prompt+generated) > this
 _STRIDE = 1            # capture every Nth (layer, step) hit
 
 # ---- module state (mirrors pivot_indexer._dump_*) ------------------------
 _probe_layers: set[str] = set()  # pinned indexer layers (fill as they match)
 _probe_seen: list[str] = []
 _probe_hits = 0
+_probe_reqs: set[str] = set()  # distinct requests admitted (seq_len > _MIN_LEN)
+_probe_capped = False          # once _MAX_REQS distinct requests tracked, stop
+_len_filter_warned = False     # once: seq_lens signal malformed, gate disabled
 # Real decode step counter (incremented once per step by set_step_request_ids,
 # which the model runner calls before each step's execution). All indexer
 # layers in one step share the same value, so it is the cross-layer alignment
@@ -240,7 +247,30 @@ def _request_row_offsets(query_start_loc, n_requests: int, total_rows: int):
     return starts
 
 
-def capture(sfa_impl, topk_indices: torch.Tensor, query_start_loc=None) -> None:
+def _per_request_lengths(seq_lens, n: int):
+    """Raw per-request sequence lengths (prompt+generated, batch order) from the
+    indexer's ``actual_seq_lengths_key`` -- the length signal for the admission
+    gate. Returns a list[int] of length n, or None if the signal is unavailable
+    or malformed. None disables the length gate (never silently drops captures
+    because a diagnostic tensor changed shape)."""
+    global _len_filter_warned
+    if seq_lens is None or n <= 0:
+        return None
+    try:
+        vals = [int(x) for x in seq_lens.detach().cpu().tolist()]
+    except Exception:
+        return None
+    if len(vals) == n:
+        return vals
+    if not _len_filter_warned:
+        _len_filter_warned = True
+        logger.warning("PIVOT topk probe: seq_lens has len %d, expected %d; "
+                       "length gate disabled", len(vals), n)
+    return None
+
+
+def capture(sfa_impl, topk_indices: torch.Tensor, query_start_loc=None,
+            seq_lens=None) -> None:
     """Record one native indexer invocation's top-2048 indices verbatim.
 
     Called from indexer_select_post_process right after the op returns, on the
@@ -257,10 +287,23 @@ def capture(sfa_impl, topk_indices: torch.Tensor, query_start_loc=None) -> None:
     into "8 requests" that were really 2). When it is unavailable we fall back
     to a uniform g = D // K only on exact division, and otherwise skip the step
     rather than guess a mapping.
+
+    Two admission gates (user-specified 2026-09-07):
+      * distinct-request cap: only the first ``_MAX_REQS`` distinct requests are
+        ever tracked (first-seen in batch order). Once the cap is reached the
+        probe stops capturing entirely for the rest of the run.
+      * length gate: a request is only admitted once its seq_len
+        (prompt+generated, from ``actual_seq_lengths_key`` passed as
+        ``seq_lens``) exceeds ``_MIN_LEN`` -- below that the decode window is
+        too short for the long-context claims these captures measure. If
+        ``seq_lens`` is unavailable/malformed the gate is silently disabled
+        rather than dropping captures on a diagnostic-signal shape change.
     """
-    global _step_req_ids, _real_step, _probe_map_warned
+    global _step_req_ids, _real_step, _probe_map_warned, _probe_reqs, _probe_capped
     if not envs.VLLM_ASCEND_TOPK_PROBE:
         return
+    if _probe_capped:
+        return  # distinct-request cap reached; hot-path off for the rest of the run
     try:
         if not _gate(sfa_impl.layer_name):
             return
@@ -272,7 +315,7 @@ def capture(sfa_impl, topk_indices: torch.Tensor, query_start_loc=None) -> None:
         if torch.npu.is_current_stream_capturing():
             return  # graph capture is unsafe for D2H + I/O; eager runs only
 
-        n_reqs = min(len(_step_req_ids), _MAX_REQS)
+        n_reqs = len(_step_req_ids)
         if n_reqs == 0:
             return
         step = _real_step  # real decode step: same value for every layer in one step
@@ -290,18 +333,40 @@ def capture(sfa_impl, topk_indices: torch.Tensor, query_start_loc=None) -> None:
                     "(D=%d, K=%d) -- skipping this step",
                     topk_indices.shape[0], len(_step_req_ids))
             return  # never guess a mapping
+        lens = _per_request_lengths(seq_lens, n_reqs)  # None -> gate disabled
+        # Admit requests in first-seen (batch) order. A request already tracked
+        # keeps being captured every step; a new one is admitted only if the
+        # distinct-request cap still has room AND (when the length signal is
+        # present) its seq_len already exceeds _MIN_LEN.
+        admit: list[int] = []
+        for r in range(n_reqs):
+            rid = _step_req_ids[r]
+            if rid in _probe_reqs:
+                admit.append(r)          # already tracked -> keep capturing
+                continue
+            if len(_probe_reqs) >= _MAX_REQS:
+                _probe_capped = True
+                logger.info("PIVOT topk probe: tracked %d distinct requests; "
+                            "capture stopped (cap=%d)", _MAX_REQS, _MAX_REQS)
+                return
+            if lens is not None and lens[r] <= _MIN_LEN:
+                continue                  # not long enough yet -> wait for a later step
+            _probe_reqs.add(rid)          # admit on first step with seq_len > _MIN_LEN
+            admit.append(r)
+        if not admit:
+            return
         # row-0 only: with MTP OFF (g=1) each decode step is exactly one token,
         # so the adjacent-step IoU computed offline IS the adjacent-token IoU.
         # (To compare parallelisms, re-run the probe under different g rather
         # than capturing all rows -- keeps this capture single-row & minimal.)
-        row_idx = torch.tensor([starts[r] for r in range(n_reqs)],
+        row_idx = torch.tensor([starts[r] for r in admit],
                                dtype=torch.long, device=topk_indices.device)
         rows = topk_indices.index_select(0, row_idx)[:, 0, :].cpu()
-        # [n_reqs, 2048] int32 -- one D2H; row r == request r's first query row
-        for i in range(n_reqs):
+        # [len(admit), 2048] int32 -- one D2H; row i == request admit[i]'s first query row
+        for i, r in enumerate(admit):
             if _queue.full():
                 return  # bounded memory: drop rather than grow unboundedly
-            _queue.put((_step_req_ids[i], step, sfa_impl.layer_name,
+            _queue.put((_step_req_ids[r], step, sfa_impl.layer_name,
                         rows[i].clone()))
     except Exception:
         # self-protect: a probe bug must never take down the server

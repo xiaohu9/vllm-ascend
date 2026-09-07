@@ -315,10 +315,10 @@ def _draw(stab: dict[str, dict], xl: dict, out: str) -> None:
     ax.set_xticklabels(
         ["%s vs %s" % (_layer_short(k.split("__")[0]), _layer_short(k.split("__")[1]))
          for k in keys], fontsize=8, rotation=30, ha="right")
-    ax.set_ylim(0, 1)
-    ax.set_title(cap("(a) 跨层 IoU(同时刻 top-2048 重合)\n高=跨层候选共享可行",
-                     "(a) cross-layer IoU at the same step\nhigh = cross-layer sharing viable",
-                     ), fontsize=9.5, pad=7)
+    ax.set_ylim(0, 1.05)
+    ax.set_title(cap("(a) 跨层 IoU(同时刻)",
+                     "(a) cross-layer IoU (same step)", ),
+                 fontsize=11, pad=7)
     ax.grid(axis="y", alpha=0.25)
 
     # (b) core/stable/transient stacked bars per layer
@@ -334,9 +334,9 @@ def _draw(stab: dict[str, dict], xl: dict, out: str) -> None:
            color="#adb5bd")
     ax.set_xticks(list(x)); ax.set_xticklabels(["L" + _layer_short(l) for l in layers])
     ax.set_ylim(0, 1.05)
-    ax.set_title(cap("(b) 位置驻留分层:锚点 vs 瞬态\n(按出现步数占比)",
-                     "(b) position residency: anchors vs transients\n(by fraction of steps present)",
-                     ), fontsize=9.5, pad=7)
+    ax.set_title(cap("(b) 位置驻留分层(core/stable/transient)",
+                     "(b) position residency (core/stable/transient)",
+                     ), fontsize=11, pad=7)
     ax.legend(fontsize=8, loc="lower right")
     ax.grid(axis="y", alpha=0.25)
 
@@ -355,23 +355,25 @@ def _draw(stab: dict[str, dict], xl: dict, out: str) -> None:
                         else cap("==全长", "==full run") for t in thrs])
     ax.set_ylim(0, 1.05)
     ax.set_ylabel(cap("位置占比", "fraction of positions"))
-    ax.set_title(cap("(c) 最长驻留段分布:越陡=越多人短驻留\n(右端==全长=全程锚点)",
-                     "(c) longest-run distribution: steep = many short stays\n(right end == full run = anchors)",
-                     ), fontsize=9.5, pad=7)
+    ax.set_title(cap("(c) 最长驻留段分布",
+                     "(c) longest-run distribution",
+                     ), fontsize=11, pad=7)
     ax.legend(fontsize=8); ax.grid(alpha=0.25)
 
     # (d) churn size per layer
     ax = axs[1, 1]
     vals = [stab[l]["churn_new_per_step"] for l in layers]
     ax.bar(x, vals, 0.5, color="#3b5bdb", alpha=0.85)
+    lo, hi = min(vals), max(vals)
+    pad = max((hi - lo) * 0.15, 1.0)
     for i, v in enumerate(vals):
-        ax.text(i, v + 5, f"{v:.0f}", ha="center", fontsize=8.5)
+        ax.text(i, v + pad * 0.6, f"{v:.0f}", ha="center", fontsize=8.5)
     ax.set_xticks(list(x)); ax.set_xticklabels(["L" + _layer_short(l) for l in layers])
     ax.set_ylabel(cap("每步换新位置数", "new entries per step"))
-    ax.set_ylim(0, max(vals) * 1.2)
-    ax.set_title(cap("(d) 每步换新量(=驱逐量)\n2048 槽里每步换掉多少",
-                     "(d) churn size: new entries per step\n(== evictions; 2048 slots total)",
-                     ), fontsize=9.5, pad=7)
+    ax.set_ylim(max(0, lo - pad), hi + pad)
+    ax.set_title(cap("(d) 每步换新量 churn size",
+                     "(d) churn size (new entries / step)",
+                     ), fontsize=11, pad=7)
     ax.grid(axis="y", alpha=0.25)
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])

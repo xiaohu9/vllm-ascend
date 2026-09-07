@@ -643,7 +643,8 @@ class BaseDeviceAdaptor:
             )
         # T5 probe: record the native top-2048 indices verbatim (baseline
         # untouched, no score re-computation). Gate off = zero cost.
-        topk_probe_capture(sfa_impl, topk_indices, actual_seq_lengths_query)
+        topk_probe_capture(sfa_impl, topk_indices, actual_seq_lengths_query,
+                           actual_seq_lengths_key)
         return topk_indices
 
     @classmethod

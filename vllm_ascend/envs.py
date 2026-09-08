@@ -155,6 +155,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # the dump logs the real indexer-layer names it sees and falls back to the
     # current one instead of silently capturing nothing.
     "VLLM_ASCEND_PIVOT_REFINE_DUMP_LAYER": lambda: os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP_LAYER", "first"),
+    # Enable PIVOT on the prefill stage (positional groups of g, paper Eq. 2).
+    # Off by default: prefill tail keeps the native indexer path. Independent
+    # of the decode MTP group env -- the two act on mutually exclusive segments
+    # (decode head vs prefill tail) of a mixed batch.
+    "VLLM_ASCEND_PIVOT_PREFILL": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_PREFILL", "0"))),
+    # Positional group size for prefill-PIVOT (paper default 4). Number of
+    # groups per request = ceil(q_r / g); a request's last group may be smaller.
+    "VLLM_ASCEND_PIVOT_PREFILL_GROUP": lambda: int(os.getenv("VLLM_ASCEND_PIVOT_PREFILL_GROUP", "4")),
     # ---- T5: baseline (non-PIVOT native path) topk characteristic probe ----
     # Single gate (dump dir / layer roster / rank are module constants inside
     # pivot_topk_probe.py, not env vars). When on, baseline_topk_probe.capture in

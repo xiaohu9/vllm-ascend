@@ -263,15 +263,23 @@ class PivotIndexer:
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
         allow_whole_batch: bool = True,
+        handle_tail: bool = True,
     ) -> torch.Tensor | None:
-        """Return topk_indices [N_in, 1, 2048] (0-based logical key positions).
+        """Return decode-head topk_indices (0-based logical key positions).
 
         Decode requests sit at the head of the batch (the engine reorders to
         decode -> ... -> prefill), so the leading run of requests with a
         uniform query count g is the decode segment: requests [0, K), query
-        rows [0, D). That segment runs through PIVOT; a non-empty prefill
-        tail runs through the native indexer and the results are
-        concatenated.
+        rows [0, D). That segment runs through PIVOT; the prefill tail is
+        handled by the caller:
+          - handle_tail=True (default): the tail runs through the NATIVE
+            indexer and the results are concatenated, then the full-batch
+            graph/index-cache guards are applied (legacy behavior, used when
+            prefill-PIVOT is off);
+          - handle_tail=False (prefill-PIVOT on): return the decode head raw
+            [0, D) with NO tail and NO full-batch guards -- the caller (the
+            three-way dispatch) owns the tail (via select_topk_prefill) and
+            the guards (via _apply_output_guards on the combined result).
 
         Returns None when the batch has no grouped decode head (C8, g < 2,
         g > 16, or a uniform batch in a prefill state when the caller
@@ -385,7 +393,8 @@ class PivotIndexer:
         # [t-g+1, t]. W = g reproduces the paper's experimental
         # configuration (w = 4 = g).
         if envs.VLLM_ASCEND_PIVOT_LOCAL_WINDOW:
-            C, aslk_op = _inject_local_window(C, seq_lens[:K], g)
+            C, aslk_op = _inject_local_window(
+                C, seq_lens[:K] - g, seq_lens[:K], g)
         else:
             # aslk drives the per-request S2 chunk loop over the CANDIDATE
             # LIST (row width = C.shape[1]). In the truncated region
@@ -508,11 +517,10 @@ class PivotIndexer:
         # repetition seen even on the torch path). Both paths emit valid
         # positions in score order; the kernel handles causality.
 
-        if K == R_all:
-            topk_indices = topk_dec
-        else:
-            # Mixed batch: the prefill tail (requests [K, R_all), rows
-            # [D, N)) stays on the native indexer.
+        if handle_tail and K != R_all:
+            # Mixed batch, native tail (fallback, prefill-PIVOT off): the
+            # prefill tail (requests [K, R_all), rows [D, N)) stays on the
+            # native indexer.
             topk_indices = torch.cat(
                 [
                     topk_dec,
@@ -533,30 +541,18 @@ class PivotIndexer:
                 ],
                 dim=0,
             )
+        else:
+            # Pure decode head (K == R_all), or the caller owns the tail and
+            # the full-batch guards (handle_tail=False): return the decode
+            # head raw.
+            topk_indices = topk_dec
 
-        # Graph padding guard: padded rows [N, N_in) get -1 tails so the
-        # output row count matches the native path (num_input_tokens).
-        if N_in > N:
-            row_pad = torch.full(
-                (N_in - N, 1, topk_indices.shape[-1]),
-                -1,
-                dtype=topk_indices.dtype,
-                device=device,
-            )
-            topk_indices = torch.cat([topk_indices, row_pad], dim=0)
-
-        # use_index_cache width guard: the read side returns the full buffer
-        # width, so pad the output to the buffer width with -1 tails.
-        if getattr(sfa_impl, "use_index_cache", False) and sfa_impl.topk_indices_buffer is not None:
-            buf_width = sfa_impl.topk_indices_buffer.shape[-1]
-            if topk_indices.shape[-1] < buf_width:
-                pad = torch.full(
-                    (topk_indices.shape[0], 1, buf_width - topk_indices.shape[-1]),
-                    -1,
-                    dtype=topk_indices.dtype,
-                    device=device,
-                )
-                topk_indices = torch.cat([topk_indices, pad], dim=-1)
+        if handle_tail:
+            # Full-batch guards (graph row pad + index-cache width pad). With
+            # handle_tail=False these are applied by the caller on the
+            # combined decode+prefill result instead.
+            topk_indices = _apply_output_guards(
+                topk_indices, sfa_impl, N_in, N)
 
         if _ENABLE_REPORT and not _capturing():
             try:
@@ -569,6 +565,184 @@ class PivotIndexer:
             "PIVOT refine: rows=%d/%d reqs=%d/%d g=%d", D, N, K, R_all, g
         )
         return topk_indices
+
+
+    @staticmethod
+    def select_topk_prefill(
+        sfa_impl,
+        q_li: torch.Tensor,
+        q_li_scale: torch.Tensor | None,
+        q_li_shape_ori: tuple | None,
+        weights: torch.Tensor,
+        kv_cache: tuple,
+        attn_metadata,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        prefill_tail_start: int,
+    ) -> torch.Tensor | None:
+        """Return prefill-tail topk_indices [N-D, 1, 2048] via prefill-PIVOT.
+
+        The prefill tail is the TND rows [D, N) = the requests whose cumulative
+        query ends exceed the decode-head row count D = prefill_tail_start
+        (= num_decode_tokens). Each prefill request's q_r query rows are split
+        into positional groups of g (paper Eq. 2, last group may be smaller);
+        groups become the R axis, so the whole decode PIVOT pipeline (mean
+        proxy -> coarse screen -> per-group window -> refine) runs unchanged
+        with R = P groups instead of R = K requests.
+
+        Coarse domain: [0, group_start) per group -- the pool is recalled at
+        the group's FIRST position (paper Eq. 5), so a group's own tokens
+        (>= group_start) never enter the pool (the window supplies them) but
+        EARLIER groups' own tokens DO (they are causal for this group).
+        Combined with the window [group_start-g+1, group_end), a full group's
+        refine domain is the complete causal prefix [0, group_end). This is
+        the decode formula [0, L) + [L-g+1, L+g) = [0, L+g) generalized to
+        group index j: [0, group_start_j) + [group_start_j-g+1, group_end_j).
+        (A per-request [0, L_r) domain -- prefix before the whole chunk --
+        would drop every earlier group's own tokens from a later group's
+        candidate set, a correctness gap for multi-group requests.)
+
+        Returns None when prefill-PIVOT is inapplicable (C8, g out of range);
+        the caller then falls the whole batch to the native indexer. All
+        geometry is pure tensor ops; the few int()/bool() reductions are the
+        same lossless-gate / count decisions select_topk already makes in the
+        eager decode path (prefill is always eager, never in a graph).
+        """
+        if getattr(sfa_impl, "enable_sparse_li_c8", False):
+            logger.warning_once(
+                "PIVOT prefill: enable_sparse_li_c8 is set; falling back to "
+                "the native indexer (PIVOT supports the BF16 path only).")
+            return None
+
+        g = envs.VLLM_ASCEND_PIVOT_PREFILL_GROUP
+        if not 2 <= g <= _MAX_GROUP:
+            logger.warning_once(
+                "PIVOT prefill: PREFILL_GROUP=%d out of [2, %d]; falling back "
+                "to the native indexer.", g, _MAX_GROUP)
+            return None
+
+        cum = actual_seq_lengths_query  # [R_all] cumulative query ends
+        seq_lens = actual_seq_lengths_key  # [R_all] == L_r + q_r
+        if cum.shape[0] == 0:
+            return None
+        N = attn_metadata.num_actual_tokens
+        device = q_li.device
+        D = prefill_tail_start
+        block_size = attn_metadata.block_size
+
+        # ---- prefill segment: requests with rows [D, N) -------------------
+        # Decode requests (rows < D) carry g query rows each; prefill requests
+        # are those whose cumulative end > D (the last decode request ends
+        # exactly at D, so `cum > D` excludes it).
+        pre_req = cum > D                      # [R_all] bool
+        R_pre = int(pre_req.sum())
+        if R_pre == 0:
+            return None
+        tail_cum = cum[pre_req] - D            # [R_pre], rebased: first == q_0
+        tail_seq = seq_lens[pre_req]           # [R_pre]
+        tail_bt = attn_metadata.block_table[pre_req]  # [R_pre, MAX_BLK]
+        N_tail = int(tail_cum[-1])             # == total prefill rows (N - D)
+        tail_q = _request_counts(tail_cum)     # [R_pre] per-request query counts
+
+        # ---- positional groups (paper Eq. 2) ------------------------------
+        n_r = (tail_q + g - 1) // g            # [R_pre] groups per request
+        P = int(n_r.sum())
+        req_base = torch.cat(
+            [torch.zeros(1, dtype=n_r.dtype, device=device), n_r.cumsum(0)[:-1]]
+        )                                       # [R_pre] group start idx per req
+        # Per-query-row: its position within its request and its group.
+        row_start = torch.cat(
+            [torch.zeros(1, dtype=tail_cum.dtype, device=device),
+             tail_cum[:-1]]
+        )                                       # [R_pre] first row of each req
+        row_in_req = torch.arange(N_tail, device=device) \
+            - torch.repeat_interleave(row_start, tail_q)  # [N_tail]
+        group_local = row_in_req // g           # [N_tail] group idx within req
+        group_ids = torch.repeat_interleave(req_base, tail_q) \
+            + group_local                       # [N_tail] per-row group idx
+
+        # Group sizes: g everywhere except each request's last group.
+        last_size = tail_q - (n_r - 1) * g      # [R_pre] last-group size (1..g)
+        last_gidx = req_base + n_r - 1          # [R_pre] index of each last group
+        group_sizes = torch.full((P,), g, dtype=tail_q.dtype, device=device)
+        group_sizes[last_gidx] = last_size
+        aslq_refine = group_sizes.cumsum(0)     # [P] cumulative; [-1] == N_tail
+
+        # Absolute KV position of each group's own-token block.
+        L_r = tail_seq - tail_q                 # [R_pre] request prefix before chunk
+        group_j = torch.arange(P, device=device) \
+            - torch.repeat_interleave(req_base, n_r)   # [P] local group idx
+        group_start = torch.repeat_interleave(L_r, n_r) + group_j * g  # [P]
+        group_end = group_start + group_sizes   # [P]
+
+        # Coarse/refine map candidate rows to KV slots via the OWNING
+        # request's block table: per-GROUP block table aligned with C [P, ...].
+        group_bt = tail_bt.repeat_interleave(n_r, dim=0)  # [P, MAX_BLK]
+
+        # ---- mean proxy (per group) --------------------------------------
+        q_dq = q_li[D:N]      # [N_tail, H, Dh] raw BF16
+        w_t = weights[D:N]    # [N_tail, H]
+        H, Dh = q_dq.shape[1], q_dq.shape[2]
+        gidx = group_ids.view(-1, 1, 1).expand(N_tail, H, Dh)
+        q_bar = q_dq.new_zeros(P, H, Dh).scatter_add_(0, gidx, q_dq)
+        q_bar = q_bar / group_sizes.view(P, 1, 1)
+        wgidx = group_ids.view(-1, 1).expand(N_tail, H)
+        w_bar = w_t.new_zeros(P, H).scatter_add_(0, wgidx, w_t)
+        w_bar = w_bar / group_sizes.view(P, 1)
+
+        # ---- coarse screen (proxy domain [0, group_start) per group) -----
+        if bool((group_start <= _COARSE_BUDGET).all()):
+            # Lossless fast path: every prefix [0, group_start) fits the
+            # budget, so the whole prefix is the candidate set.
+            col = torch.arange(_COARSE_BUDGET, dtype=torch.int64, device=device)
+            C = torch.where(col[None, :] < group_start[:, None],
+                            col[None, :], -1)
+        else:
+            C = _coarse_screen(q_bar, w_bar, kv_cache, group_bt,
+                               block_size, group_start)
+
+        # ---- per-query local window (compete-by-score, decode semantics) --
+        if envs.VLLM_ASCEND_PIVOT_LOCAL_WINDOW:
+            C, aslk_op = _inject_local_window(C, group_start, group_end, g)
+        else:
+            aslk_op = torch.clamp(group_end, max=C.shape[1])
+
+        # ---- refine: query row -> group candidate row ---------------------
+        req_ids = group_ids  # [N_tail] each row -> its group's candidate row
+
+        if envs.VLLM_ASCEND_PIVOT_REFINE_USE_OP:
+            try:
+                # Op prototype requires candidates DT_INT32; _coarse_screen
+                # returns torch.topk indices (int64). Cast only on the op path.
+                topk_pre = torch.ops._C_ascend.npu_indexer_refine(
+                    q_dq, kv_cache[2], w_t, C.to(torch.int32),
+                    actual_seq_lengths_query=aslq_refine,
+                    actual_seq_lengths_key=aslk_op,
+                    block_table=group_bt,
+                    layout_query="TND", layout_key="PA_BSND",
+                    sparse_count=_REFINE_BUDGET,
+                )  # [N_tail, 1, _REFINE_BUDGET] int32
+                # Same caller-side column->position gather as decode: the op
+                # emits candidate COLUMN indices, not KV positions.
+                cols = topk_pre.view(N_tail, _REFINE_BUDGET).to(torch.int64)
+                pos = C[req_ids].gather(1, cols.clamp(min=0))  # [N_tail, 2048]
+                topk_pre = torch.where(cols < 0, -1, pos) \
+                    .view(N_tail, 1, _REFINE_BUDGET).to(torch.int32)
+            except Exception as e:
+                logger.warning("PIVOT prefill refine op/gather failed, "
+                               "recomputing via torch: %s", e)
+                topk_pre = _refine_topk(q_dq, w_t, C, req_ids, kv_cache,
+                                        group_bt, block_size, N_tail)
+        else:
+            topk_pre = _refine_topk(q_dq, w_t, C, req_ids, kv_cache,
+                                    group_bt, block_size, N_tail)
+
+        assert int(aslq_refine[-1]) == N_tail, \
+            f"PIVOT prefill: group cum [-1]={int(aslq_refine[-1])} != N_tail={N_tail}"
+
+        logger.debug("PIVOT prefill refine: rows=%d reqs=%d groups=%d g=%d",
+                     N_tail, R_pre, P, g)
+        return topk_pre
 
 
 def _native_indexer_tail(
@@ -613,6 +787,43 @@ def _native_indexer_tail(
         getattr(sfa_impl, "enable_sparse_li_c8", False),
         getattr(sfa_impl, "use_torch_npu_lightning_indexer", False),
     )
+
+
+def _apply_output_guards(
+    topk_indices: torch.Tensor,
+    sfa_impl,
+    N_in: int,
+    N: int,
+) -> torch.Tensor:
+    """Pad PIVOT topk_indices to the native row count and index-cache width.
+
+    Shared by select_topk (handle_tail=True) and the three-way dispatch (on
+    the combined decode+prefill result). Two pads, both -1 tails:
+      - graph padding: rows [N, N_in) get -1 rows so the output row count
+        matches the native path (num_input_tokens);
+      - use_index_cache width: pad the width to the buffer width so the read
+        side returns a full-width buffer.
+    """
+    device = topk_indices.device
+    if N_in > N:
+        row_pad = torch.full(
+            (N_in - N, 1, topk_indices.shape[-1]),
+            -1,
+            dtype=topk_indices.dtype,
+            device=device,
+        )
+        topk_indices = torch.cat([topk_indices, row_pad], dim=0)
+    if getattr(sfa_impl, "use_index_cache", False) and sfa_impl.topk_indices_buffer is not None:
+        buf_width = sfa_impl.topk_indices_buffer.shape[-1]
+        if topk_indices.shape[-1] < buf_width:
+            pad = torch.full(
+                (topk_indices.shape[0], 1, buf_width - topk_indices.shape[-1]),
+                -1,
+                dtype=topk_indices.dtype,
+                device=device,
+            )
+            topk_indices = torch.cat([topk_indices, pad], dim=-1)
+    return topk_indices
 
 
 def _coarse_screen(
@@ -680,22 +891,29 @@ def _coarse_screen(
 
 def _inject_local_window(
     C: torch.Tensor,
-    seq_lens: torch.Tensor,
+    win_base: torch.Tensor,
+    end: torch.Tensor,
     g: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Append each request's decode local-window union to its candidate row.
+    """Append each group's local-window union to its candidate row.
 
-    Paper Appendix B (decode variant): each query refines over (pool U its
-    own W_t = [t-W+1, t]) with duplicates removed, W >= g so the window
-    covers every token generated within the step. The op refines over a
-    SHARED per-request candidate row, so the per-query windows enter the row
-    as their group union [L-g+1, L+g) -- which for W = g is exactly the union
-    of the g queries' windows (query row t's window is [t-g+1, t]; the union
-    over t in [L, L+g) is [L-g+1, L+g)). Each query row still sees its own
-    window in the domain; entries outside the row's causal prefix are
-    masked by the SFA kernel downstream, so the widened union is harmless
-    per row. Entries compete by score in the refine -- the paper's
-    semantics, not a forced-in reserve slot.
+    Decode variant (caller passes win_base=seq_lens-g, end=seq_lens): each
+    query refines over (pool U its own W_t = [t-W+1, t]) with duplicates
+    removed, W >= g so the window covers every token generated within the
+    step. The op refines over a SHARED per-group candidate row, so the
+    per-query windows enter the row as their group union
+    [win_base-g+1, end) -- which for W = g is exactly the union of the g
+    queries' windows (query row t's window is [t-g+1, t]; the union over
+    t in [win_base, win_base+g) is [win_base-g+1, win_base+g) =
+    [win_base-g+1, end)). Prefill variant (caller passes
+    win_base=group_start, end=group_end): a positional group's own tokens
+    [group_start, group_end) plus the g-1 preceding, i.e.
+    [group_start-g+1, group_end) -- the same [win_base-g+1, end) shape, so a
+    single body serves both stages. Each query row still sees its own window
+    in the domain; entries outside the row's causal prefix are masked by the
+    SFA kernel downstream, so the widened union is harmless per row. Entries
+    compete by score in the refine -- the paper's semantics, not a forced-in
+    reserve slot.
 
     Mechanics. The union is deduplicated against C (the pool is a top-k of
     positions, so recent ones are already in it) and the genuinely-new
@@ -712,28 +930,26 @@ def _inject_local_window(
     walks -1 slots. Front-loading makes the whole valid domain reachable.
 
     Returns (C', aslk'): C' [R, c'] int64 (dtype unchanged) whose valid
-    entries are unique, < L+g, and exactly the columns [0, aslk'[r]) --
+    entries are unique, < end, and exactly the columns [0, aslk'[r]) --
     nothing else. aslk' = the row's valid candidate count (op contract:
-    per-request S2 bound), dtype matching seq_lens. In the lossless region
-    (L + g <= _COARSE_BUDGET) _coarse_screen already returned the whole
-    prefix [0, L) and only the g own tokens are new, so C' holds exactly the
-    whole prefix [0, L+g) with aslk' = L+g -- the same candidate set the
+    per-group S2 bound), dtype matching win_base. In the lossless region
+    (end <= _COARSE_BUDGET) _coarse_screen already returned the whole prefix
+    [0, win_base) and only the own tokens are new, so C' holds exactly the
+    whole prefix [0, end) with aslk' = end -- the same candidate set the
     native indexer scans -- and refine top-k keeps the lossless contract
     bit-identically.
     """
     device = C.device
     R, c = C.shape
-    Lg = seq_lens.to(torch.int64)  # [R] = L + g per request
-    L = Lg - g  # [R] prefix length BEFORE this step's own tokens
-    aslk_dtype = seq_lens.dtype
+    win_base = win_base.to(torch.int64)  # [R] absolute own-token block start
+    end = end.to(torch.int64)            # [R] absolute window end (exclusive)
+    aslk_dtype = win_base.dtype
 
-    # Window union [L-g+1, L+g): the g query rows' own windows joined. Query
-    # row t (t in [L, L+g)) attends up to t, so its W_t = [t-g+1, t]; the
-    # union over the group is [L-g+1, L+g). Positions < 0 are dropped via
-    # the `valid` mask below.
+    # Window union [win_base-g+1, end): the group's own tokens plus the g-1
+    # lookback. Positions < 0 are dropped via the `valid` mask below.
     win = torch.arange(-(g - 1), g, device=device)  # [2g-1]
-    win = L.view(R, 1) + win.view(1, -1)  # [R, 2g-1] absolute positions
-    valid = (win >= 0) & (win < Lg.view(R, 1))
+    win = win_base.view(R, 1) + win.view(1, -1)  # [R, 2g-1] absolute positions
+    valid = (win >= 0) & (win < end.view(R, 1))
 
     # Dedup against C: C's valid entries are unique positions, so membership
     # of each window position in the request's row is an elementwise
@@ -752,7 +968,7 @@ def _inject_local_window(
         # adds at least one), so this is the truncated region with the
         # window already covered by C -- clamp-only aslk over C's compact
         # rows (valid front, -1 tail) is exact.
-        return C, torch.clamp(seq_lens, max=c)
+        return C, torch.clamp(end, max=c)
 
     # Append the genuinely-new entries in natural ascending position order.
     # The old key=new<<40 - win descending argsort actually yields ASCENDING

@@ -1561,7 +1561,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             # (select_topk_prefill, when VLLM_ASCEND_PIVOT_PREFILL) run PIVOT;
             # the native indexer is only the whole-batch fallback.
             n_dec = attn_metadata.num_decode_tokens
-            n_pre = attn_metadata.num_prefill_tokens
+            # AscendSFAMetadata has no num_prefill_tokens; derive it from the
+            # canonical split (utils.split_decodes_and_prefills): prefill =
+            # total tokens minus decode tokens. num_prefills is the prefill
+            # REQUEST count, not the token count -- wrong semantics here.
+            n_pre = attn_metadata.num_actual_tokens - attn_metadata.num_decode_tokens
             use_pre_pivot = n_pre > 0 and envs.VLLM_ASCEND_PIVOT_PREFILL
 
             dec_topk = None

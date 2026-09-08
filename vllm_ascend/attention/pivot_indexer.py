@@ -427,8 +427,12 @@ class PivotIndexer:
                     kv_cache[2],
                     weights[:D],
                     C.to(torch.int32),
-                    actual_seq_lengths_query=cum[:K],
-                    actual_seq_lengths_key=aslk_op,
+                    # Tiling hard-requires int32 lengths; aslk_op is int64
+                    # once the local window (_inject_local_window) is on --
+                    # without the cast the op fails tiling and this path
+                    # silently falls back to the torch reference.
+                    actual_seq_lengths_query=cum[:K].to(torch.int32),
+                    actual_seq_lengths_key=aslk_op.to(torch.int32),
                     block_table=attn_metadata.block_table[:K],
                     layout_query="TND",
                     layout_key="PA_BSND",
@@ -716,8 +720,12 @@ class PivotIndexer:
                 # returns torch.topk indices (int64). Cast only on the op path.
                 topk_pre = torch.ops._C_ascend.npu_indexer_refine(
                     q_dq, kv_cache[2], w_t, C.to(torch.int32),
-                    actual_seq_lengths_query=aslq_refine,
-                    actual_seq_lengths_key=aslk_op,
+                    # Tiling (indexer_refine_tiling.cpp) hard-requires int32
+                    # for both length inputs; the positional-group geometry
+                    # builds int64 (arange / _request_counts) -> cast only on
+                    # the op path (the torch reference consumes them as-is).
+                    actual_seq_lengths_query=aslq_refine.to(torch.int32),
+                    actual_seq_lengths_key=aslk_op.to(torch.int32),
                     block_table=group_bt,
                     layout_query="TND", layout_key="PA_BSND",
                     sparse_count=_REFINE_BUDGET,

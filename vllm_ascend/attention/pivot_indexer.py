@@ -308,8 +308,17 @@ class PivotIndexer:
                 "bailing the whole batch to the native indexer.", int(cum[-1]), N)
             return None
 
-        counts = _request_counts(cum)  # [R]
-        g = int(counts[0])
+        # Decode segment: K requests / D rows are the engine's authoritative
+        # decode/prefill split (utils.split_decodes_and_prefills reorders
+        # decodes to the batch head). Do not re-derive them from the
+        # cumulative geometry -- the old leading-run inference (first request
+        # with count != g) could misfire when a prefill request carries
+        # exactly g rows and extend K past the real decode head. g (the MTP
+        # step-group size) is the one runtime fact not in the metadata; it is
+        # the head request's row count (decode-at-head).
+        K = attn_metadata.num_decodes
+        D = attn_metadata.num_decode_tokens
+        g = int(cum[0])
         if not 2 <= g <= _MAX_GROUP:
             # Not a grouped-decode head (single-token decode, or a prefill
             # leading the batch): nothing to amortize.
@@ -320,13 +329,17 @@ class PivotIndexer:
                 "reorder did not put decodes at the batch head.", g)
             return None
 
-        # Decode segment: the leading run of requests carrying g query rows.
-        eq = counts == g
-        if bool(eq.all()):
-            K, D = R_all, N
-        else:
-            K = int((~eq).nonzero()[0, 0])  # first non-group request
-            D = int(cum[K - 1])
+        # O(1) geometry self-check: the decode head must be exactly K requests
+        # of g rows each, ending at the metadata row boundary. The old O(R)
+        # counts==g scan guaranteed this by construction; metadata K/D do not,
+        # so assert it here -- preserves the bail-to-native on any
+        # decode-not-at-head / non-uniform geometry.
+        if K * g != D or int(cum[K - 1]) != D:
+            logger.warning_once(
+                "PIVOT: decode head geometry (K=%d g=%d D=%d) inconsistent "
+                "with metadata num_decodes/num_decode_tokens; bailing the "
+                "whole batch to the native indexer.", K, g, D)
+            return None
 
         if K == R_all and not allow_whole_batch:
             # A uniform batch in a prefill state is an all-prefill shape
@@ -403,10 +416,11 @@ class PivotIndexer:
             aslk_op = torch.clamp(seq_lens[:K], max=C.shape[1])
 
         # ---- 3. refine: broadcast C, score, top-k -------------------------
-        # Query row -> request id within the decode segment (the leading run
-        # is uniform, so this equals repeat_interleave(arange(K), g)).
+        # Query row -> request id within the decode segment. The decode head
+        # is validated uniform-g above (K*g == D), so each request owns g
+        # rows: repeat_interleave(arange(K), g) == the old counts[:K] form.
         req_ids = torch.repeat_interleave(
-            torch.arange(K, dtype=torch.int64, device=device), counts[:K]
+            torch.arange(K, dtype=torch.int64, device=device), g
         )  # [D]
         if envs.VLLM_ASCEND_PIVOT_REFINE_USE_OP:
             # Validated op (NPU 9/9 tie-aware PASS). The op groups the
@@ -549,7 +563,7 @@ class PivotIndexer:
 
         if _ENABLE_REPORT and not _capturing():
             try:
-                _report(seq_lens[:K], counts[:K], C, topk_indices, D, K, g,
+                _report(seq_lens[:K], [g] * K, C, topk_indices, D, K, g,
                         R_all, N, aslk=aslk_op)
             except Exception as e:  # diagnostics must never take down the decode path
                 logger.warning("PIVOT[dbg] _report failed: %s", e)

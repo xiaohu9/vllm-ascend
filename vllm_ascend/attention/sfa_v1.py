@@ -36,6 +36,7 @@ from vllm_ascend.attention.utils import (
     get_sfa_qsfa_packed_head_dim,
     maybe_save_kv_layer_to_connector,
     notify_kv_cache_written,
+    split_decodes_and_prefills,
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
@@ -513,6 +514,25 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             actual_group_key_idx = None
             actual_group_key_cache_idx = None
 
+        # num_decodes / num_decode_tokens / num_prefills are deliberately NOT
+        # set on the base SFA path: the kernel resolves per-request
+        # decode/prefill internally, and split_decodes_and_prefills does
+        # .item() host syncs in its mixed-prefill branch, which the SFA hot
+        # path avoids. PIVOT is the only consumer of the token counts, so
+        # compute them only when PIVOT is enabled. Pure-decode batches (incl.
+        # MTP decode) hit the function's sync-free early return
+        # (max_query_len <= decode_threshold -> all decode), so this stays
+        # cheap; the .item() sync only appears for genuinely mixed batches,
+        # where it is acceptable.
+        num_decodes = num_decode_tokens = num_prefills = 0
+        if envs.VLLM_ASCEND_ENABLE_PIVOT_REFINE:
+            num_decodes, num_prefills, num_decode_tokens, _ = (
+                split_decodes_and_prefills(
+                    common_attn_metadata,
+                    decode_threshold=self.decode_threshold,
+                )
+            )
+
         return self.metadata_cls(  # type: ignore
             num_input_tokens=common_attn_metadata.num_input_tokens,
             num_actual_tokens=num_actual_tokens,
@@ -531,6 +551,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             group_len=actual_group_len,
             group_key_idx=actual_group_key_idx,
             group_key_cache_idx=actual_group_key_cache_idx,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            num_prefills=num_prefills,
         )
 
     def build_for_graph_capture(

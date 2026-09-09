@@ -1064,7 +1064,13 @@ def _refine_topk(
     k32 = k_cand.to(torch.float32)
     C_n = C[req_ids]  # [N, c]
     score = torch.empty(N, c, dtype=torch.float32, device=device)
-    chunk = 256
+    # The bmm output [chunk, H, c] fp32 must fit the device headroom: on a
+    # near-full NPU (58/61 GiB resident, ~116 MiB free) chunk=256's 130 MiB
+    # output OOMs the torch reference (USE_OP=0 / dump golden). chunk=64
+    # drops it to ~33 MiB; the loop is row-parallel slicing so results are
+    # unchanged. (k_cand above is still full [R, c, Dh] -- escalate to
+    # c-blocking if a large group count R OOMs there first.)
+    chunk = 64
     for s in range(0, N, chunk):
         e = min(s + chunk, N)
         att = torch.relu(

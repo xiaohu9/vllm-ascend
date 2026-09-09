@@ -411,92 +411,81 @@ class PivotIndexer:
         if envs.VLLM_ASCEND_PIVOT_REFINE_USE_OP:
             # Validated op (NPU 9/9 tie-aware PASS). The op groups the
             # per-request candidates C via the cumulative aslq internally.
-            # Fall back to the torch reference on any op failure so the
-            # decode path keeps serving.
-            try:
-                # Op prototype requires candidates DT_INT32; _coarse_screen
-                # returns torch.topk indices (int64). Cast only on the op
-                # path -- the torch reference below consumes C as-is.
-                # aslk_op (computed above = the per-row valid candidate count
-                # after local-window compaction; = L+g in the lossless region,
-                # up to 4096+2g-1 once truncated) bounds the per-request S2
-                # chunk loop over the CANDIDATE LIST; the DUMP persists the
-                # same value the op actually consumed.
-                topk_dec = torch.ops._C_ascend.npu_indexer_refine(
-                    q_dq,
-                    kv_cache[2],
-                    weights[:D],
-                    C.to(torch.int32),
-                    # Tiling hard-requires int32 lengths; aslk_op is int64
-                    # once the local window (_inject_local_window) is on --
-                    # without the cast the op fails tiling and this path
-                    # silently falls back to the torch reference.
-                    actual_seq_lengths_query=cum[:K].to(torch.int32),
-                    actual_seq_lengths_key=aslk_op.to(torch.int32),
-                    block_table=attn_metadata.block_table[:K],
-                    layout_query="TND",
-                    layout_key="PA_BSND",
-                    sparse_count=_REFINE_BUDGET,
-                )  # [D, 1, _REFINE_BUDGET] int32
-                # One-shot confirmation that the op path (not the torch
-                # fallback below) is live -- without this a silently failing
-                # op would make gsm8k runs indistinguishable from USE_OP=0.
-                logger.info_once(
-                    "PIVOT refine: using npu_indexer_refine op "
-                    "(VLLM_ASCEND_PIVOT_REFINE_USE_OP=1).")
-                # Dump is diagnostics: guarded so a dump bug can never read
-                # "op failed", never trigger the torch fallback, never break
-                # the decode path. _dump_real_inputs self-protects too.
-                _do_dump = False
-                _layer = getattr(sfa_impl, "layer_name", "unknown")
-                if envs.VLLM_ASCEND_PIVOT_REFINE_DUMP:
-                    try:
-                        _do_dump = _dump_gate(_layer)
-                    except Exception as e:
-                        logger.warning_once(
-                            "PIVOT refine dump gate error (%s); skipping dump", e)
-                if _do_dump:
-                    # Dump AFTER the op returned, so the capture holds inputs
-                    # + the op's raw output (pre-gather cols) + the python
-                    # reference output computed from the same tensors.
-                    _dump_real_inputs(
-                        q_dq, weights[:D], C, req_ids, cum[:K], seq_lens[:K],
-                        kv_cache, attn_metadata.block_table[:K],
-                        attn_metadata.block_size,
-                        _layer,
-                        op_topk=topk_dec,
-                        # op 实收的 aslk(=该行有效候选数,经 local-window
-                        # 加宽+compact 后与 raw seq_lens[:K] 分叉),回放必须
-                        # 用这个。
-                        aslk_op=aslk_op,
-                    )
-                # CRITICAL: the refine op's S2 axis is the CANDIDATE LIST, so
-                # it sorts and emits the candidate COLUMN index -- unlike the
-                # native indexer where column == KV position. _coarse_screen
-                # returns score-ordered positions (C[r, j] = j-th best
-                # position, NOT identity), so a raw column value is useless to
-                # the SFA kernel unless mapped back to the position value.
-                # Missing this gather is why the op path read wrong keys and
-                # produced the massive repetition loops in gsm8k.
-                cols = topk_dec.view(D, _REFINE_BUDGET).to(torch.int64)
-                pos = C[req_ids].gather(1, cols.clamp(min=0))  # [D, 2048]
-                topk_dec = (
-                    torch.where(cols < 0, -1, pos)
-                    .view(D, 1, _REFINE_BUDGET)
-                    .to(torch.int32)
-                )
-            except Exception as e:
-                logger.warning("PIVOT refine op/gather failed, recomputing via torch: %s", e)
-                topk_dec = _refine_topk(
-                    q_dq,
-                    weights[:D],
-                    C,
-                    req_ids,
-                    kv_cache,
-                    attn_metadata.block_table[:K],
+            # NO try/except: an op failure now propagates loudly instead of
+            # silently recomputing via torch -- the fallback hid which path
+            # actually ran (debug instrumentation; restore the fallback once
+            # the window/prefill geometry is re-validated).
+            # Op prototype requires candidates DT_INT32; _coarse_screen
+            # returns torch.topk indices (int64). Cast only on the op
+            # path -- the torch reference below consumes C as-is.
+            # aslk_op (computed above = the per-row valid candidate count
+            # after local-window compaction; = L+g in the lossless region,
+            # up to 4096+2g-1 once truncated) bounds the per-request S2
+            # chunk loop over the CANDIDATE LIST; the DUMP persists the
+            # same value the op actually consumed.
+            topk_dec = torch.ops._C_ascend.npu_indexer_refine(
+                q_dq,
+                kv_cache[2],
+                weights[:D],
+                C.to(torch.int32),
+                # Tiling hard-requires int32 lengths; aslk_op is int64
+                # once the local window (_inject_local_window) is on --
+                # without the cast the op fails tiling and this path
+                # silently falls back to the torch reference.
+                actual_seq_lengths_query=cum[:K].to(torch.int32),
+                actual_seq_lengths_key=aslk_op.to(torch.int32),
+                block_table=attn_metadata.block_table[:K],
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=_REFINE_BUDGET,
+            )  # [D, 1, _REFINE_BUDGET] int32
+            # One-shot confirmation that the op path is live -- without
+            # this a silently failing op would make gsm8k runs
+            # indistinguishable from USE_OP=0.
+            logger.info_once(
+                "PIVOT refine: using npu_indexer_refine op "
+                "(VLLM_ASCEND_PIVOT_REFINE_USE_OP=1).")
+            # Dump is diagnostics: guarded so a dump bug can never read
+            # "op failed" or break the decode path. _dump_real_inputs
+            # self-protects too.
+            _do_dump = False
+            _layer = getattr(sfa_impl, "layer_name", "unknown")
+            if envs.VLLM_ASCEND_PIVOT_REFINE_DUMP:
+                try:
+                    _do_dump = _dump_gate(_layer)
+                except Exception as e:
+                    logger.warning_once(
+                        "PIVOT refine dump gate error (%s); skipping dump", e)
+            if _do_dump:
+                # Dump AFTER the op returned, so the capture holds inputs
+                # + the op's raw output (pre-gather cols) + the python
+                # reference output computed from the same tensors.
+                _dump_real_inputs(
+                    q_dq, weights[:D], C, req_ids, cum[:K], seq_lens[:K],
+                    kv_cache, attn_metadata.block_table[:K],
                     attn_metadata.block_size,
-                    D,
+                    _layer,
+                    op_topk=topk_dec,
+                    # op 实收的 aslk(=该行有效候选数,经 local-window
+                    # 加宽+compact 后与 raw seq_lens[:K] 分叉),回放必须
+                    # 用这个。
+                    aslk_op=aslk_op,
                 )
+            # CRITICAL: the refine op's S2 axis is the CANDIDATE LIST, so
+            # it sorts and emits the candidate COLUMN index -- unlike the
+            # native indexer where column == KV position. _coarse_screen
+            # returns score-ordered positions (C[r, j] = j-th best
+            # position, NOT identity), so a raw column value is useless to
+            # the SFA kernel unless mapped back to the position value.
+            # Missing this gather is why the op path read wrong keys and
+            # produced the massive repetition loops in gsm8k.
+            cols = topk_dec.view(D, _REFINE_BUDGET).to(torch.int64)
+            pos = C[req_ids].gather(1, cols.clamp(min=0))  # [D, 2048]
+            topk_dec = (
+                torch.where(cols < 0, -1, pos)
+                .view(D, 1, _REFINE_BUDGET)
+                .to(torch.int32)
+            )
         else:
             topk_dec = _refine_topk(
                 q_dq,
@@ -715,32 +704,36 @@ class PivotIndexer:
         req_ids = group_ids  # [N_tail] each row -> its group's candidate row
 
         if envs.VLLM_ASCEND_PIVOT_REFINE_USE_OP:
-            try:
-                # Op prototype requires candidates DT_INT32; _coarse_screen
-                # returns torch.topk indices (int64). Cast only on the op path.
-                topk_pre = torch.ops._C_ascend.npu_indexer_refine(
-                    q_dq, kv_cache[2], w_t, C.to(torch.int32),
-                    # Tiling (indexer_refine_tiling.cpp) hard-requires int32
-                    # for both length inputs; the positional-group geometry
-                    # builds int64 (arange / _request_counts) -> cast only on
-                    # the op path (the torch reference consumes them as-is).
-                    actual_seq_lengths_query=aslq_refine.to(torch.int32),
-                    actual_seq_lengths_key=aslk_op.to(torch.int32),
-                    block_table=group_bt,
-                    layout_query="TND", layout_key="PA_BSND",
-                    sparse_count=_REFINE_BUDGET,
-                )  # [N_tail, 1, _REFINE_BUDGET] int32
-                # Same caller-side column->position gather as decode: the op
-                # emits candidate COLUMN indices, not KV positions.
-                cols = topk_pre.view(N_tail, _REFINE_BUDGET).to(torch.int64)
-                pos = C[req_ids].gather(1, cols.clamp(min=0))  # [N_tail, 2048]
-                topk_pre = torch.where(cols < 0, -1, pos) \
-                    .view(N_tail, 1, _REFINE_BUDGET).to(torch.int32)
-            except Exception as e:
-                logger.warning("PIVOT prefill refine op/gather failed, "
-                               "recomputing via torch: %s", e)
-                topk_pre = _refine_topk(q_dq, w_t, C, req_ids, kv_cache,
-                                        group_bt, block_size, N_tail)
+            # NO try/except: an op failure now propagates loudly instead of
+            # silently recomputing via torch -- the fallback hid which path
+            # actually ran (debug instrumentation; restore when the geometry
+            # is re-validated).
+            # Op prototype requires candidates DT_INT32; _coarse_screen
+            # returns torch.topk indices (int64). Cast only on the op path.
+            topk_pre = torch.ops._C_ascend.npu_indexer_refine(
+                q_dq, kv_cache[2], w_t, C.to(torch.int32),
+                # Tiling (indexer_refine_tiling.cpp) hard-requires int32
+                # for both length inputs; the positional-group geometry
+                # builds int64 (arange / _request_counts) -> cast only on
+                # the op path (the torch reference consumes them as-is).
+                actual_seq_lengths_query=aslq_refine.to(torch.int32),
+                actual_seq_lengths_key=aslk_op.to(torch.int32),
+                block_table=group_bt,
+                layout_query="TND", layout_key="PA_BSND",
+                sparse_count=_REFINE_BUDGET,
+            )  # [N_tail, 1, _REFINE_BUDGET] int32
+            # One-shot confirmation the prefill op path is live (decode has
+            # its own at the decode call; without this a silent prefill op
+            # failure is indistinguishable from USE_OP=0).
+            logger.info_once(
+                "PIVOT prefill: using npu_indexer_refine op "
+                "(VLLM_ASCEND_PIVOT_REFINE_USE_OP=1).")
+            # Same caller-side column->position gather as decode: the op
+            # emits candidate COLUMN indices, not KV positions.
+            cols = topk_pre.view(N_tail, _REFINE_BUDGET).to(torch.int64)
+            pos = C[req_ids].gather(1, cols.clamp(min=0))  # [N_tail, 2048]
+            topk_pre = torch.where(cols < 0, -1, pos) \
+                .view(N_tail, 1, _REFINE_BUDGET).to(torch.int32)
         else:
             topk_pre = _refine_topk(q_dq, w_t, C, req_ids, kv_cache,
                                     group_bt, block_size, N_tail)
@@ -867,34 +860,51 @@ def _coarse_screen(
     seq_i64 = seq_lens.to(torch.int64)
     L_max = int(seq_i64.max())
 
+    # The dense gather k_all=[R, L_max, D] and the fp32 score=[R, H, L_max]
+    # both scale as R*L_max. In the decode path R is the (small) request
+    # count, but in the prefill path R is the positional-group count
+    # (N_pre/g -- thousands on a long chunk) and L_max is the longest group
+    # prefix, so the product OOMs on one shot (real prefill run: a 5.6 GiB
+    # gather on top of a 54 GiB resident graph). Each group top-k is over its
+    # OWN prefix and the -inf padding is per-row, so tiling over R is
+    # bit-identical to the monolithic call while bounding every intermediate
+    # by the tile size. _TILE keeps the worst-case fp32 score
+    # [tile, H, L_max] within the prefill headroom for L_max up to 8K.
     pos = torch.arange(L_max, dtype=torch.int64, device=device)  # [L_max]
-    # slot for key position p of request r: block_table[r, p//bs] * bs + p%bs
-    slots = block_table[:, pos // block_size] * block_size + pos % block_size
-    k_all = kc[slots.reshape(-1)].view(R, L_max, -1)  # [R, L_max, D]
+    _TILE = 64
+    cols_out = torch.full((R, _COARSE_BUDGET), -1, dtype=torch.int64,
+                          device=device)
+    for s in range(0, R, _TILE):
+        e = min(s + _TILE, R)
+        bt_t = block_table[s:e]   # [t, MAX_BLK]
+        seq_t = seq_i64[s:e]      # [t]
+        # slot for key position p of request r: block_table[r, p//bs]*bs + p%bs
+        slots = bt_t[:, pos // block_size] * block_size + pos % block_size
+        k_all = kc[slots.reshape(-1)].view(e - s, L_max, -1)  # [t, L_max, D]
 
-    # Score in fp32 (was bf16 via q_bar.dtype): the native indexer is fp32
-    # end to end (Mmad fp32 accumulate -> Fixp NoQuant fp32 writeback), and
-    # at production score magnitude a bf16 score collapses adjacent columns
-    # (gaps of a few hundred) to one bf16 value, distorting the top-4096
-    # candidate set -- same bug class as the old bf16 _refine_topk (see
-    # memory: indexer-refine-tie-root-cause). R is the decode batch request
-    # count (small), so a single bmm is fine memory-wise.
-    q32 = q_bar.to(torch.float32)  # [R, H, Dh]
-    w32 = w_bar.to(torch.float32)  # [R, H]
-    k32 = k_all.to(torch.float32)  # [R, L_max, Dh]
-    score = torch.relu(torch.bmm(q32, k32.transpose(1, 2)))  # [R, H, L_max]
-    score = (score * w32.unsqueeze(-1)).sum(dim=1)  # [R, L_max]
+        # Score in fp32 (was bf16 via q_bar.dtype): the native indexer is
+        # fp32 end to end (Mmad fp32 accumulate -> Fixp NoQuant fp32
+        # writeback), and at production score magnitude a bf16 score
+        # collapses adjacent columns (gaps of a few hundred) to one bf16
+        # value, distorting the top-4096 candidate set -- same bug class as
+        # the old bf16 _refine_topk (see memory: indexer-refine-tie-root-cause).
+        q32 = q_bar[s:e].to(torch.float32)  # [t, H, Dh]
+        w32 = w_bar[s:e].to(torch.float32)  # [t, H]
+        k32 = k_all.to(torch.float32)       # [t, L_max, Dh]
+        score = torch.relu(torch.bmm(q32, k32.transpose(1, 2)))  # [t, H, L_max]
+        score = (score * w32.unsqueeze(-1)).sum(dim=1)           # [t, L_max]
 
-    beyond = pos.unsqueeze(0) >= seq_i64.unsqueeze(1)  # [R, L_max]
-    score = score.masked_fill(beyond, float("-inf"))
+        beyond = pos.unsqueeze(0) >= seq_t.unsqueeze(1)  # [t, L_max]
+        score = score.masked_fill(beyond, float("-inf"))
 
-    if L_max < _COARSE_BUDGET:
-        pad = score.new_full((R, _COARSE_BUDGET - L_max), float("-inf"))
-        score = torch.cat([score, pad], dim=-1)  # [R, _COARSE_BUDGET]
+        if L_max < _COARSE_BUDGET:
+            pad = score.new_full((e - s, _COARSE_BUDGET - L_max),
+                                 float("-inf"))
+            score = torch.cat([score, pad], dim=-1)  # [t, _COARSE_BUDGET]
 
-    vals, cols = torch.topk(score, _COARSE_BUDGET, dim=-1)  # [R, _COARSE_BUDGET]
-    cols = cols.masked_fill(vals == float("-inf"), -1)
-    return cols  # [R, _COARSE_BUDGET], 0-based, -1 padded
+        vals, cols = torch.topk(score, _COARSE_BUDGET, dim=-1)
+        cols_out[s:e] = cols.masked_fill(vals == float("-inf"), -1)
+    return cols_out  # [R, _COARSE_BUDGET], 0-based, -1 padded
 
 
 def _inject_local_window(

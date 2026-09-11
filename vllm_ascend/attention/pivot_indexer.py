@@ -1015,7 +1015,17 @@ def _inject_local_window(
     # `valid` already drops the window's own negative positions, so
     # `present` is exactly set-membership. (Alternative bitmap membership in
     # git history; broadcast-compare measured fastest on CPU.)
-    present = (C[:, None, :] == win[:, :, None]).any(dim=2)  # [R, 2g-1]
+    # Membership broadcast (C == win).any over the c columns materializes an
+    # intermediate [R, 2g-1, c] bool -- for a large prefill (R = P groups,
+    # c = 4096+) that is hundreds of MiB and OOMs next to the resident graph
+    # (2026-09-11). Tile over the row axis: the per-tile intermediate is
+    # [tile, 2g-1, c] (~2 MiB at tile=64, c=4096). decode (R = K, small) runs
+    # in a single tile, behavior unchanged.
+    present = torch.zeros(R, win.shape[1], dtype=torch.bool, device=device)
+    _WT = 64
+    for s in range(0, R, _WT):
+        e = min(s + _WT, R)
+        present[s:e] = (C[s:e, None, :] == win[s:e, :, None]).any(dim=2)
     new = valid & ~present  # [R, 2g-1] window entries not already in C
 
     max_new = int(new.sum(dim=1).max()) if R else 0

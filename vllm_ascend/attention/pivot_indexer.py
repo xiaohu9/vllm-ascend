@@ -690,11 +690,26 @@ class PivotIndexer:
         q_dq = q_li[D:N]      # [N_tail, H, Dh] raw BF16
         w_t = weights[D:N]    # [N_tail, H]
         H, Dh = q_dq.shape[1], q_dq.shape[2]
-        gidx = group_ids.view(-1, 1, 1).expand(N_tail, H, Dh)
-        q_bar = q_dq.new_zeros(P, H, Dh).scatter_add_(0, gidx, q_dq)
+        # Grouped mean proxy. scatter_add_ over the FULL [N_tail, H, Dh]
+        # index materializes the expanded gidx internally -- for a large
+        # prefill tail (N_tail thousands x H*Dh=16384) that is multi-GiB of
+        # index tensor and OOMs next to the resident graph (2026-09-11,
+        # prefill node). Tile over the row axis; scatter_add_ accumulates, so
+        # the tiled result is bit-identical. prefill is always eager, so the
+        # Python loop is free.
+        q_bar = q_dq.new_zeros(P, H, Dh)
+        w_bar = w_t.new_zeros(P, H)
+        _MT = 256
+        for s in range(0, N_tail, _MT):
+            e = min(s + _MT, N_tail)
+            gs = group_ids[s:e]                                  # [tile]
+            q_bar.scatter_add_(0,
+                               gs.view(-1, 1, 1).expand(e - s, H, Dh),
+                               q_dq[s:e])
+            w_bar.scatter_add_(0,
+                               gs.view(-1, 1).expand(e - s, H),
+                               w_t[s:e])
         q_bar = q_bar / group_sizes.view(P, 1, 1)
-        wgidx = group_ids.view(-1, 1).expand(N_tail, H)
-        w_bar = w_t.new_zeros(P, H).scatter_add_(0, wgidx, w_t)
         w_bar = w_bar / group_sizes.view(P, 1)
 
         # ---- coarse screen (proxy domain [0, group_start) per group) -----

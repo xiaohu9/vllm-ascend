@@ -744,10 +744,20 @@ class PivotIndexer:
                 "(VLLM_ASCEND_PIVOT_REFINE_USE_OP=1).")
             # Same caller-side column->position gather as decode: the op
             # emits candidate COLUMN indices, not KV positions.
-            cols = topk_pre.view(N_tail, _REFINE_BUDGET).to(torch.int64)
-            pos = C[req_ids].gather(1, cols.clamp(min=0))  # [N_tail, 2048]
-            topk_pre = torch.where(cols < 0, -1, pos) \
-                .view(N_tail, 1, _REFINE_BUDGET).to(torch.int32)
+            # Map op column indices back to KV positions via the group's
+            # candidate row C[req_ids]. Materializing C[req_ids] at once is
+            # [N_tail, c'] -- for a large prefill tail (N_tail thousands,
+            # c' up to 4096+2g-1) that is hundreds of MiB of intermediate
+            # and OOMs next to the resident graph (same class as the
+            # coarse-screen R*L_max blowup; 2026-09-11 NPU 3/6). Tile the
+            # gather over the row axis; prefill is always eager (never
+            # graph-captured) so the Python loop is free.
+            _GT = 64
+            for s in range(0, N_tail, _GT):
+                e = min(s + _GT, N_tail)
+                col_s = topk_pre[s:e, 0].to(torch.int64)  # [tile, 2048]
+                pos_s = C[req_ids[s:e]].gather(1, col_s.clamp(min=0))  # [tile, 2048]
+                topk_pre[s:e, 0] = torch.where(col_s < 0, -1, pos_s).to(torch.int32)
         else:
             topk_pre = _refine_topk(q_dq, w_t, C, req_ids, kv_cache,
                                     group_bt, block_size, N_tail)

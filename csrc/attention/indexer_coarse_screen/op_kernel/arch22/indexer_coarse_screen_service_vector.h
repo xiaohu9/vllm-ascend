@@ -72,7 +72,8 @@ public:
     __aicore__ inline void InitCoarseGlobalTensor(GlobalTensor<Q_T> queryGm, GlobalTensor<Q_T> callerWeightsGm,
                                                   GlobalTensor<Q_T> rowWeightsGm, GlobalTensor<uint32_t> callerSeqLenGmQ,
                                                   GlobalTensor<uint32_t> aslkGm, GlobalTensor<Q_T> qBarGm,
-                                                  GlobalTensor<Q_T> wBarGm, GlobalTensor<int32_t> proxyCumGm,
+                                                  GlobalTensor<Q_T> wBarGm, GlobalTensor<int32_t> qBarI32Gm,
+                                                  GlobalTensor<int32_t> wBarI32Gm, GlobalTensor<int32_t> proxyCumGm,
                                                   GlobalTensor<int32_t> candidatesWsGm,
                                                   GlobalTensor<int32_t> candidatesOutGm, GlobalTensor<int32_t> aslkOutGm);
     __aicore__ inline void ProcessGroupMean();
@@ -90,6 +91,8 @@ protected:
     GlobalTensor<uint32_t> aslkGm_;      // aslk [R] 粗筛域上界(绝对值)
     GlobalTensor<Q_T> qBarGm_;           // q_bar [R,H,Dh](M1 输出)
     GlobalTensor<Q_T> wBarGm_;           // w_bar [R,H](M1 输出)
+    GlobalTensor<int32_t> qBarI32Gm_;   // q_bar 位视图(debug dump 用)
+    GlobalTensor<int32_t> wBarI32Gm_;   // w_bar 位视图(debug dump 用)
     GlobalTensor<int32_t> proxyCumGm_;  // [1..R](主 pass TND s1 累计)
     GlobalTensor<int32_t> candidatesWsGm_; // 窗口模式主 pass 候选中转 [R,sparseCount]
     GlobalTensor<int32_t> candidatesOutGm_; // 输出 candidates [R,outW]
@@ -483,7 +486,8 @@ template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::InitCoarseGlobalTensor(
     GlobalTensor<Q_T> queryGm, GlobalTensor<Q_T> callerWeightsGm, GlobalTensor<Q_T> rowWeightsGm,
     GlobalTensor<uint32_t> callerSeqLenGmQ, GlobalTensor<uint32_t> aslkGm, GlobalTensor<Q_T> qBarGm,
-    GlobalTensor<Q_T> wBarGm, GlobalTensor<int32_t> proxyCumGm, GlobalTensor<int32_t> candidatesWsGm,
+    GlobalTensor<Q_T> wBarGm, GlobalTensor<int32_t> qBarI32Gm, GlobalTensor<int32_t> wBarI32Gm,
+    GlobalTensor<int32_t> proxyCumGm, GlobalTensor<int32_t> candidatesWsGm,
     GlobalTensor<int32_t> candidatesOutGm, GlobalTensor<int32_t> aslkOutGm)
 {
     queryGm_ = queryGm;
@@ -493,6 +497,8 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::InitCoarseGlobalTe
     aslkGm_ = aslkGm;
     qBarGm_ = qBarGm;
     wBarGm_ = wBarGm;
+    qBarI32Gm_ = qBarI32Gm;
+    wBarI32Gm_ = wBarI32Gm;
     proxyCumGm_ = proxyCumGm;
     candidatesWsGm_ = candidatesWsGm;
     candidatesOutGm_ = candidatesOutGm;
@@ -645,6 +651,31 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
 
     const uint32_t rBegin = static_cast<uint32_t>(GetBlockIdx()) * rowsPerAiv;
     const uint32_t rEnd = IndexerCoarseScreenCommon::Min(rBegin + rowsPerAiv, rowNum);
+    if (static_cast<uint32_t>(constInfo_.hasWindow) == 2U) {
+        // DEBUG dump(has_window=2,位级验收 M1):每行 7 个 int32 写 candidates 行首,
+        // [0..3]=qBar[r] 前 8 个 bf16 位对,[4..5]=wBar[r] 前 4 个 bf16 位对,[6]=proxyCum[r]。
+        // 不产出正常结果;行宽 W 与 hasWindow=1 同式(安全,只写前 7 个)。
+        const uint32_t qRowI32 = (static_cast<uint32_t>(constInfo_.headDim) *
+                                  static_cast<uint32_t>(constInfo_.gSize)) / 2U;
+        const uint32_t hRowI32 = static_cast<uint32_t>(constInfo_.gSize) / 2U;
+        for (uint32_t r = rBegin; r < rEnd; r++) {
+            for (uint32_t j = 0; j < 4; j++) {
+                outI32.SetValue(j, qBarI32Gm_.GetValue(r * qRowI32 + j));
+            }
+            for (uint32_t j = 0; j < 2; j++) {
+                outI32.SetValue(4 + j, wBarI32Gm_.GetValue(r * hRowI32 + j));
+            }
+            outI32.SetValue(6, static_cast<int32_t>(proxyCumGm_.GetValue(r)));
+            SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+            SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+            DataCopyPad(candidatesOutGm_[r * W], outI32, {1, static_cast<uint16_t>(7 * sizeof(int32_t)), 0, 0});
+            auxI32.SetValue(0, static_cast<int32_t>(aslkGm_.GetValue(r)));
+            SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+            DataCopyPad(aslkOutGm_[r], auxI32, {1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0});
+        }
+        SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
+        return;
+    }
     for (uint32_t r = rBegin; r < rEnd; r++) {
         uint32_t upper = aslkGm_.GetValue(r);
         uint32_t cumEnd = callerSeqLenGmQ_.GetValue(r);

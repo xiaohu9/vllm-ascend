@@ -167,8 +167,9 @@ ge::graphStatus IndexerCoarseScreenInfoParser::GetAndCheckAttrParaInfo()
     OP_CHECK_IF((*opParamInfo_.coarseCount % 1024 != 0),
                OP_LOGE(opName_, "coarse_count must be an integer multiple of 1024."),
                return ge::GRAPH_FAILED);
-    OP_CHECK_IF((*opParamInfo_.hasWindow != 0) && (*opParamInfo_.hasWindow != 1),
-               OP_LOGE(opName_, "input attr has_window must be 0 or 1."),
+    // 0=纯粗筛 1=窗口注入(生产) 2=DEBUG dump(M1 位级验收,输出行首 7 个 int32)
+    OP_CHECK_IF((*opParamInfo_.hasWindow < 0) || (*opParamInfo_.hasWindow > 2),
+               OP_LOGE(opName_, "input attr has_window must be 0, 1 or 2."),
                return ge::GRAPH_FAILED);
 
     return ge::GRAPH_SUCCESS;
@@ -416,7 +417,7 @@ ge::graphStatus IndexerCoarseScreenInfoParser::ValidateInputShapesMatch()
                OP_LOGE(opName_, "input query, key shape last dim must be same."), return ge::GRAPH_FAILED);
     // -----------------------check 输出列宽 W'-------------------
     uint32_t outW = *opParamInfo_.coarseCount;
-    if (*opParamInfo_.hasWindow == WINDOW_ON) {
+    if (*opParamInfo_.hasWindow != 0) { // 1 与 2 同宽(2 只写行首 7 词)
         outW = *opParamInfo_.coarseCount + 2 * groupSize_ - 1;
     }
     OP_CHECK_IF((opParamInfo_.candidatesOut.shape->GetStorageShape().GetDim(DIM_IDX_ONE) != outW),
@@ -441,7 +442,7 @@ void IndexerCoarseScreenInfoParser::GenerateInfo(IndexerCoarseScreenTilingInfo &
     liInfo.groupSize = groupSize_; // g
     liInfo.windowG = 2 * groupSize_ - 1;
     liInfo.hasWindow = static_cast<uint32_t>(*opParamInfo_.hasWindow);
-    liInfo.outW = *opParamInfo_.coarseCount + (liInfo.hasWindow ? liInfo.windowG : 0);
+    liInfo.outW = *opParamInfo_.coarseCount + (liInfo.hasWindow != 0 ? liInfo.windowG : 0);
 
     liInfo.inputQType = inputQType_;
     liInfo.inputKType = inputKType_;

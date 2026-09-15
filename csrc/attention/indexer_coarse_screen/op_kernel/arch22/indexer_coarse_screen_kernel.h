@@ -458,11 +458,17 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Init(__gm__ uint8_t *quer
         return (bytes + GM_ALIGN_BYTES - 1) / GM_ALIGN_BYTES * GM_ALIGN_BYTES;
     };
     uint64_t proxyRowSize = constInfo.headDim * constInfo.gSize; // H*Dh
-    qBarGm.SetGlobalBuffer((__gm__ Q_T *)(workspace + offset));
+    __gm__ uint8_t *qBarPtr = workspace + offset;
+    qBarGm.SetGlobalBuffer((__gm__ Q_T *)qBarPtr);
     offset += alignGm(constInfo.batchSize * proxyRowSize * sizeof(Q_T));
     __gm__ uint8_t *wBarPtr = workspace + offset;
     wBarGm.SetGlobalBuffer((__gm__ Q_T *)wBarPtr);
     offset += alignGm(constInfo.batchSize * constInfo.gSize * sizeof(Q_T));
+    // M1 输出的 int32 位视图(debug dump 用,与 Q_T 视图同地址)
+    GlobalTensor<int32_t> qBarI32;
+    qBarI32.SetGlobalBuffer((__gm__ int32_t *)qBarPtr);
+    GlobalTensor<int32_t> wBarI32;
+    wBarI32.SetGlobalBuffer((__gm__ int32_t *)wBarPtr);
     proxyCumGm.SetGlobalBuffer((__gm__ int32_t *)(workspace + offset));
     offset += alignGm(constInfo.batchSize * sizeof(int32_t));
     if (constInfo.hasWindow) {
@@ -479,8 +485,8 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Init(__gm__ uint8_t *quer
         callerWeightsGm.SetGlobalBuffer((__gm__ Q_T *)weights);
         rowWeightsGm.SetGlobalBuffer((__gm__ Q_T *)rowWeights);
         vectorService.InitCoarseGlobalTensor(queryGm, callerWeightsGm, rowWeightsGm, callerSeqLenGmQ,
-                                             actualSeqLengthsGm, qBarGm, wBarGm, proxyCumGm, candidatesWsGm,
-                                             candidatesOutGm, aslkOutGm);
+                                             actualSeqLengthsGm, qBarGm, wBarGm, qBarI32, wBarI32,
+                                             proxyCumGm, candidatesWsGm, candidatesOutGm, aslkOutGm);
         // 主 pass 直写目标:窗口模式先落 workspace(行距 sparseCount),否则直写输出(行距 outW=coarseCount)
         GlobalTensor<int32_t> mainPassOut = constInfo.hasWindow ? candidatesWsGm : candidatesOutGm;
         // 主 pass weights = w_bar(M1 输出);W_T 视图(DT_W_FLAG=true 时为 float)

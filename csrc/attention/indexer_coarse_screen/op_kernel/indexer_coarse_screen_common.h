@@ -115,7 +115,8 @@ struct ConstInfo {
     uint32_t groupSize = 0;     // g(row_weights.shape[1],组内 query 数)
     uint32_t windowG = 0;       // 2g-1(窗口并集最大宽度)
     uint32_t outW = 0;          // 输出列宽(coarseCount + hasWindow*windowG)
-    bool hasWindow = true;      // 1=窗口注入(生产) 0=纯粗筛(transition/debug)
+    uint32_t hasWindow = 1;     // 原值 0/1/2:0=纯粗筛 1=窗口注入 2=DEBUG dump。
+                                 // 必须保留原值(bool 会把 2 折叠成 1,debug dump 判定失效)
 
     uint32_t actualLenQDims = 0U; // query的actualSeqLength 的维度
     uint32_t actualLenDims = 0U;  // KV 的actualSeqLength 的维度

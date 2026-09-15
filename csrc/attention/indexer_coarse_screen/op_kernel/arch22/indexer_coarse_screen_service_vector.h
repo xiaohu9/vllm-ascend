@@ -651,7 +651,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
 
     const uint32_t rBegin = static_cast<uint32_t>(GetBlockIdx()) * rowsPerAiv;
     const uint32_t rEnd = IndexerCoarseScreenCommon::Min(rBegin + rowsPerAiv, rowNum);
-    if (static_cast<uint32_t>(constInfo_.hasWindow) == 2U) {
+    if (constInfo_.hasWindow == 2U) {
         // DEBUG dump(has_window=2,位级验收 M1):每行 7 个 int32 写 candidates 行首,
         // [0..3]=qBar[r] 前 8 个 bf16 位对,[4..5]=wBar[r] 前 4 个 bf16 位对,[6]=proxyCum[r]。
         // 不产出正常结果;行宽 W 与 hasWindow=1 同式(安全,只写前 7 个)。

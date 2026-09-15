@@ -192,7 +192,7 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::InitTilingData(const Inde
     constInfo.groupSize = tilingData->groupSize;
     constInfo.windowG = tilingData->windowG;
     constInfo.outW = tilingData->outW;
-    constInfo.hasWindow = tilingData->hasWindow != 0;
+    constInfo.hasWindow = tilingData->hasWindow; // 原值(0/1/2)直传,bool 折叠会废掉 debug dump
 
     constInfo.outputLayout = LAYOUT_T; // 输出和输入形状一致
     if (LAYOUT_T == LI_LAYOUT::TND) {

@@ -712,8 +712,10 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
                 for (int t = 0; t < 8; t++) {
                     diffSum += mskF32.GetValue(t);
                 }
+                // diffSum = Σ min(|cand-pos|,1) = 不等于 pos 的候选个数;
+                // present(已存在)⇔ 存在相等候选 ⇔ diffSum < validC。
                 // aicore 禁止 float↔unsigned 直转,经 int32 中转
-                if (diffSum > static_cast<float>(static_cast<int32_t>(validC)) - 0.5f) {
+                if (diffSum < static_cast<float>(static_cast<int32_t>(validC)) - 0.5f) {
                     continue; // present:窗口位置已在候选行
                 }
             }

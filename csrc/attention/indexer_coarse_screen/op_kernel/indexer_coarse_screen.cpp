@@ -32,9 +32,15 @@ using namespace LIKernel;
         op.Process();                                                                                                  \
     } while (0)
 
+// 入口形参序必须与 op def 输入序一致(query, weights, row_weights, key, aslq, aslk, block_table,
+// candidates, aslk_out, workspace, tiling)——aclnnInner 按 def 顺序传 GM 指针。
+// NPU 实测教训(2026-09-15):曾按 refine 惯例写成 (query, key, weights, rowWeights, ...),
+// 导致 key/weights/row_weights 三槽错位 —— M1 的 rw 读成 key 字节、主 pass 的 key 读成
+// weights,分数与 query 无关且随分配非确定(A6 位级 dump 定位)。
 template <int DT_Q, int DT_K, int DT_OUT, int PAGE_ATTENTION, int LAYOUT_T, int K_LAYOUT_T, int DT_W_FLAG>
-__global__ __aicore__ void indexer_coarse_screen(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *weights,
-                                                 __gm__ uint8_t *rowWeights, __gm__ uint8_t *actualSeqLengthsQ,
+__global__ __aicore__ void indexer_coarse_screen(__gm__ uint8_t *query, __gm__ uint8_t *weights,
+                                                 __gm__ uint8_t *rowWeights, __gm__ uint8_t *key,
+                                                 __gm__ uint8_t *actualSeqLengthsQ,
                                                  __gm__ uint8_t *actualSeqLengths,
                                                  __gm__ uint8_t *blocktable, __gm__ uint8_t *candidatesOut,
                                                  __gm__ uint8_t *aslkOut,

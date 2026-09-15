@@ -676,6 +676,15 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
                 continue;
             }
             if (validC > 0) {
+                // 两级对齐归并(NPU 实测修复:旧标量树状折叠在 [validC]/[half] 处的
+                // 向量操作偏移仅 4B 粒度,触发 507015 "UB address not aligned"):
+                // 布局 [64 行,cols 列](cols∈{16,32,64},2 的幂),所有向量操作
+                // 偏移 = now*cols*4 ≥ 64B;二级折到 8 元素(偏移 ≥32B)后标量收尾。
+                uint32_t nb = IndexerCoarseScreenCommon::CeilDiv(validC, 64U);
+                uint32_t cols = (nb <= 16) ? 16 : (nb <= 32) ? 32 : 64;
+                // 全区清零再覆写有效段(pad 写避开任意偏移;Sub/Abs/Mins 只写 [0,validC))
+                Duplicate(mskF32, 0.0f, 64 * cols);
+                PipeBarrier<PIPE_V>();
                 Duplicate(posF32, static_cast<float>(pos), validC);
                 PipeBarrier<PIPE_V>();
                 Sub(mskF32, candF32, posF32, validC);
@@ -684,23 +693,25 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
                 PipeBarrier<PIPE_V>();
                 Mins(mskF32, mskF32, 1.0f, validC);
                 PipeBarrier<PIPE_V>();
-                uint32_t p2 = 1;
-                while (p2 < validC) {
-                    p2 <<= 1;
-                }
-                if (p2 > validC) {
-                    Duplicate(mskF32[validC], 0.0f, p2 - validC);
-                    PipeBarrier<PIPE_V>();
-                }
-                uint32_t now = p2;
+                // 一级:64 行按列折叠(in-place 重叠加法同 DoReduce 先例)
+                uint32_t now = 64;
                 while (now > 1) {
-                    uint32_t half = now / 2;
-                    Add(mskF32, mskF32, mskF32[half], half);
+                    now >>= 1;
+                    Add(mskF32, mskF32, mskF32[now * cols], now * cols);
                     PipeBarrier<PIPE_V>();
-                    now = half;
+                }
+                // 二级:cols → 8 元素(偏移 n*4 ≥ 32B)
+                uint32_t n2 = cols;
+                while (n2 > 8) {
+                    n2 >>= 1;
+                    Add(mskF32, mskF32, mskF32[n2], n2);
+                    PipeBarrier<PIPE_V>();
                 }
                 SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
-                float diffSum = mskF32.GetValue(0);
+                float diffSum = 0.0f;
+                for (int t = 0; t < 8; t++) {
+                    diffSum += mskF32.GetValue(t);
+                }
                 // aicore 禁止 float↔unsigned 直转,经 int32 中转
                 if (diffSum > static_cast<float>(static_cast<int32_t>(validC)) - 0.5f) {
                     continue; // present:窗口位置已在候选行

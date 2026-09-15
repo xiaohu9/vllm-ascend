@@ -109,9 +109,8 @@ private:
     TBuf<TPosition::VECCALC> brcBuf_;
     // 窗口阶段独立缓冲(pipe->Reset 后重新申请,先例 = InitLDBuffers)
     TBuf<TPosition::VECCALC> winCandBuf_;    // 候选行 int32 [sparseCount]
-    TBuf<TPosition::VECCALC> winCandF32Buf_; // 候选行 float [sparseCount](判重域)
-    TBuf<TPosition::VECCALC> winPosF32Buf_;  // 广播窗口位置 float
-    TBuf<TPosition::VECCALC> winMskF32Buf_;  // |cand-pos| 截断序列(fold 归并)
+    TBuf<TPosition::VECCALC> winPosBuf_;     // 广播窗口位置 int32(判重)
+    TBuf<TPosition::VECCALC> winMskBuf_;     // (cand-pos)^2 截断序列 int32(fold 归并)
     TBuf<TPosition::VECCALC> winOutBuf_;     // 输出行 int32 [outW]
     TBuf<TPosition::VECCALC> winAuxBuf_;     // [0,64) 窗口新增位置 + [64,...) aslk 行块
 
@@ -631,16 +630,14 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
     const uint32_t aivNum = GetBlockNum() * 2;
     const uint32_t rowsPerAiv = IndexerCoarseScreenCommon::CeilDiv(rowNum, aivNum);
     pipe->InitBuffer(winCandBuf_, c * sizeof(int32_t));
-    pipe->InitBuffer(winCandF32Buf_, cAlign * sizeof(float));
-    pipe->InitBuffer(winPosF32Buf_, cAlign * sizeof(float));
-    pipe->InitBuffer(winMskF32Buf_, cAlign * sizeof(float));
+    pipe->InitBuffer(winPosBuf_, cAlign * sizeof(int32_t));
+    pipe->InitBuffer(winMskBuf_, cAlign * sizeof(int32_t));
     pipe->InitBuffer(winOutBuf_, W * sizeof(int32_t));
     pipe->InitBuffer(winAuxBuf_, (64 + rowsPerAiv) * sizeof(int32_t));
 
     LocalTensor<int32_t> candI32 = winCandBuf_.Get<int32_t>();
-    LocalTensor<float> candF32 = winCandF32Buf_.Get<float>();
-    LocalTensor<float> posF32 = winPosF32Buf_.Get<float>();
-    LocalTensor<float> mskF32 = winMskF32Buf_.Get<float>();
+    LocalTensor<int32_t> posI32 = winPosBuf_.Get<int32_t>();
+    LocalTensor<int32_t> mskI32 = winMskBuf_.Get<int32_t>();
     LocalTensor<int32_t> outI32 = winOutBuf_.Get<int32_t>();
     LocalTensor<int32_t> auxI32 = winAuxBuf_.Get<int32_t>();
 
@@ -659,8 +656,6 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         }
         DataCopy(candI32, candidatesWsGm_[r * c], c);
         PipeBarrier<PIPE_MTE2>();
-        Cast(candF32, candI32, RoundMode::CAST_NONE, c);
-        PipeBarrier<PIPE_V>();
 
         // 窗口收集:win = [winStart, winEnd) 内的有效位置,不在候选行的按升序 append。
         // validC > 0 时先去重:|cand-pos| 截断到 [0,1] 后树状求和,
@@ -676,46 +671,45 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
                 continue;
             }
             if (validC > 0) {
-                // 两级对齐归并(NPU 实测修复:旧标量树状折叠在 [validC]/[half] 处的
-                // 向量操作偏移仅 4B 粒度,触发 507015 "UB address not aligned"):
-                // 布局 [64 行,cols 列](cols∈{16,32,64},2 的幂),所有向量操作
-                // 偏移 = now*cols*4 ≥ 64B;二级折到 8 元素(偏移 ≥32B)后标量收尾。
+                // 全 int32 算术链(NPU 实测修复:float 链 Cast(int→float)+float
+                // Mins 在 dav_c220 上 diffSum 恒 = validC,相等候选永不出 0 → 全误判;
+                // refine scattered-mask 同源教训"dav_c220 float 链不可靠 → 算术替代")。
+                // m_j = min((cand_j - pos)^2, 1):整数精确,t==0⇔相等;t≠0 ⇒ t^2 ≥ 1
+                // (|t| < 8192,int32 平方无溢出)。两级对齐归并布局 [64,cols],
+                // cols∈{16,32,64},向量偏移 now*cols*4 ≥ 64B;二级折到 8 元素标量收尾。
                 uint32_t nb = IndexerCoarseScreenCommon::CeilDiv(validC, 64U);
                 uint32_t cols = (nb <= 16) ? 16 : (nb <= 32) ? 32 : 64;
-                // 全区清零再覆写有效段(pad 写避开任意偏移;Sub/Abs/Mins 只写 [0,validC))
-                Duplicate(mskF32, 0.0f, 64 * cols);
+                Duplicate(mskI32, 0, 64 * cols);
                 PipeBarrier<PIPE_V>();
-                Duplicate(posF32, static_cast<float>(pos), validC);
+                Duplicate(posI32, pos, validC);
                 PipeBarrier<PIPE_V>();
-                Sub(mskF32, candF32, posF32, validC);
+                Sub(mskI32, candI32, posI32, validC);
                 PipeBarrier<PIPE_V>();
-                Abs(mskF32, mskF32, validC);
+                Mul(mskI32, mskI32, mskI32, validC);
                 PipeBarrier<PIPE_V>();
-                Mins(mskF32, mskF32, 1.0f, validC);
+                Mins(mskI32, mskI32, static_cast<int32_t>(1), validC);
                 PipeBarrier<PIPE_V>();
                 // 一级:64 行按列折叠(in-place 重叠加法同 DoReduce 先例)
                 uint32_t now = 64;
                 while (now > 1) {
                     now >>= 1;
-                    Add(mskF32, mskF32, mskF32[now * cols], now * cols);
+                    Add(mskI32, mskI32, mskI32[now * cols], now * cols);
                     PipeBarrier<PIPE_V>();
                 }
                 // 二级:cols → 8 元素(偏移 n*4 ≥ 32B)
                 uint32_t n2 = cols;
                 while (n2 > 8) {
                     n2 >>= 1;
-                    Add(mskF32, mskF32, mskF32[n2], n2);
+                    Add(mskI32, mskI32, mskI32[n2], n2);
                     PipeBarrier<PIPE_V>();
                 }
                 SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
-                float diffSum = 0.0f;
+                int32_t diffSum = 0;
                 for (int t = 0; t < 8; t++) {
-                    diffSum += mskF32.GetValue(t);
+                    diffSum += mskI32.GetValue(t);
                 }
-                // diffSum = Σ min(|cand-pos|,1) = 不等于 pos 的候选个数;
-                // present(已存在)⇔ 存在相等候选 ⇔ diffSum < validC。
-                // aicore 禁止 float↔unsigned 直转,经 int32 中转
-                if (diffSum < static_cast<float>(static_cast<int32_t>(validC)) - 0.5f) {
+                // diffSum = 不等于 pos 的候选个数;present ⇔ 存在相等 ⇔ diffSum < validC(纯整比)
+                if (diffSum < static_cast<int32_t>(validC)) {
                     continue; // present:窗口位置已在候选行
                 }
             }

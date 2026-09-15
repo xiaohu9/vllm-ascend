@@ -722,12 +722,16 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         }
 
         // 组装输出行:[0,c)=候选行原序(含 -1 尾),[validC, validC+nNew)=窗口新增(升序),[c,W)=-1
+        // 管线顺序(NPU 实测修复:UB→UB DataCopy 走 MTE2 管道,与 S 管道补丁、MTE3 落盘
+        // 竞态 → 补丁被覆写/行内容混杂):V 预填 -1 → V_MTE2 → MTE2 直读 GM 候选行进
+        // outI32 → MTE2_V → V_S → S 补丁 → S_MTE3 + V_MTE3 → MTE3 落盘,逐段显式配对。
         Duplicate(outI32, constInfo_.INVALID_IDX, W);
         PipeBarrier<PIPE_V>();
-        DataCopy(outI32, candI32, c);
-        PipeBarrier<PIPE_V>();
+        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+        DataCopy(outI32, candidatesWsGm_[r * c], c);
+        SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+        SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
         if (nNew > 0) {
-            SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
             for (uint32_t k = 0; k < nNew; k++) {
                 outI32.SetValue(validC + k, auxI32.GetValue(k));
             }

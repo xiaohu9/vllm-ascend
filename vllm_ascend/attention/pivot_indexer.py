@@ -356,64 +356,96 @@ class PivotIndexer:
         N_in = q_li.shape[0]
         q_dq = q_li[:D]  # raw BF16 [D, H, Dh] (no hadamard/quant on this path)
 
-        # ---- 1. mean proxy (segment mean over each request's g queries) --
-        H, Dh = q_dq.shape[1], q_dq.shape[2]
-        q_bar = q_dq.view(K, g, H, Dh).mean(dim=1)  # [K, H, Dh]
-        w_bar = weights[:D].view(K, g, H).mean(dim=1)  # [K, H]
-
-        # ---- 2. coarse screen: torch proxy scan, K rows -> 4096 ----------
-        # Done in torch (not the native npu_lightning_indexer) so the
-        # candidate superset is _COARSE_BUDGET (4096, the paper's number)
-        # rather than the native 2048 sparse_count hard limit. Same score
-        # formula (sum_h w_bar * relu(q_bar . k)); the SFA attention kernel
-        # applies causality downstream. The proxy domain is [0, L) -- the
-        # paper (Eq. 5) recalls the pool at the group's FIRST position, so
-        # this step's own g tokens never enter the proxy pool (they are the
-        # worst-represented entries of a mean proxy anyway); the local
-        # window below supplies them to the refine domain instead.
-        # Lossless fast path: if every decode request's prefix length
-        # L = seq_lens - g is within _COARSE_BUDGET, the coarse top-4096 over
-        # [0, L) already covers the whole prefix (top-4096 over < 4096
-        # distinct positions is the whole set), so the proxy bmm + topk are
-        # pure overhead -- build the full-prefix candidate set directly.
-        # Ascending (not score-descending) column order is irrelevant
-        # downstream: the refine op re-sorts by score, so the emitted
-        # topk_indices are bit-identical to the coarse-screened path
-        # (candidate set [0, L+g) unchanged).
-        L = seq_lens[:K].to(torch.int64) - g  # [K] per-request prefix length
-        if int(L.max()) <= _COARSE_BUDGET:
-            col = torch.arange(
-                _COARSE_BUDGET, dtype=torch.int64, device=device)
-            C = torch.where(col[None, :] < L[:, None], col[None, :], -1)
+        if envs.VLLM_ASCEND_PIVOT_COARSE_USE_OP:
+            # ---- 1+2+2b fused coarse screen op (T3, plans/pivot_graph_entry_
+            # design.md §4.3/§8/§9.14) --------------------------------------
+            # npu_indexer_coarse_screen does the group weighted mean proxy
+            # (row_weights all-ones == the torch uniform mean above), the
+            # full-prefix top-_COARSE_BUDGET scan (score formula identical to
+            # _coarse_screen, fp32 accumulation, PA block-table reads) and the
+            # local-window union injection (== _inject_local_window, window
+            # = [aslk-(g-1), aslk+own)) in one kernel. It returns the
+            # compacted candidate rows (int32 LOGICAL positions, -1 tail,
+            # score-descending -- order is irrelevant downstream) plus aslk'
+            # (per-row valid candidate count) that feeds the refine op
+            # directly. The proxy domain is [0, aslk) with aslk = seq_lens-g
+            # (== L, §9.14: the caller passes the coarse-domain upper bound).
+            # Off by default (VLLM_ASCEND_PIVOT_COARSE_USE_OP=0) until the op
+            # passes its NPU probe (P1 gate); the torch reference below stays
+            # the golden for that comparison.
+            C, aslk_op = torch.ops._C_ascend.npu_indexer_coarse_screen(
+                q_dq,
+                weights[:D],
+                torch.ones((K, g), dtype=q_dq.dtype, device=device),
+                kv_cache[2],
+                actual_seq_lengths_query=cum[:K].to(torch.int32),
+                actual_seq_lengths_key=(seq_lens[:K] - g).to(torch.int32),
+                block_table=attn_metadata.block_table[:K],
+                coarse_count=_COARSE_BUDGET,
+                has_window=int(bool(envs.VLLM_ASCEND_PIVOT_LOCAL_WINDOW)),
+            )  # C: [K, W'] int32, aslk_op: [K] int32
+            logger.info_once(
+                "PIVOT coarse: using npu_indexer_coarse_screen op "
+                "(VLLM_ASCEND_PIVOT_COARSE_USE_OP=1).")
         else:
-            C = _coarse_screen(
-                q_bar, w_bar, kv_cache, attn_metadata.block_table[:K],
-                attn_metadata.block_size, seq_lens[:K] - g,
-            )
+            # ---- 1. mean proxy (segment mean over each request's g queries) --
+            H, Dh = q_dq.shape[1], q_dq.shape[2]
+            q_bar = q_dq.view(K, g, H, Dh).mean(dim=1)  # [K, H, Dh]
+            w_bar = weights[:D].view(K, g, H).mean(dim=1)  # [K, H]
 
-        # ---- 2b. per-query local window (paper Appendix B, decode) -------
-        # The paper's decode refine domain is (pool U W_t) per query, with
-        # W_t = [t-W+1, t] and W >= g so the window covers every token
-        # generated within the step. The op's candidate row is shared per
-        # request, so the window enters the row as the GROUP's window union
-        # [L-g+1, L+g) -- deduped against C, appended, C widened (the op
-        # imposes no width bound; workspace scales linearly), then the valid
-        # candidates are COMPACTED to the row front (see _inject_local_window)
-        # so the op's S2 walk [0, aslk) reaches the whole refine domain.
-        # Window entries then COMPETE BY SCORE exactly like pool entries --
-        # the paper's decode semantics, not a forced-in reserve slot. Each
-        # row's causal mask (SFA kernel) trims the union to that row's own
-        # [t-g+1, t]. W = g reproduces the paper's experimental
-        # configuration (w = 4 = g).
-        if envs.VLLM_ASCEND_PIVOT_LOCAL_WINDOW:
-            C, aslk_op = _inject_local_window(
-                C, seq_lens[:K] - g, seq_lens[:K], g)
-        else:
-            # aslk drives the per-request S2 chunk loop over the CANDIDATE
-            # LIST (row width = C.shape[1]). In the truncated region
-            # L+g > 4096 an unclamped aslk makes the kernel read candidate
-            # columns past the row end (garbage/adjacent rows); clamp.
-            aslk_op = torch.clamp(seq_lens[:K], max=C.shape[1])
+            # ---- 2. coarse screen: torch proxy scan, K rows -> 4096 ----------
+            # Done in torch (not the native npu_lightning_indexer) so the
+            # candidate superset is _COARSE_BUDGET (4096, the paper's number)
+            # rather than the native 2048 sparse_count hard limit. Same score
+            # formula (sum_h w_bar * relu(q_bar . k)); the SFA attention kernel
+            # applies causality downstream. The proxy domain is [0, L) -- the
+            # paper (Eq. 5) recalls the pool at the group's FIRST position, so
+            # this step's own g tokens never enter the proxy pool (they are the
+            # worst-represented entries of a mean proxy anyway); the local
+            # window below supplies them to the refine domain instead.
+            # Lossless fast path: if every decode request's prefix length
+            # L = seq_lens - g is within _COARSE_BUDGET, the coarse top-4096 over
+            # [0, L) already covers the whole prefix (top-4096 over < 4096
+            # distinct positions is the whole set), so the proxy bmm + topk are
+            # pure overhead -- build the full-prefix candidate set directly.
+            # Ascending (not score-descending) column order is irrelevant
+            # downstream: the refine op re-sorts by score, so the emitted
+            # topk_indices are bit-identical to the coarse-screened path
+            # (candidate set [0, L+g) unchanged).
+            L = seq_lens[:K].to(torch.int64) - g  # [K] per-request prefix length
+            if int(L.max()) <= _COARSE_BUDGET:
+                col = torch.arange(
+                    _COARSE_BUDGET, dtype=torch.int64, device=device)
+                C = torch.where(col[None, :] < L[:, None], col[None, :], -1)
+            else:
+                C = _coarse_screen(
+                    q_bar, w_bar, kv_cache, attn_metadata.block_table[:K],
+                    attn_metadata.block_size, seq_lens[:K] - g,
+                )
+
+            # ---- 2b. per-query local window (paper Appendix B, decode) -------
+            # The paper's decode refine domain is (pool U W_t) per query, with
+            # W_t = [t-W+1, t] and W >= g so the window covers every token
+            # generated within the step. The op's candidate row is shared per
+            # request, so the window enters the row as the GROUP's window union
+            # [L-g+1, L+g) -- deduped against C, appended, C widened (the op
+            # imposes no width bound; workspace scales linearly), then the valid
+            # candidates are COMPACTED to the row front (see _inject_local_window)
+            # so the op's S2 walk [0, aslk) reaches the whole refine domain.
+            # Window entries then COMPETE BY SCORE exactly like pool entries --
+            # the paper's decode semantics, not a forced-in reserve slot. Each
+            # row's causal mask (SFA kernel) trims the union to that row's own
+            # [t-g+1, t]. W = g reproduces the paper's experimental
+            # configuration (w = 4 = g).
+            if envs.VLLM_ASCEND_PIVOT_LOCAL_WINDOW:
+                C, aslk_op = _inject_local_window(
+                    C, seq_lens[:K] - g, seq_lens[:K], g)
+            else:
+                # aslk drives the per-request S2 chunk loop over the CANDIDATE
+                # LIST (row width = C.shape[1]). In the truncated region
+                # L+g > 4096 an unclamped aslk makes the kernel read candidate
+                # columns past the row end (garbage/adjacent rows); clamp.
+                aslk_op = torch.clamp(seq_lens[:K], max=C.shape[1])
 
         # ---- 3. refine: broadcast C, score, top-k -------------------------
         # Query row -> request id within the decode segment. The decode head
@@ -690,44 +722,66 @@ class PivotIndexer:
         q_dq = q_li[D:N]      # [N_tail, H, Dh] raw BF16
         w_t = weights[D:N]    # [N_tail, H]
         H, Dh = q_dq.shape[1], q_dq.shape[2]
-        # Grouped mean proxy. scatter_add_ over the FULL [N_tail, H, Dh]
-        # index materializes the expanded gidx internally -- for a large
-        # prefill tail (N_tail thousands x H*Dh=16384) that is multi-GiB of
-        # index tensor and OOMs next to the resident graph (2026-09-11,
-        # prefill node). Tile over the row axis; scatter_add_ accumulates, so
-        # the tiled result is bit-identical. prefill is always eager, so the
-        # Python loop is free.
-        q_bar = q_dq.new_zeros(P, H, Dh)
-        w_bar = w_t.new_zeros(P, H)
-        _MT = 256
-        for s in range(0, N_tail, _MT):
-            e = min(s + _MT, N_tail)
-            gs = group_ids[s:e]                                  # [tile]
-            q_bar.scatter_add_(0,
-                               gs.view(-1, 1, 1).expand(e - s, H, Dh),
-                               q_dq[s:e])
-            w_bar.scatter_add_(0,
-                               gs.view(-1, 1).expand(e - s, H),
-                               w_t[s:e])
-        q_bar = q_bar / group_sizes.view(P, 1, 1)
-        w_bar = w_bar / group_sizes.view(P, 1)
-
-        # ---- coarse screen (proxy domain [0, group_start) per group) -----
-        if bool((group_start <= _COARSE_BUDGET).all()):
-            # Lossless fast path: every prefix [0, group_start) fits the
-            # budget, so the whole prefix is the candidate set.
-            col = torch.arange(_COARSE_BUDGET, dtype=torch.int64, device=device)
-            C = torch.where(col[None, :] < group_start[:, None],
-                            col[None, :], -1)
+        if envs.VLLM_ASCEND_PIVOT_COARSE_USE_OP:
+            # ---- 1+2+2b fused coarse screen op (prefill 位置组模式,§9.14) ----
+            # op1 从既有输入推导窗口界(零新增张量):粗筛域 = [0, group_start)
+            # (aslk=group_start,组首位置,含更早组 own tokens 的完整因果域);
+            # win = [group_start-(g-1), group_start+aslq差分)(末组 partial 由
+            # own_tokens 自动 cap),与 torch 分支逐位一致。row_weights 全 1 =
+            # 均匀组均值。输出候选 [P, W'] int32 逻辑位置 + aslk' [P]。
+            C, aslk_op = torch.ops._C_ascend.npu_indexer_coarse_screen(
+                q_dq,
+                w_t,
+                torch.ones((P, g), dtype=q_dq.dtype, device=device),
+                kv_cache[2],
+                actual_seq_lengths_query=aslq_refine.to(torch.int32),
+                actual_seq_lengths_key=group_start.to(torch.int32),
+                block_table=group_bt,
+                coarse_count=_COARSE_BUDGET,
+                has_window=int(bool(envs.VLLM_ASCEND_PIVOT_LOCAL_WINDOW)),
+            )  # C: [P, W'] int32, aslk_op: [P] int32
+            logger.info_once(
+                "PIVOT coarse(prefill): using npu_indexer_coarse_screen op "
+                "(VLLM_ASCEND_PIVOT_COARSE_USE_OP=1).")
         else:
-            C = _coarse_screen(q_bar, w_bar, kv_cache, group_bt,
-                               block_size, group_start)
+            # Grouped mean proxy. scatter_add_ over the FULL [N_tail, H, Dh]
+            # index materializes the expanded gidx internally -- for a large
+            # prefill tail (N_tail thousands x H*Dh=16384) that is multi-GiB of
+            # index tensor and OOMs next to the resident graph (2026-09-11,
+            # prefill node). Tile over the row axis; scatter_add_ accumulates, so
+            # the tiled result is bit-identical. prefill is always eager, so the
+            # Python loop is free.
+            q_bar = q_dq.new_zeros(P, H, Dh)
+            w_bar = w_t.new_zeros(P, H)
+            _MT = 256
+            for s in range(0, N_tail, _MT):
+                e = min(s + _MT, N_tail)
+                gs = group_ids[s:e]                                  # [tile]
+                q_bar.scatter_add_(0,
+                                   gs.view(-1, 1, 1).expand(e - s, H, Dh),
+                                   q_dq[s:e])
+                w_bar.scatter_add_(0,
+                                   gs.view(-1, 1).expand(e - s, H),
+                                   w_t[s:e])
+            q_bar = q_bar / group_sizes.view(P, 1, 1)
+            w_bar = w_bar / group_sizes.view(P, 1)
 
-        # ---- per-query local window (compete-by-score, decode semantics) --
-        if envs.VLLM_ASCEND_PIVOT_LOCAL_WINDOW:
-            C, aslk_op = _inject_local_window(C, group_start, group_end, g)
-        else:
-            aslk_op = torch.clamp(group_end, max=C.shape[1])
+            # ---- coarse screen (proxy domain [0, group_start) per group) -----
+            if bool((group_start <= _COARSE_BUDGET).all()):
+                # Lossless fast path: every prefix [0, group_start) fits the
+                # budget, so the whole prefix is the candidate set.
+                col = torch.arange(_COARSE_BUDGET, dtype=torch.int64, device=device)
+                C = torch.where(col[None, :] < group_start[:, None],
+                                col[None, :], -1)
+            else:
+                C = _coarse_screen(q_bar, w_bar, kv_cache, group_bt,
+                                   block_size, group_start)
+
+            # ---- per-query local window (compete-by-score, decode semantics) --
+            if envs.VLLM_ASCEND_PIVOT_LOCAL_WINDOW:
+                C, aslk_op = _inject_local_window(C, group_start, group_end, g)
+            else:
+                aslk_op = torch.clamp(group_end, max=C.shape[1])
 
         # ---- refine: query row -> group candidate row ---------------------
         req_ids = group_ids  # [N_tail] each row -> its group's candidate row
@@ -880,8 +934,10 @@ def _coarse_screen(
     superset is _COARSE_BUDGET (4096, the paper's number) rather than the
     native 2048 sparse_count hard limit. Score formula matches the native
     fp32 indexer: score[r, p] = sum_h w_bar[r, h] * relu(q_bar[r, h] . k[r, p])
-    over p in [0, seq_lens[r]) (= L + g, the full prefix; causality is left
-    to the SFA attention kernel). NOTE: unlike the native indexer, which
+    over p in [0, seq_lens[r]) where seq_lens is the EXCLUSIVE domain upper
+    bound the caller passes (decode: L = seq_lens_at_indexer - g, the paper's
+    proxy domain excluding this step's own tokens; prefill: group_start).
+    Causality is left to the SFA attention kernel. NOTE: unlike the native indexer, which
     scores each query row independently with that row's own q/w, this
     screen scores a REQUEST-LEVEL mean proxy (q_bar/w_bar averaged over the
     request's g queries -- the PIVOT paper's design) so each request shares

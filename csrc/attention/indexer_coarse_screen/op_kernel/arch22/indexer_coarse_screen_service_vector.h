@@ -535,9 +535,11 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessGroupMean()
         LocalTensor<float> acc = outQueue_.AllocTensor<float>();
         LocalTensor<float> accW = brcBuf_.Get<float>();
         for (uint32_t r = rBegin; r < rEnd; r++) {
-            // row_weights 行(g bf16 不足 32B,DataCopyPad 装载)→ fp32,后续标量读
-            DataCopyPad(rwRow, rowWeightsGm_[r * hSize],
-                        {1, static_cast<uint16_t>(hSize * sizeof(Q_T)), 0, 0}, {false, 0, 0, 0});
+            // row_weights 行(步长 = groupSize,读 g 个;g*2B 不足 32B 用 DataCopyPad)→ fp32,后续标量读。
+            // NPU 实测修复:旧版按 hSize(=H)步长/长度读 [R,g] 张量,r=0 即越界、r>=1 全程
+            // OOB → rw 未定义(0 时 sumRw=0 → q_bar=0/0=NaN,排序乱序丢位)。
+            DataCopyPad(rwRow, rowWeightsGm_[r * constInfo_.groupSize],
+                        {1, static_cast<uint16_t>(constInfo_.groupSize * sizeof(Q_T)), 0, 0}, {false, 0, 0, 0});
             SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
             Cast(rwF32, rwRow, RoundMode::CAST_NONE, hSize);
             PipeBarrier<PIPE_V>();

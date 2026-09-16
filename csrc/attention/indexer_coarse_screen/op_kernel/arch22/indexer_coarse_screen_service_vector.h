@@ -77,6 +77,8 @@ public:
                                                   GlobalTensor<int32_t> candidatesWsGm,
                                                   GlobalTensor<int32_t> candidatesOutGm, GlobalTensor<int32_t> aslkOutGm,
                                                   GlobalTensor<int32_t> dbgMm1);
+    __aicore__ inline void SetDebugGeo(int32_t blkNum, int32_t qbarKb, int32_t wbarKb,
+                                       int32_t mAlign, int32_t s1b, int32_t used);
     __aicore__ inline void ProcessGroupMean();
     __aicore__ inline void ProcessWindow(TPipe *pipe);
 
@@ -118,6 +120,14 @@ private:
     TBuf<TPosition::VECCALC> winMskBuf_;     // (cand-pos)^2 截断序列 int32(fold 归并)
     TBuf<TPosition::VECCALC> winOutBuf_;     // 输出行 int32 [outW]
     TBuf<TPosition::VECCALC> winAuxBuf_;     // [0,64) 窗口新增位置 + [64,...) aslk 行块
+
+    // debug 几何暂存(kernel Init 注入,dump 词 28..33 输出)
+    int32_t dbgBlkNum_ = -1;
+    int32_t dbgQbarKb_ = -1;
+    int32_t dbgWbarKb_ = -1;
+    int32_t dbgMAlign_ = -1;
+    int32_t dbgS1b_ = -1;
+    int32_t dbgUsed_ = -1;
 
     LocalTensor<float> tmpUb_;
     LocalTensor<int32_t> globalTopkIndice_;
@@ -509,6 +519,18 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::InitCoarseGlobalTe
     aslkOutGm_ = aslkOutGm;
 }
 
+template <typename LIT>
+__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::SetDebugGeo(
+    int32_t blkNum, int32_t qbarKb, int32_t wbarKb, int32_t mAlign, int32_t s1b, int32_t used)
+{
+    dbgBlkNum_ = blkNum;
+    dbgQbarKb_ = qbarKb;
+    dbgWbarKb_ = wbarKb;
+    dbgMAlign_ = mAlign;
+    dbgS1b_ = s1b;
+    dbgUsed_ = used;
+}
+
 // --------------------------M1 组均值代理(AIV 全局预阶段)--------------------------
 // q_bar[r] = Σ_{i<own_r} rw[r,i]·query[cum_{r-1}+i] / Σ_{i<own_r} rw[r,i](fp32 累加,一次舍入 bf16)
 // w_bar[r] 同式(caller weights);row_weights 全 1 时 = torch 均匀组均值 mean(1)。
@@ -704,12 +726,19 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
                 for (uint32_t j = 0; j < 8; j++) {
                     outI32.SetValue(20 + j, proxyCumGm_.GetValue(j < rowNum ? j : 0U));
                 }
+                // 词28..33: 几何(GetBlockNum/qBar偏移KB/wBar偏移KB/mBaseAlign/s1Base/usedCoreNum)
+                outI32.SetValue(28, dbgBlkNum_);
+                outI32.SetValue(29, dbgQbarKb_);
+                outI32.SetValue(30, dbgWbarKb_);
+                outI32.SetValue(31, dbgMAlign_);
+                outI32.SetValue(32, dbgS1b_);
+                outI32.SetValue(33, dbgUsed_);
             } else {
                 outI32.SetValue(16, static_cast<int32_t>(0x0BADC0DE));
             }
             SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
             SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-            DataCopyPad(candidatesOutGm_[r * W], outI32, {1, static_cast<uint16_t>(28 * sizeof(int32_t)), 0, 0});
+            DataCopyPad(candidatesOutGm_[r * W], outI32, {1, static_cast<uint16_t>(34 * sizeof(int32_t)), 0, 0});
             auxI32.SetValue(0, static_cast<int32_t>(aslkGm_.GetValue(r)));
             SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
             DataCopyPad(aslkOutGm_[r], auxI32, {1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0});

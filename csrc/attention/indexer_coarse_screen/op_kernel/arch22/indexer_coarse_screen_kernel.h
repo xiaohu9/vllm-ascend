@@ -482,6 +482,14 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Init(__gm__ uint8_t *quer
     blockTableGm.SetGlobalBuffer((__gm__ int32_t *)blockTable);
     if ASCEND_IS_AIV {
         vectorService.InitParams(constInfo, tiling);
+        // debug 几何注入(dump 词28..33):块数/qBar/wBar 相对 workspace 偏移(KB)等
+        uint64_t wsBase = reinterpret_cast<uint64_t>(workspace);
+        vectorService.SetDebugGeo(static_cast<int32_t>(GetBlockNum()),
+                                  static_cast<int32_t>((reinterpret_cast<uint64_t>(qBarPtr) - wsBase) >> 10),
+                                  static_cast<int32_t>((reinterpret_cast<uint64_t>(wBarPtr) - wsBase) >> 10),
+                                  static_cast<int32_t>(constInfo.mBaseSizeAlign),
+                                  static_cast<int32_t>(constInfo.s1BaseSize),
+                                  static_cast<int32_t>(usedCoreNum));
         queryGm.SetGlobalBuffer((__gm__ Q_T *)query);
         callerWeightsGm.SetGlobalBuffer((__gm__ Q_T *)weights);
         rowWeightsGm.SetGlobalBuffer((__gm__ Q_T *)rowWeights);

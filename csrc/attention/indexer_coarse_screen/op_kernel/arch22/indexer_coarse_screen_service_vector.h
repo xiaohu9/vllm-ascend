@@ -365,25 +365,24 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
             AscendC::PipeBarrier<PIPE_ALL>();
 
             LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
-            // over-2K(coarseCount=4096>2048)恒走 SortAll + v11 双累积 2-list MergeSort:
-            //   旧单次 4096 归并 mrgDstNum>3072 进 MergeSort 3-segment 分支(4 路 MrgSort),
-            //   该分支 ~50% 数据相关单相邻 swap(over2k/prod_wide NPU 实证);2-list 分支
-            //   全用例 100% 可靠(indexer_refine v11,2026-08-31 NPU 终验 17/17)。
-            //   双累积: acc_U(排名1-2048)+acc_L(排名2049-4096),每 chunk SortAll(512) 后
-            //   两次 mrgDstNum=2048 的归并,输出 = acc_U+acc_L 拼接 == top-4096。
+            // over-2K(coarseCount=4096>2048)恒走 SortAll + 原生单次 MergeSort(virTopK):
+            //   原生 lightning_indexer 生产同款(2026-09-16 起,替换 v11 双累积 —— 该形态
+            //   从未 NPU 验证且多 chunk 实测 fault,详见分支内注释)。
             if (info.actS1Size > 4 || constInfo_.isSparseCountOver2K) {
                 // info.actS1Size > 4 则单个vector核内处理的 s1>2，缓存方案无法处理
                 if (constInfo_.isSparseCountOver2K) {
-                    SortAll(reduceOutBuff, tmpSortBuf, cuS2LenVecAlign); // 恢复整块 512 排序(probe prod 同款, 实证可靠)
+                    // 2026-09-16 对齐原生生产形态:单次 MergeSort(mrgDstNum=virTopK)。
+                    //   v11 双累积(2×2048)源于当年"3-segment 腐蚀"假设 —— 已被证伪(实为
+                    //   tie 误判,见 indexer-refine-tie-root-cause 记忆),该形态仅 CPU 仿真背书、
+                    //   从未 NPU 验证(refine 的 17/17 全部 sparseCount=2048 非 over-2K);本算子
+                    //   NPU 实测多 chunk(aslk>512)在 v11 路径 aicore MTE fault(A7/A8/A9 复现,
+                    //   单 chunk 全过)。原生 lightning_indexer 的 over-2K 即单次归并(生产代码):
+                    //   SortAll(chunk) + MergeSort(acc, virTopK, chunk, len, tmpUb_)。
+                    SortAll(reduceOutBuff, tmpSortBuf, cuS2LenVecAlign);
                     PipeBarrier<PIPE_V>();
-                    IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK / 2,
-                                            reduceOutBuff, cuS2LenVecAlign, tmpUb_);
-                    // 2026-09-01 aarch64 原生工具链(严格模式)拒收 LocalTensor::operator[] 临时量作
-                    //   非 const 左值引用形参(mrgSrc/tmpTensor): 先提命名变量。
-                    LocalTensor<float> ubTail = tmpUb_[virTopK];
-                    LocalTensor<float> ubScratch = tmpUb_[virTopK + 2 * cuS2LenVecAlign];
-                    IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2 + virTopK], virTopK / 2,
-                                            ubTail, cuS2LenVecAlign, ubScratch);
+                    LocalTensor<float> ubTmpSort = tmpUb_;
+                    IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK,
+                                            reduceOutBuff, cuS2LenVecAlign, ubTmpSort);
                 } else if (cuS2LenVecAlign == s2BaseSize_) {
                     IndexerCoarseScreenServiceVec::SortAll(reduceOutBuff, tmpSortBuf, cuS2LenVecAlign);
                     PipeBarrier<PIPE_V>();

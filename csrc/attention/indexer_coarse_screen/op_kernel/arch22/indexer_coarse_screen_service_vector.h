@@ -685,9 +685,11 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
             outI32.SetValue(11, bfPair(queryGm_.GetValue((cumB + 1) * qRowI32 * 2),
                                        queryGm_.GetValue((cumB + 1) * qRowI32 * 2 + 1)));
             outI32.SetValue(12, static_cast<int32_t>(aslkGm_.GetValue(r)));
-            // 词13/14: aslq 回显(own, cumBegin)——直接暴露 M1 读到的组跨度
-            outI32.SetValue(13, static_cast<int32_t>(own));
-            outI32.SetValue(14, static_cast<int32_t>(cumBegin));
+            // 词13/14: aslq 回显(own, cumBegin)——直接暴露 M1 读到的组跨度(就地重算,勿引用下方循环变量)
+            uint32_t cumEndEcho = callerSeqLenGmQ_.GetValue(r);
+            uint32_t cumBeginEcho = (r == 0) ? 0U : callerSeqLenGmQ_.GetValue(r - 1);
+            outI32.SetValue(13, static_cast<int32_t>(cumEndEcho - cumBeginEcho));
+            outI32.SetValue(14, static_cast<int32_t>(cumBeginEcho));
             outI32.SetValue(15, static_cast<int32_t>(0xDEADBEEF));
             SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
             SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);

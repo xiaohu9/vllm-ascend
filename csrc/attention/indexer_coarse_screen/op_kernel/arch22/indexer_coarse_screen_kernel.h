@@ -638,9 +638,15 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Process()
         // M1 组均值代理(全局预阶段):q_bar/w_bar/proxyCum 就绪后放行 AIC
         vectorService.ProcessGroupMean();
     }
-    ProcessMain();
-    if ASCEND_IS_AIV {
-        // M2.5 窗口注入(全局后阶段,hasWindow 门控)
+    // 阶段门控调试:hasWindow==3 只跑 M1+dump(主 pass/窗口全跳,须双核同步跳过防
+    // 种子 flag 悬空);==4 跑 M1+主 pass+dump(跳窗口)。用于多 chunk fault 的阶段二分。
+    if (constInfo.hasWindow != 3U) {
+        ProcessMain();
+    } else if (ASCEND_IS_AIC) {
+        return; // 无主 pass 时 AIC 无事可做,直接退出(不参与任何同步)
+    }
+    if (ASCEND_IS_AIV) {
+        // M2.5 窗口注入(全局后阶段,hasWindow>=2 走 dump/窗口)
         vectorService.ProcessWindow(pipe);
     }
 }

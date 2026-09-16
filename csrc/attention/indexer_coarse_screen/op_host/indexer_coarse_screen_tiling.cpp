@@ -167,9 +167,9 @@ ge::graphStatus IndexerCoarseScreenInfoParser::GetAndCheckAttrParaInfo()
     OP_CHECK_IF((*opParamInfo_.coarseCount % 1024 != 0),
                OP_LOGE(opName_, "coarse_count must be an integer multiple of 1024."),
                return ge::GRAPH_FAILED);
-    // 0=纯粗筛 1=窗口注入(生产) 2=DEBUG dump(M1 位级验收,输出行首 7 个 int32)
-    OP_CHECK_IF((*opParamInfo_.hasWindow < 0) || (*opParamInfo_.hasWindow > 2),
-               OP_LOGE(opName_, "input attr has_window must be 0, 1 or 2."),
+    // 0=纯粗筛 1=窗口注入(生产) 2=dump 3=仅M1+dump(阶段二分) 4=M1+主pass+dump
+    OP_CHECK_IF((*opParamInfo_.hasWindow < 0) || (*opParamInfo_.hasWindow > 4),
+               OP_LOGE(opName_, "input attr has_window must be 0..4."),
                return ge::GRAPH_FAILED);
 
     return ge::GRAPH_SUCCESS;

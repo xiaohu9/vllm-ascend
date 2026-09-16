@@ -370,6 +370,7 @@ __aicore__ void inline IndexerCoarseScreenKernel<LIT>::SplitCore(uint32_t curCor
                                : s2Idx + coreDealBlockCnt - lastGS1RemainBlockCnt - 1;
 
                     if (coreIdx == curCoreIdx) {
+                        info.isEmptyRange = false; // 拥有任务段的核
                         // LD 跨核归并已裁剪:coarse_count 强制 >2048(over-2K),
                         // over-2K 恒整请求单核(s2End = s2BaseNum-1),无跨核续核需要归并
                         // 最后一个核处理的不是最后一个Batch，表明后面的Batch为空块(S2=0), 调整终点坐标以便清理输出
@@ -685,7 +686,8 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessMain()
 
     IndexerCoarseScreenCommon::RunInfo runInfo;
     uint32_t gloop = 0;
-    for (uint32_t bN2LoopIdx = splitCoreInfo.bN2Start; bN2LoopIdx <= splitCoreInfo.bN2End; bN2LoopIdx++) {
+    for (uint32_t bN2LoopIdx = splitCoreInfo.isEmptyRange ? 1U : splitCoreInfo.bN2Start;
+         !splitCoreInfo.isEmptyRange && bN2LoopIdx <= splitCoreInfo.bN2End; bN2LoopIdx++) {
         CalcGS1LoopParams(bN2LoopIdx);
         if (tempLoopInfo.curActSeqLenIsZero) {
             DealActSeqLenIsZero(tempLoopInfo.bIdx, tempLoopInfo.n2Idx, 0U);

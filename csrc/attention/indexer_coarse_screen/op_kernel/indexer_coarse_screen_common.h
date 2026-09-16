@@ -134,7 +134,10 @@ struct SplitCoreInfo {
     uint32_t bN2End = 0U;
     uint32_t gS1Start = 0U;
     uint32_t gS1End = 0U;
-    bool isCoreEnable = false;
+    // 冗余核(任务数 < 核数时,SplitCore 未为 curCoreIdx 返回范围)——默认 {0..0} 会让它
+    // 重复处理请求 0;本算子 over-2K 下每请求恒整核单段,冗余处理纯属浪费且是 fault/
+    // 串扰来源(NPU 实测 fault 恒落在冗余核)。置空范围:核内 flag 配平保留,数据通路跳过。
+    bool isEmptyRange = true;
 };
 
 template <typename T>

@@ -652,23 +652,45 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
     const uint32_t rBegin = static_cast<uint32_t>(GetBlockIdx()) * rowsPerAiv;
     const uint32_t rEnd = IndexerCoarseScreenCommon::Min(rBegin + rowsPerAiv, rowNum);
     if (constInfo_.hasWindow == 2U) {
-        // DEBUG dump(has_window=2,位级验收 M1):每行 7 个 int32 写 candidates 行首,
-        // [0..3]=qBar[r] 前 8 个 bf16 位对,[4..5]=wBar[r] 前 4 个 bf16 位对,[6]=proxyCum[r]。
-        // 不产出正常结果;行宽 W 与 hasWindow=1 同式(安全,只写前 7 个)。
+        // DEBUG dump(has_window=2,16 词/行,一次拿全地层真相):
+        //  [0..3] qBar 采样(+0/+1/+1024/+2047)  [4..5] wBar(+0/+15)  [6] proxyCum
+        //  [7..8] row_weights 输入位(r 行 4 个 bf16,全 1 应=0x3F803F80 —— 槽位映射直接验证)
+        //  [9] callerWeights 输入位(组首行前 2 bf16)  [10..11] query 输入位(组行 0/1 首 2 bf16)
+        //  [12] aslk 回显  [13] row_weights[0] 全局  [14] callerWeights[0] 全局  [15] 0xDEADBEEF
         const uint32_t qRowI32 = (static_cast<uint32_t>(constInfo_.headDim) *
                                   static_cast<uint32_t>(constInfo_.gSize)) / 2U;
         const uint32_t hRowI32 = static_cast<uint32_t>(constInfo_.gSize) / 2U;
+        auto bfPair = [](Q_T t0, Q_T t1) -> int32_t {
+            uint16_t a = *reinterpret_cast<uint16_t *>(&t0);
+            uint16_t b = *reinterpret_cast<uint16_t *>(&t1);
+            return static_cast<int32_t>((static_cast<uint32_t>(b) << 16) | static_cast<uint32_t>(a));
+        };
+        const uint32_t gSz = constInfo_.groupSize;
+        const uint32_t hSz = static_cast<uint32_t>(constInfo_.gSize);
         for (uint32_t r = rBegin; r < rEnd; r++) {
-            for (uint32_t j = 0; j < 4; j++) {
-                outI32.SetValue(j, qBarI32Gm_.GetValue(r * qRowI32 + j));
-            }
-            for (uint32_t j = 0; j < 2; j++) {
-                outI32.SetValue(4 + j, wBarI32Gm_.GetValue(r * hRowI32 + j));
-            }
+            outI32.SetValue(0, qBarI32Gm_.GetValue(r * qRowI32));
+            outI32.SetValue(1, qBarI32Gm_.GetValue(r * qRowI32 + 1));
+            outI32.SetValue(2, qBarI32Gm_.GetValue(r * qRowI32 + 1024));
+            outI32.SetValue(3, qBarI32Gm_.GetValue(r * qRowI32 + qRowI32 - 1));
+            outI32.SetValue(4, wBarI32Gm_.GetValue(r * hRowI32));
+            outI32.SetValue(5, wBarI32Gm_.GetValue(r * hRowI32 + hRowI32 - 1));
             outI32.SetValue(6, static_cast<int32_t>(proxyCumGm_.GetValue(r)));
+            outI32.SetValue(7, bfPair(rowWeightsGm_.GetValue(r * gSz), rowWeightsGm_.GetValue(r * gSz + 1)));
+            outI32.SetValue(8, bfPair(rowWeightsGm_.GetValue(r * gSz + 2), rowWeightsGm_.GetValue(r * gSz + 3)));
+            uint32_t cumB = (r == 0) ? 0U : callerSeqLenGmQ_.GetValue(r - 1);
+            outI32.SetValue(9, bfPair(callerWeightsGm_.GetValue(cumB * hSz),
+                                      callerWeightsGm_.GetValue(cumB * hSz + 1)));
+            outI32.SetValue(10, bfPair(queryGm_.GetValue(cumB * qRowI32 * 2),
+                                       queryGm_.GetValue(cumB * qRowI32 * 2 + 1)));
+            outI32.SetValue(11, bfPair(queryGm_.GetValue((cumB + 1) * qRowI32 * 2),
+                                       queryGm_.GetValue((cumB + 1) * qRowI32 * 2 + 1)));
+            outI32.SetValue(12, static_cast<int32_t>(aslkGm_.GetValue(r)));
+            outI32.SetValue(13, bfPair(rowWeightsGm_.GetValue(0), rowWeightsGm_.GetValue(1)));
+            outI32.SetValue(14, bfPair(callerWeightsGm_.GetValue(0), callerWeightsGm_.GetValue(1)));
+            outI32.SetValue(15, static_cast<int32_t>(0xDEADBEEF));
             SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
             SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-            DataCopyPad(candidatesOutGm_[r * W], outI32, {1, static_cast<uint16_t>(7 * sizeof(int32_t)), 0, 0});
+            DataCopyPad(candidatesOutGm_[r * W], outI32, {1, static_cast<uint16_t>(16 * sizeof(int32_t)), 0, 0});
             auxI32.SetValue(0, static_cast<int32_t>(aslkGm_.GetValue(r)));
             SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
             DataCopyPad(aslkOutGm_[r], auxI32, {1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0});

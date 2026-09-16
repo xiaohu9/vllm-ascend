@@ -701,12 +701,21 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         const uint32_t gSz = constInfo_.groupSize;
         const uint32_t hSz = static_cast<uint32_t>(constInfo_.gSize);
         for (uint32_t r = rBegin; r < rEnd; r++) {
-            outI32.SetValue(0, qBarI32Gm_.GetValue(r * qRowI32));
-            outI32.SetValue(1, qBarI32Gm_.GetValue(r * qRowI32 + 1));
-            outI32.SetValue(2, qBarI32Gm_.GetValue(r * qRowI32 + 1024));
-            outI32.SetValue(3, qBarI32Gm_.GetValue(r * qRowI32 + qRowI32 - 1));
-            outI32.SetValue(4, wBarI32Gm_.GetValue(r * hRowI32));
-            outI32.SetValue(5, wBarI32Gm_.GetValue(r * hRowI32 + hRowI32 - 1));
+            // 2026-09-16 dump 读取改用已验证模式:输入回显(bfPair+GetValue)每轮全对,
+            // 而 int32 视图读同一 GM 却与 AIC 实读(mm1 已逐位正确)矛盾 ⇒ 视图不可靠。
+            // qBar/wBar 一律经 Q_T 标量读 + 位对打包(与 q0/calW/rowW 同款)。
+            outI32.SetValue(0, bfPair(qBarGm_.GetValue(r * qRowI32 * 2),
+                                      qBarGm_.GetValue(r * qRowI32 * 2 + 1)));
+            outI32.SetValue(1, bfPair(qBarGm_.GetValue(r * qRowI32 * 2 + 2),
+                                      qBarGm_.GetValue(r * qRowI32 * 2 + 3)));
+            outI32.SetValue(2, bfPair(qBarGm_.GetValue(r * qRowI32 * 2 + 2048),
+                                      qBarGm_.GetValue(r * qRowI32 * 2 + 2049)));
+            outI32.SetValue(3, bfPair(qBarGm_.GetValue((r + 1) * qRowI32 * 2 - 2),
+                                      qBarGm_.GetValue((r + 1) * qRowI32 * 2 - 1)));
+            outI32.SetValue(4, bfPair(wBarGm_.GetValue(r * hSz),
+                                      wBarGm_.GetValue(r * hSz + 1)));
+            outI32.SetValue(5, bfPair(wBarGm_.GetValue((r + 1) * hSz - 2),
+                                      wBarGm_.GetValue((r + 1) * hSz - 1)));
             outI32.SetValue(6, static_cast<int32_t>(proxyCumGm_.GetValue(r)));
             outI32.SetValue(7, bfPair(rowWeightsGm_.GetValue(r * gSz), rowWeightsGm_.GetValue(r * gSz + 1)));
             outI32.SetValue(8, bfPair(rowWeightsGm_.GetValue(r * gSz + 2), rowWeightsGm_.GetValue(r * gSz + 3)));
@@ -728,7 +737,8 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
             //   直接暴露 AIC 读到的 qBar);词20..27: proxyCum[0..7] 全量(M1 写入完整性)
             if (r == rBegin) {
                 for (uint32_t j = 0; j < 4; j++) {
-                    outI32.SetValue(16 + j, dbgMm1Gm_.GetValue(j));
+                    float v = mm1ResGm.GetValue(j);
+                    outI32.SetValue(16 + j, *reinterpret_cast<int32_t *>(&v));
                 }
                 for (uint32_t j = 0; j < 8; j++) {
                     outI32.SetValue(20 + j, proxyCumGm_.GetValue(j < rowNum ? j : 0U));

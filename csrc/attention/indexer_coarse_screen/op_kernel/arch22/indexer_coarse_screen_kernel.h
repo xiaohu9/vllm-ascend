@@ -691,11 +691,14 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessMain()
     }
 
     if ASCEND_IS_AIV {
-        // M1 已在 ProcessGroupMean 完成并 SyncAll;此处预置 syncV1C1×2 种子 flag(MTE2),
-        // 供 AIC 首两轮 matmul 的 CrossCoreWaitFlag 打破流水线首轮依赖。
+        // M1 已在 ProcessGroupMean 完成并 SyncAll;此处预置 syncV1C1×2 种子 flag。
+        // 2026-09-16:种子管道由 MTE2 改绑 MTE3 —— qBar/wBar 落地走 MTE3 管道,
+        // MTE2 语义种子(原生无 M1 的写法)不等 MTE3 队列,rows≥1 的 M1 写出
+        // 相对 AIC 首轮读取存在窗口(NPU 实测 rows≥1 间歇坏、row 0 恒好);
+        // MTE3 语义种子保证 flag 置位时 qBar 已在 GM。
         vectorService.AllocEventID();
-        CrossCoreSetFlag<IndexerCoarseScreenCommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
-        CrossCoreSetFlag<IndexerCoarseScreenCommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
+        CrossCoreSetFlag<IndexerCoarseScreenCommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(constInfo.syncV1C1);
+        CrossCoreSetFlag<IndexerCoarseScreenCommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(constInfo.syncV1C1);
     } else {
         matmulService.AllocEventID();
     }

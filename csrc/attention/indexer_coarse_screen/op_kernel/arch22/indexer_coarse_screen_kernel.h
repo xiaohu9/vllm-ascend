@@ -642,10 +642,12 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Process()
     // 种子 flag 悬空);==4 跑 M1+主 pass+dump(跳窗口)。用于多 chunk fault 的阶段二分。
     if (constInfo.hasWindow != 3U) {
         ProcessMain();
-    } else if (ASCEND_IS_AIC) {
-        return; // 无主 pass 时 AIC 无事可做,直接退出(不参与任何同步)
+    } else {
+        if ASCEND_IS_AIC {
+            return; // 无主 pass 时 AIC 无事可做,直接退出(不参与任何同步)
+        }
     }
-    if (ASCEND_IS_AIV) {
+    if ASCEND_IS_AIV {
         // M2.5 窗口注入(全局后阶段,hasWindow>=2 走 dump/窗口)
         vectorService.ProcessWindow(pipe);
     }

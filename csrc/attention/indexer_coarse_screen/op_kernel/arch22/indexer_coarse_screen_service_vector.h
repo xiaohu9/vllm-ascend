@@ -539,6 +539,10 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::SetDebugGeo(
 template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessGroupMean()
 {
+    // 2026-09-16 重写:NPU 实测旧版(A10 纯 M1 隔离验证)qBar 输出为相邻元素混合体——
+    // 唯一非仓库惯例的用法是把 VECOUT 队列张量(outQueue_.AllocTensor)当纯 V 计算草稿
+    // (仓库先例一律 Alloc→EnQue→DeQue→MTE3→Free)。本版:全部走专用 VECCALC TBuf,
+    // 布局宽松无共享视图,事件链规范(MTE2_V / V_S / V_MTE3 / MTE3_MTE2 逐段)。
     const uint32_t qRowSize = static_cast<uint32_t>(constInfo_.headDim * constInfo_.gSize); // H*Dh
     const uint32_t hSize = static_cast<uint32_t>(constInfo_.gSize);
     const uint32_t rowNum = static_cast<uint32_t>(constInfo_.batchSize);
@@ -548,7 +552,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessGroupMean()
     const uint32_t rEnd = IndexerCoarseScreenCommon::Min(rBegin + rowsPerAiv, rowNum);
 
     if (rBegin < rEnd) {
-        // proxyCum:主 pass TND s1 累计 = [1..R];tmpUb 复用段,写完等 MTE3 读完成再让位 MTE2
+        // proxyCum:[1..R](主 pass TND s1 累计)。tmpUb 复用段,词 13/14 调试回显同源。
         LocalTensor<int32_t> cumRow = tmpUb_.template ReinterpretCast<int32_t>();
         ArithProgression<int32_t>(cumRow, static_cast<int32_t>(rBegin) + 1, 1, rEnd - rBegin);
         PipeBarrier<PIPE_V>();
@@ -557,87 +561,91 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessGroupMean()
                     {1, static_cast<uint16_t>((rEnd - rBegin) * sizeof(int32_t)), 0, 0});
         SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
 
-        // UB 复用布局(H=64 时 68KB 内): rowQ bf16 [0,16KB) | rowF32 f32 [16KB,48KB)
-        //   | rwF32 [48KB,+256B) | rwRow bf16 [+256B,+288B)
-        LocalTensor<Q_T> rowQ = tmpUb_.template ReinterpretCast<Q_T>();
-        LocalTensor<float> rowF32 = tmpUb_[qRowSize];
-        LocalTensor<float> rwF32 = tmpUb_[2 * qRowSize];
-        LocalTensor<Q_T> rwRow = tmpUb_.template ReinterpretCast<Q_T>()[4 * qRowSize + 2 * hSize];
-        LocalTensor<float> acc = outQueue_.AllocTensor<float>();
-        LocalTensor<float> accW = brcBuf_.Get<float>();
+        // UB 布局(全 fp32 视图,元素粒度,零重叠):
+        //   [0, qRowSize)                 qInF32    当前 query 行(fp32)
+        //   [qRowSize, 2*qRowSize)        accQ      q_bar 累加器
+        //   [2*qRowSize, 2*qRowSize+N]    divF32    除数广播
+        //   [2*qRowSize+N, +2N+64)        rwF32/杂  row_weights → fp32 + 标量读区
+        //   bf16 暂存(ReinterpretCast 到后半区,与上面 fp32 区隔离):
+        //   [4*qRowSize, 4*qRowSize+N*H)  原始 bf16 暂存(query/weights/rw 共用,逐段即时)
+        LocalTensor<float> qInF32 = tmpUb_;
+        LocalTensor<float> accQ = tmpUb_[qRowSize];
+        LocalTensor<float> divF32 = tmpUb_[2 * qRowSize];
+        LocalTensor<float> miscF32 = tmpUb_[2 * qRowSize + 1024];
+        // bf16 暂存:字节偏移 3*qRowSize*4(fp32 三段之后),长 8KB,总占用 < tmpBuf_ 68KB ✓
+        LocalTensor<Q_T> bfStash =
+            tmpUb_.template ReinterpretCast<Q_T>()[(3 * qRowSize * sizeof(float)) / sizeof(Q_T)];
+
         for (uint32_t r = rBegin; r < rEnd; r++) {
-            // row_weights 行(步长 = groupSize,读 g 个;g*2B 不足 32B 用 DataCopyPad)→ fp32,后续标量读。
-            // NPU 实测修复:旧版按 hSize(=H)步长/长度读 [R,g] 张量,r=0 即越界、r>=1 全程
-            // OOB → rw 未定义(0 时 sumRw=0 → q_bar=0/0=NaN,排序乱序丢位)。
-            DataCopyPad(rwRow, rowWeightsGm_[r * constInfo_.groupSize],
-                        {1, static_cast<uint16_t>(constInfo_.groupSize * sizeof(Q_T)), 0, 0}, {false, 0, 0, 0});
+            // row_weights 行(g 个 bf16,DataCopyPad 不足 32B 装载)→ fp32 → 标量读
+            DataCopyPad(bfStash, rowWeightsGm_[r * constInfo_.groupSize],
+                        {1, static_cast<uint16_t>(constInfo_.groupSize * sizeof(Q_T)), 0, 0},
+                        {false, 0, 0, 0});
             SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
-            Cast(rwF32, rwRow, RoundMode::CAST_NONE, hSize);
+            Cast(miscF32, bfStash, RoundMode::CAST_NONE, constInfo_.groupSize);
             PipeBarrier<PIPE_V>();
             SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
 
             uint32_t cumEnd = callerSeqLenGmQ_.GetValue(r);
             uint32_t cumBegin = (r == 0) ? 0U : callerSeqLenGmQ_.GetValue(r - 1);
             uint32_t own = cumEnd - cumBegin;
-            float sumRw = 0.0f;
-            Duplicate(acc, 0.0f, qRowSize);
-            PipeBarrier<PIPE_V>();
-            for (uint32_t i = 0; i < own; i++) {
-                float rw = rwF32.GetValue(i);
-                sumRw += rw;
-                DataCopy(rowQ, queryGm_[(cumBegin + i) * qRowSize], qRowSize);
-                SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
-                Cast(rowF32, rowQ, RoundMode::CAST_NONE, qRowSize);
-                PipeBarrier<PIPE_V>();
-                Muls(rowF32, rowF32, rw, qRowSize);
-                PipeBarrier<PIPE_V>();
-                Add(acc, acc, rowF32, qRowSize);
-                PipeBarrier<PIPE_V>();
-            }
-            if (own > 0) {
-                Duplicate(rowF32, sumRw, qRowSize);
-                PipeBarrier<PIPE_V>();
-                Div(acc, acc, rowF32, qRowSize);
-                PipeBarrier<PIPE_V>();
-            }
-            Cast(rowQ, acc, RoundMode::CAST_RINT, qRowSize);
-            PipeBarrier<PIPE_V>();
-            SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-            DataCopy(qBarGm_[r * qRowSize], rowQ, qRowSize);
 
-            // w_bar(组内 weights 行同权加权)
-            float sumW = 0.0f;
-            Duplicate(accW, 0.0f, hSize);
+            // ---- q_bar:Σ rw_i·q_i / Σ rw_i(fp32 累加)----
+            Duplicate(accQ, 0.0f, qRowSize);
             PipeBarrier<PIPE_V>();
+            float sumRw = 0.0f;
             for (uint32_t i = 0; i < own; i++) {
-                float rw = rwF32.GetValue(i);
-                sumW += rw;
-                DataCopy(rowQ, callerWeightsGm_[(cumBegin + i) * hSize], hSize);
+                float rw = miscF32.GetValue(i);
+                sumRw += rw;
+                DataCopy(bfStash, queryGm_[(cumBegin + i) * qRowSize], qRowSize);
                 SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
-                Cast(rowF32, rowQ, RoundMode::CAST_NONE, hSize);
+                Cast(qInF32, bfStash, RoundMode::CAST_NONE, qRowSize);
                 PipeBarrier<PIPE_V>();
-                Muls(rowF32, rowF32, rw, hSize);
+                Muls(qInF32, qInF32, rw, qRowSize);
                 PipeBarrier<PIPE_V>();
-                Add(accW, accW, rowF32, hSize);
-                PipeBarrier<PIPE_V>();
-            }
-            if (own > 0) {
-                Duplicate(rowF32, sumW, hSize);
-                PipeBarrier<PIPE_V>();
-                Div(accW, accW, rowF32, hSize);
+                Add(accQ, accQ, qInF32, qRowSize);
                 PipeBarrier<PIPE_V>();
             }
-            Cast(rowQ, accW, RoundMode::CAST_RINT, hSize);
+            if (sumRw != 0.0f) {
+                Duplicate(divF32, sumRw, qRowSize);
+                PipeBarrier<PIPE_V>();
+                Div(accQ, accQ, divF32, qRowSize);
+                PipeBarrier<PIPE_V>();
+            }
+            Cast(bfStash, accQ, RoundMode::CAST_RINT, qRowSize);
             PipeBarrier<PIPE_V>();
             SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-            DataCopy(wBarGm_[r * hSize], rowQ, hSize);
-            // WAR 防护(先例 refine_service_vector:806 MTE3_V 同类):上面对 rowQ 的 MTE3 读
-            // (qBar/wBar store)与下一轮 DataCopy(rowQ/rwRow, GM→UB) 的 MTE2 复写之间,
-            // 必须等 MTE3 读完成;V(Cast 对 rwRow/rwF32 的读)与下轮 MTE2 复写同理。
+            DataCopy(qBarGm_[r * qRowSize], bfStash, qRowSize);
             SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
-            SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+
+            // ---- w_bar(同式,weights [N,H])----
+            Duplicate(accQ, 0.0f, hSize);
+            PipeBarrier<PIPE_V>();
+            float sumW = 0.0f;
+            for (uint32_t i = 0; i < own; i++) {
+                float rw = miscF32.GetValue(i);
+                sumW += rw;
+                DataCopy(bfStash, callerWeightsGm_[(cumBegin + i) * hSize], hSize);
+                SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+                Cast(qInF32, bfStash, RoundMode::CAST_NONE, hSize);
+                PipeBarrier<PIPE_V>();
+                Muls(qInF32, qInF32, rw, hSize);
+                PipeBarrier<PIPE_V>();
+                Add(accQ, accQ, qInF32, hSize);
+                PipeBarrier<PIPE_V>();
+            }
+            if (sumW != 0.0f) {
+                Duplicate(divF32, sumW, hSize);
+                PipeBarrier<PIPE_V>();
+                Div(accQ, accQ, divF32, hSize);
+                PipeBarrier<PIPE_V>();
+            }
+            Cast(bfStash, accQ, RoundMode::CAST_RINT, hSize);
+            PipeBarrier<PIPE_V>();
+            SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+            DataCopy(wBarGm_[r * hSize], bfStash, hSize);
+            SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
         }
-        outQueue_.FreeTensor(acc);
     }
 
     PipeBarrier<PIPE_MTE3>();

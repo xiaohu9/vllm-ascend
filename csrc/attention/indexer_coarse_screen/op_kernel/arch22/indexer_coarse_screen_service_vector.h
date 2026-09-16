@@ -64,7 +64,7 @@ public:
     __aicore__ inline void InitParams(const struct IndexerCoarseScreenCommon::ConstInfo &constInfo,
                                       const IndexerCoarseScreenTilingData *__restrict tilingData);
     __aicore__ inline void InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<W_T> weightsGm,
-                                                GlobalTensor<int32_t> indiceOutGm);
+                                                GlobalTensor<int32_t> indiceOutGm);  // mm1 视图经 set 注入
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
@@ -75,7 +75,8 @@ public:
                                                   GlobalTensor<Q_T> wBarGm, GlobalTensor<int32_t> qBarI32Gm,
                                                   GlobalTensor<int32_t> wBarI32Gm, GlobalTensor<int32_t> proxyCumGm,
                                                   GlobalTensor<int32_t> candidatesWsGm,
-                                                  GlobalTensor<int32_t> candidatesOutGm, GlobalTensor<int32_t> aslkOutGm);
+                                                  GlobalTensor<int32_t> candidatesOutGm, GlobalTensor<int32_t> aslkOutGm,
+                                                  GlobalTensor<int32_t> dbgMm1);
     __aicore__ inline void ProcessGroupMean();
     __aicore__ inline void ProcessWindow(TPipe *pipe);
 
@@ -93,6 +94,7 @@ protected:
     GlobalTensor<Q_T> wBarGm_;           // w_bar [R,H](M1 输出)
     GlobalTensor<int32_t> qBarI32Gm_;   // q_bar 位视图(debug dump 用)
     GlobalTensor<int32_t> wBarI32Gm_;   // w_bar 位视图(debug dump 用)
+    GlobalTensor<int32_t> dbgMm1Gm_;    // mm1Res core0 位视图(workspace 头,dump 用)
     GlobalTensor<int32_t> proxyCumGm_;  // [1..R](主 pass TND s1 累计)
     GlobalTensor<int32_t> candidatesWsGm_; // 窗口模式主 pass 候选中转 [R,sparseCount]
     GlobalTensor<int32_t> candidatesOutGm_; // 输出 candidates [R,outW]
@@ -488,7 +490,8 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::InitCoarseGlobalTe
     GlobalTensor<uint32_t> callerSeqLenGmQ, GlobalTensor<uint32_t> aslkGm, GlobalTensor<Q_T> qBarGm,
     GlobalTensor<Q_T> wBarGm, GlobalTensor<int32_t> qBarI32Gm, GlobalTensor<int32_t> wBarI32Gm,
     GlobalTensor<int32_t> proxyCumGm, GlobalTensor<int32_t> candidatesWsGm,
-    GlobalTensor<int32_t> candidatesOutGm, GlobalTensor<int32_t> aslkOutGm)
+    GlobalTensor<int32_t> candidatesOutGm, GlobalTensor<int32_t> aslkOutGm,
+    GlobalTensor<int32_t> dbgMm1)
 {
     queryGm_ = queryGm;
     callerWeightsGm_ = callerWeightsGm;
@@ -499,6 +502,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::InitCoarseGlobalTe
     wBarGm_ = wBarGm;
     qBarI32Gm_ = qBarI32Gm;
     wBarI32Gm_ = wBarI32Gm;
+    dbgMm1Gm_ = dbgMm1;
     proxyCumGm_ = proxyCumGm;
     candidatesWsGm_ = candidatesWsGm;
     candidatesOutGm_ = candidatesOutGm;
@@ -691,9 +695,21 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
             outI32.SetValue(13, static_cast<int32_t>(cumEndEcho - cumBeginEcho));
             outI32.SetValue(14, static_cast<int32_t>(cumBeginEcho));
             outI32.SetValue(15, static_cast<int32_t>(0xDEADBEEF));
+            // 词16..19: mm1Res core0 首 4 个 fp32 分数(AIC 实际打分用 —— 与期望对照
+            //   直接暴露 AIC 读到的 qBar);词20..27: proxyCum[0..7] 全量(M1 写入完整性)
+            if (r == rBegin) {
+                for (uint32_t j = 0; j < 4; j++) {
+                    outI32.SetValue(16 + j, dbgMm1Gm_.GetValue(j));
+                }
+                for (uint32_t j = 0; j < 8; j++) {
+                    outI32.SetValue(20 + j, proxyCumGm_.GetValue(j < rowNum ? j : 0U));
+                }
+            } else {
+                outI32.SetValue(16, static_cast<int32_t>(0x0BADC0DE));
+            }
             SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
             SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-            DataCopyPad(candidatesOutGm_[r * W], outI32, {1, static_cast<uint16_t>(16 * sizeof(int32_t)), 0, 0});
+            DataCopyPad(candidatesOutGm_[r * W], outI32, {1, static_cast<uint16_t>(28 * sizeof(int32_t)), 0, 0});
             auxI32.SetValue(0, static_cast<int32_t>(aslkGm_.GetValue(r)));
             SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
             DataCopyPad(aslkOutGm_[r], auxI32, {1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0});

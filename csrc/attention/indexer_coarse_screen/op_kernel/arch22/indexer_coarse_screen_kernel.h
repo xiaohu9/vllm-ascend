@@ -484,9 +484,13 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Init(__gm__ uint8_t *quer
         queryGm.SetGlobalBuffer((__gm__ Q_T *)query);
         callerWeightsGm.SetGlobalBuffer((__gm__ Q_T *)weights);
         rowWeightsGm.SetGlobalBuffer((__gm__ Q_T *)rowWeights);
+        // dbg:mm1 core0 = workspace 头(int32 位视图,dump AIC 实际分数用)
+        GlobalTensor<int32_t> dbgMm1;
+        dbgMm1.SetGlobalBuffer((__gm__ int32_t *)workspace);
         vectorService.InitCoarseGlobalTensor(queryGm, callerWeightsGm, rowWeightsGm, callerSeqLenGmQ,
                                              actualSeqLengthsGm, qBarGm, wBarGm, qBarI32, wBarI32,
-                                             proxyCumGm, candidatesWsGm, candidatesOutGm, aslkOutGm);
+                                             proxyCumGm, candidatesWsGm, candidatesOutGm, aslkOutGm,
+                                             dbgMm1);
         // 主 pass 直写目标:窗口模式先落 workspace(行距 sparseCount),否则直写输出(行距 outW=coarseCount)
         GlobalTensor<int32_t> mainPassOut = constInfo.hasWindow ? candidatesWsGm : candidatesOutGm;
         // 主 pass weights = w_bar(M1 输出);W_T 视图(DT_W_FLAG=true 时为 float)

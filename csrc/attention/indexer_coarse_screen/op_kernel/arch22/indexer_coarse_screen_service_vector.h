@@ -617,7 +617,11 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
             continue;
         }
         DataCopy(candI32, candidatesWsGm_[r * c], c);
-        PipeBarrier<PIPE_MTE2>();
+        // 2026-09-17 竞态终修(A3 判决实证):dedup 首个 Sub(V) 可越过未完成的
+        // MTE2 拷贝读 candI32 —— winStart 位置被判"缺席"追加重复(A3 的 61 即证)。
+        // PipeBarrier<PIPE_MTE2> 只排 MTE2 内部;跨管道 MTE2→V 必须事件同步
+        // (M1/复刻链同款先例:复刻链因先做 MTE2_S 等待而全对,真实链缺此事件)。
+        SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
 
         // 窗口收集:win = [winStart, winEnd) 内的有效位置,不在候选行的按升序 append。
         // validC > 0 时先去重:|cand-pos| 截断到 [0,1] 后树状求和,

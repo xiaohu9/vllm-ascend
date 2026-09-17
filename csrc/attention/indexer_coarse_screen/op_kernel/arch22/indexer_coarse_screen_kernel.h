@@ -635,8 +635,14 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Process()
         return;
     }
     if ASCEND_IS_AIV {
-        // M1 组均值代理(全局预阶段):q_bar/w_bar/proxyCum 就绪后放行 AIC
-        vectorService.ProcessGroupMean();
+        // M1 组均值代理(全局预阶段):本对偶 AIV 写同对 AIC 的 SplitCore 精确请求范围
+        // (依赖闭环:写者即种子方;奇 AIV 置空范围跳过,仍达 SyncAll)
+        uint32_t m1Begin = splitCoreInfo.isEmptyRange ? 0U : splitCoreInfo.bN2Start;
+        uint32_t m1End = splitCoreInfo.isEmptyRange ? 0U : splitCoreInfo.bN2End + 1U; // 闭→开
+        if (tmpBlockIdx % 2 == 1) {
+            m1Begin = m1End; // 奇 AIV(对的第 2 个)不承担 M1 写入
+        }
+        vectorService.ProcessGroupMean(m1Begin, m1End);
     }
     // 阶段门控调试:hasWindow==3 只跑 M1+dump(主 pass/窗口全跳,须双核同步跳过防
     // 种子 flag 悬空);==4 跑 M1+主 pass+dump(跳窗口)。用于多 chunk fault 的阶段二分。

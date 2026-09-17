@@ -79,7 +79,7 @@ public:
                                                   GlobalTensor<int32_t> dbgMm1);
     __aicore__ inline void SetDebugGeo(int32_t blkNum, int32_t qbarKb, int32_t wbarKb,
                                        int32_t mAlign, int32_t s1b, int32_t used);
-    __aicore__ inline void ProcessGroupMean();
+    __aicore__ inline void ProcessGroupMean(uint32_t rBegin, uint32_t rEnd);
     __aicore__ inline void ProcessWindow(TPipe *pipe);
 
 protected:
@@ -537,29 +537,15 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::SetDebugGeo(
 // 收尾:PipeBarrier<MTE3>(本核 flush) + SyncAll(全 AIV 屏障)→ 所有 AIV 的 M1 写全局可见;
 // ProcessMain 随后预置 syncV1C1×2,AIC 首个 matmul 的 CrossCoreWaitFlag 由此放行(§4.11 模式)。
 template <typename LIT>
-__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessGroupMean()
+__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessGroupMean(uint32_t rBegin, uint32_t rEnd)
 {
-    // 2026-09-16 重写:NPU 实测旧版(A10 纯 M1 隔离验证)qBar 输出为相邻元素混合体——
-    // 唯一非仓库惯例的用法是把 VECOUT 队列张量(outQueue_.AllocTensor)当纯 V 计算草稿
-    // (仓库先例一律 Alloc→EnQue→DeQue→MTE3→Free)。本版:全部走专用 VECCALC TBuf,
-    // 布局宽松无共享视图,事件链规范(MTE2_V / V_S / V_MTE3 / MTE3_MTE2 逐段)。
+    // 2026-09-17 行范围由 kernel 侧传入(= 同对 AIC 的 SplitCore 精确请求范围):
+    // AIC k 的首个 WaitFlag(syncV1C1)只被搭档 AIV(2k/2k+1)的种子放行,主 pass 中
+    // AIC k 读其 SplitCore 范围内的 qBar 行 —— 由同对偶 AIV 写这些行,依赖在"对"内
+    // 闭环,且对任意 P(含 prefill P>>24)精确对齐(复用同一 SplitCore 分配,无近似)。
+    // 奇 AIV 范围置空跳过写,仍达 SyncAll。
     const uint32_t qRowSize = static_cast<uint32_t>(constInfo_.headDim * constInfo_.gSize); // H*Dh
     const uint32_t hSize = static_cast<uint32_t>(constInfo_.gSize);
-    const uint32_t rowNum = static_cast<uint32_t>(constInfo_.batchSize);
-    // 2026-09-17 分区按"AIC 对"对齐(竞态终修):AIC k 的首个 WaitFlag(syncV1C1)只被其搭档
-    // AIV(2k/2k+1)的种子放行,而主 pass 中 AIC k 读 qBar 第 k 行 —— 若该行由其它 AIV 写
-    // (旧分区:AIV k 写行 k,AIV k 是 AIC k/2 的搭档),依赖跨"对",仅靠 SyncAll 全局屏障
-    // 兜底,NPU 实测 R>=4 竞态(rows 1,3 恒零/A13 换序全对/A15 单chunk更坏 —— 均时序依赖)。
-    // 本分区:pair k(R<=24 时 rowsPerPair=1)写行 k == AIC k 消费的行,写者即种子方,
-    // 依赖在"对"内闭环。对内仅偶 AIV 承担写入(奇 AIV 跳过,仍达 SyncAll)。
-    const uint32_t pairNum = GetBlockNum(); // AIC 块数 = 对数
-    const uint32_t rowsPerPair = IndexerCoarseScreenCommon::CeilDiv(rowNum, pairNum);
-    const uint32_t pairIdx = static_cast<uint32_t>(GetBlockIdx()) / 2;
-    uint32_t rBegin = pairIdx * rowsPerPair;
-    const uint32_t rEnd = IndexerCoarseScreenCommon::Min(rBegin + rowsPerPair, rowNum);
-    if (static_cast<uint32_t>(GetBlockIdx()) % 2 == 1) {
-        rBegin = rEnd; // 奇 AIV(对的第 2 个)不承担 M1 写入
-    }
 
     if (rBegin < rEnd) {
         // proxyCum:[1..R](主 pass TND s1 累计)。tmpUb 复用段,词 13/14 调试回显同源。

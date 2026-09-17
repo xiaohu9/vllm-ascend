@@ -534,21 +534,67 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
     LocalTensor<int32_t> auxI32 = winAuxBuf_.Get<int32_t>();
 
     if (constInfo_.hasWindow == 2U) {
-        // M1 出核后 dump 精简版:候选行采样(词16..22)+ mm1 core0(词23..24)+ mark(词15)
+        // DEBUG dump(dedup 全链复刻判决):词16..22 = cand[up-3..up+3] 原位采样;
+        // 词0..6 = 7 个窗口位置各自经【与真实 dedup 完全相同向量链】算出的 diffSum。
+        // 数学期望:pos 在候选行 ⇒ diffSum = validC-1;不在 ⇒ = validC。
         LocalTensor<int32_t> dumpCand = winCandBuf_.Get<int32_t>();
+        LocalTensor<int32_t> posI32 = winPosBuf_.Get<int32_t>();
+        LocalTensor<int32_t> mskI32 = winMskBuf_.Get<int32_t>();
         for (uint32_t r = rBegin; r < rEnd; r++) {
             DataCopy(dumpCand, candidatesWsGm_[r * c], c);
             PipeBarrier<PIPE_MTE2>();
             SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+            uint32_t up = aslkGm_.GetValue(r);
+            uint32_t validC = IndexerCoarseScreenCommon::Min(up, c);
+            uint32_t cumEnd = callerSeqLenGmQ_.GetValue(r);
+            uint32_t cumBegin = (r == 0) ? 0U : callerSeqLenGmQ_.GetValue(r - 1);
+            uint32_t own = cumEnd - cumBegin;
+            int32_t winStart = static_cast<int32_t>(up) - static_cast<int32_t>(constInfo_.groupSize - 1);
+            int32_t winEnd = static_cast<int32_t>(up) + static_cast<int32_t>(own);
             for (uint32_t j = 0; j < 7; j++) {
-                uint32_t idx = aslkGm_.GetValue(r) - 3U + j;
-                outI32.SetValue(16 + j, dumpCand.GetValue(idx));
+                outI32.SetValue(16 + j, dumpCand.GetValue(up - 3U + j));
             }
+            // dedup 全链复刻(每位置独立,从头初始化,与真实 dedup 同一序列)
+            uint32_t nb = IndexerCoarseScreenCommon::CeilDiv(validC, 64U);
+            uint32_t cols = (nb <= 16) ? 16 : (nb <= 32) ? 32 : 64;
+            for (uint32_t j = 0; j < 7; j++) {
+                int32_t pos = winStart + static_cast<int32_t>(j);
+                if (pos < 0 || pos >= winEnd || validC == 0) {
+                    outI32.SetValue(j, -12345); // 域外标记
+                    continue;
+                }
+                Duplicate(mskI32, 0, 64 * cols);
+                PipeBarrier<PIPE_V>();
+                Duplicate(posI32, pos, validC);
+                PipeBarrier<PIPE_V>();
+                Sub(mskI32, dumpCand, posI32, validC);
+                PipeBarrier<PIPE_V>();
+                Mul(mskI32, mskI32, mskI32, validC);
+                PipeBarrier<PIPE_V>();
+                Mins(mskI32, mskI32, static_cast<int32_t>(1), validC);
+                PipeBarrier<PIPE_V>();
+                uint32_t now = 64;
+                while (now > 1) {
+                    now >>= 1;
+                    Add(mskI32, mskI32, mskI32[now * cols], now * cols);
+                    PipeBarrier<PIPE_V>();
+                }
+                uint32_t n2 = cols;
+                while (n2 > 8) {
+                    n2 >>= 1;
+                    Add(mskI32, mskI32, mskI32[n2], n2);
+                    PipeBarrier<PIPE_V>();
+                }
+                SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+                int32_t diffSum = 0;
+                for (int t = 0; t < 8; t++) {
+                    diffSum += mskI32.GetValue(t);
+                }
+                outI32.SetValue(j, diffSum);
+            }
+            outI32.SetValue(15, static_cast<int32_t>(0xC0FFEE34));
             float v0 = dbgMm1Gm_.GetValue(0);
-            float v1 = dbgMm1Gm_.GetValue(1);
             outI32.SetValue(23, *reinterpret_cast<int32_t *>(&v0));
-            outI32.SetValue(24, *reinterpret_cast<int32_t *>(&v1));
-            outI32.SetValue(15, static_cast<int32_t>(0xC0FFEE34)); // M1 出核版标记
             SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
             SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
             DataCopyPad(candidatesOutGm_[r * W], outI32, {1, static_cast<uint16_t>(28 * sizeof(int32_t)), 0, 0});

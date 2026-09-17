@@ -660,8 +660,13 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
     // 承担行 r 的窗口读(MTE2),同核 MTE3→MTE2 经 PipeBarrier 严格有序,消除跨对
     // GM 可见性时序(NPU 实测 3 行 S2 重复+S4 缺失双向判错 = 该读竞争的签名,
     // 与 qBar/proxyCum 竞态同族第三例)。
-    // 主 pass 候选写(MTE3)全部完成后才可读回
+    // 主 pass 候选写(MTE3)全部完成后才可读回。
+    // 2026-09-17 竞态终修:行 r 的候选行由本 AIV 主 pass CopyOut(MTE3)写出 —— 同核
+    // 跨管道 MTE3→MTE2 必须用事件同步,PipeBarrier<PIPE_MTE3> 只排 MTE3 管道内部,
+    // MTE2 读可越过未落地的 MTE3 写(NPU 实测 dedup 双向判错 +1dup/-1miss 即半写快照)。
+    // M1 段同款先例:SetWaitFlag<MTE3_MTE2> 后 qBar 行为验证正确。
     PipeBarrier<PIPE_MTE3>();
+    SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
     SyncAll();
     // 独立窗口缓冲(pipe->Reset 释放主 pass 缓冲,先例 = InitLDBuffers)
     pipe->Reset();

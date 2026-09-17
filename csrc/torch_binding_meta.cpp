@@ -350,8 +350,8 @@ std::tuple<at::Tensor, at::Tensor> npu_indexer_coarse_screen_meta(
         out_w = coarse_count + 2 * MAX_GROUP - 1;
     }
     at::SmallVector<int64_t, SIZE> candidates_size = {req_num, out_w};
-    at::Tensor candidates_out = at::empty(candidates_size, query.options().dtype(at::kInt));
-    at::Tensor aslk_out = at::empty({req_num}, query.options().dtype(at::kInt));
+    at::Tensor candidates_out = at::empty(candidates_size, q_bar.options().dtype(at::kInt));
+    at::Tensor aslk_out = at::empty({req_num}, q_bar.options().dtype(at::kInt));
     return std::tuple<at::Tensor, at::Tensor>(candidates_out, aslk_out);
 }
 

@@ -27,15 +27,16 @@ using namespace LIKernel;
         templateClass<IndexerCoarseScreenType<__VA_ARGS__>> op;                                                        \
         GET_TILING_DATA_WITH_STRUCT(IndexerCoarseScreenTilingData, tiling_data_in, tiling);                            \
         const IndexerCoarseScreenTilingData *__restrict tiling_data = &tiling_data_in;                                 \
-        op.Init(qBar, wBar, key, actualSeqLengthsQ, actualSeqLengths, blocktable, candidatesOut,              \n                aslkOut, user, tiling_data, &tPipe);                                                                   \
+        op.Init(qBar, wBar, key, actualSeqLengthsQ, actualSeqLengths, blocktable, candidatesOut,                        \
+                aslkOut, user, tiling_data, &tPipe);                                                                   \
         op.Process();                                                                                                  \
     } while (0)
 
-// 入口形参序必须与 op def 输入序一致(query, weights, row_weights, key, aslq, aslk, block_table,
+// 入口形参序必须与 op def 输入序一致(q_bar, w_bar, key, aslq, aslk, block_table,
 // candidates, aslk_out, workspace, tiling)——aclnnInner 按 def 顺序传 GM 指针。
-// NPU 实测教训(2026-09-15):曾按 refine 惯例写成 (query, key, weights, rowWeights, ...),
-// 导致 key/weights/row_weights 三槽错位 —— M1 的 rw 读成 key 字节、主 pass 的 key 读成
-// weights,分数与 query 无关且随分配非确定(A6 位级 dump 定位)。
+// NPU 实测教训(2026-09-15):曾按 refine 惯例写成 (query, key, weights, ...),导致
+// key/weights/row_weights 三槽错位。2026-09-17 M1 出核:输入改为 caller 算好的
+// q_bar/w_bar(组均值),内核不再做 M1。
 template <int DT_Q, int DT_K, int DT_OUT, int PAGE_ATTENTION, int LAYOUT_T, int K_LAYOUT_T, int DT_W_FLAG>
 __global__ __aicore__ void indexer_coarse_screen(__gm__ uint8_t *qBar, __gm__ uint8_t *wBar,
                                                  __gm__ uint8_t *key,

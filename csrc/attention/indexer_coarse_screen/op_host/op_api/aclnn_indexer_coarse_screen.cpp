@@ -42,9 +42,8 @@ extern aclnnStatus aclnnInnerIndexerCoarseScreen(void *workspace, uint64_t works
                                                  const aclrtStream stream);
 
 aclnnStatus aclnnIndexerCoarseScreenGetWorkspaceSize(
-        const aclTensor *query,
-        const aclTensor *weights,
-        const aclTensor *rowWeights,
+        const aclTensor *qBar,
+        const aclTensor *wBar,
         const aclTensor *key,
         const aclTensor *actualSeqLengthsQueryOptional,
         const aclTensor *actualSeqLengthsKeyOptional,
@@ -56,8 +55,8 @@ aclnnStatus aclnnIndexerCoarseScreenGetWorkspaceSize(
         uint64_t *workspaceSize,
         aclOpExecutor **executor)
 {
-    if (query == nullptr) {
-        OP_LOGE(ACLNN_ERR_PARAM_NULLPTR, "Query pointer is null, cannot get data type!");
+    if (qBar == nullptr) {
+        OP_LOGE(ACLNN_ERR_PARAM_NULLPTR, "q_bar pointer is null, cannot get data type!");
         return ge::GRAPH_FAILED;
     }
 

@@ -735,11 +735,13 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
             // 直接判决(ZERO=qBar零/CORRECT/垃圾),mm1 读法已证可靠,绕开 qBar 直读悖论。
             // 每核 mm1 区 512KB = 131072 个 int32。
             {
+                // 经 dbgMm1Gm_(workspace+0 绝对地址)读 core r 区:mm1ResGm 自带本 AIV 的
+                // aiCoreIdx 偏移,直读会落到 core(r/2+r) —— 上轮判决矩阵的索引错根因。
                 constexpr uint32_t MM1_CORE_I32 = 131072;
-                float v0 = mm1ResGm.GetValue(r * MM1_CORE_I32);
-                float v1 = mm1ResGm.GetValue(r * MM1_CORE_I32 + 1);
-                float v2 = mm1ResGm.GetValue(r * MM1_CORE_I32 + 2);
-                float v3 = mm1ResGm.GetValue(r * MM1_CORE_I32 + 3);
+                float v0 = dbgMm1Gm_.GetValue(r * MM1_CORE_I32);
+                float v1 = dbgMm1Gm_.GetValue(r * MM1_CORE_I32 + 1);
+                float v2 = dbgMm1Gm_.GetValue(r * MM1_CORE_I32 + 2);
+                float v3 = dbgMm1Gm_.GetValue(r * MM1_CORE_I32 + 3);
                 outI32.SetValue(16, *reinterpret_cast<int32_t *>(&v0));
                 outI32.SetValue(17, *reinterpret_cast<int32_t *>(&v1));
                 outI32.SetValue(18, *reinterpret_cast<int32_t *>(&v2));

@@ -399,8 +399,8 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::DealActSeqLenIsZero(uint3
 {
     if ASCEND_IS_AIV {
         if (constInfo.outputLayout == LI_LAYOUT::TND) {
-            uint32_t tSize = proxyCumGm.GetValue(constInfo.batchSize - 1);
-            uint32_t tBase = bIdx == 0 ? 0 : proxyCumGm.GetValue(bIdx - 1);
+            uint32_t tSize = constInfo.batchSize;                 // 每请求 1 行 proxy:总行数 == R
+            uint32_t tBase = bIdx;                                // prefix 硬编码(同 CalcRunInfo,零 GM 读)
             uint32_t s1Count = tempLoopInfo.actS1Size;
 
             for (uint32_t s1Idx = s1Start; s1Idx < s1Count; s1Idx++) {
@@ -602,7 +602,11 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::CalcRunInfo(uint32_t loop
         uint64_t actualSeqQPrefixSum;
         uint64_t actualSeqKPrefixSum;
         if constexpr (LAYOUT_T == LI_LAYOUT::TND) {
-            actualSeqQPrefixSum = (runInfo.bIdx <= 0) ? 0 : proxyCumGm.GetValue(runInfo.bIdx - 1);
+            // 2026-09-17 prefix 硬编码:每请求恒 1 行 proxy ⟹ prefix(bIdx) == bIdx。
+            // 旧版读 proxyCum[bIdx-1](M1 写于 pair bIdx-1,读于 pair bIdx —— 跨对 GM 读,
+            // NPU mm1 判决实证 AIC3 读到 prefix=4 即 row4 的分):种子只闭环本对依赖,
+            // SyncAll 不足以保证跨对可见时序。硬编码后计算路径零 proxyCum 读,跨对依赖清零。
+            actualSeqQPrefixSum = runInfo.bIdx;
             actualSeqKPrefixSum = (runInfo.bIdx <= 0) ? 0 : actualSeqLengthsGm.GetValue(runInfo.bIdx - 1);
         } else { // BSND
             actualSeqQPrefixSum = (runInfo.bIdx <= 0) ? 0 : runInfo.bIdx * constInfo.qSeqSize;

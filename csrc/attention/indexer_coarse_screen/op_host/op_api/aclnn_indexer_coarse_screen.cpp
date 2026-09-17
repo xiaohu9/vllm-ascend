@@ -62,7 +62,7 @@ aclnnStatus aclnnIndexerCoarseScreenGetWorkspaceSize(
 
     return aclnnInnerIndexerCoarseScreenGetWorkspaceSize(
         qBar, wBar, key, actualSeqLengthsQueryOptional, actualSeqLengthsKeyOptional,
-        blockTableOptional, coarseCount, hasWindow, candidatesOut, aslkOut, workspaceSize, executor);
+        blockTableOptional, coarseCount, hasWindow, groupSize, candidatesOut, aslkOut, workspaceSize, executor);
 }
 
 aclnnStatus aclnnIndexerCoarseScreen(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor,

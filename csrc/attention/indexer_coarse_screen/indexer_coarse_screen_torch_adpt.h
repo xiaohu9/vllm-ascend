@@ -19,7 +19,7 @@
 namespace vllm_ascend {
 
 std::tuple<at::Tensor, at::Tensor> construct_indexer_coarse_screen_output_tensor(
-    const at::Tensor& q_bar, int64_t coarse_count, int64_t has_window)
+    const at::Tensor& q_bar, int64_t coarse_count, int64_t has_window, int64_t group_size)
 {
     constexpr int64_t SIZE = 8;
     constexpr int64_t DIM_0 = 0;
@@ -35,11 +35,8 @@ std::tuple<at::Tensor, at::Tensor> construct_indexer_coarse_screen_output_tensor
     TORCH_CHECK(coarse_count > 0,
                 "coarse count should be greater than 0, but now is ",
                 coarse_count);
-    // 固定 TND q_bar + PA_BSND key:候选 [R, W'],W' = coarse + (has_window ? 31 : 0)
-    // (M1 出核后 g 无张量来源,窗口宽取 GROUP_SIZE_LIMIT=16 上限 → 2*16-1=31)
+    // 固定 TND q_bar + PA_BSND key:候选 [R, W'],W' = coarse + (has_window ? 2g-1 : 0)
     const int64_t req_num = q_bar.size(DIM_0);
-    constexpr int64_t MAX_GROUP = 16;
-    const int64_t group_size = MAX_GROUP;
     int64_t out_w = coarse_count;
     if (has_window != 0) {
         out_w = coarse_count + 2 * group_size - 1;
@@ -56,7 +53,8 @@ std::tuple<at::Tensor, at::Tensor> npu_indexer_coarse_screen(
     const at::Tensor& key,
     const c10::optional<at::Tensor>& actual_seq_lengths_query,
     const c10::optional<at::Tensor>& actual_seq_lengths_key,
-    const at::Tensor& block_table, int64_t coarse_count, int64_t has_window)
+    const at::Tensor& block_table, int64_t coarse_count, int64_t has_window,
+    int64_t group_size)
 {
     // 图安全:仅做 shape/dtype 存在性检查,捕获期不读张量数据
     TORCH_CHECK(q_bar.numel() > 0, "Tensor q_bar is empty.");
@@ -65,13 +63,13 @@ std::tuple<at::Tensor, at::Tensor> npu_indexer_coarse_screen(
     TORCH_CHECK(block_table.numel() > 0, "Tensor block_table is empty.");
 
     auto coarse_screen_output = construct_indexer_coarse_screen_output_tensor(
-        q_bar, coarse_count, has_window);
+        q_bar, coarse_count, has_window, group_size);
     at::Tensor candidates_out = std::get<0>(coarse_screen_output);
     at::Tensor aslk_out = std::get<1>(coarse_screen_output);
 
     EXEC_NPU_CMD(aclnnIndexerCoarseScreen, q_bar, w_bar, key,
                  actual_seq_lengths_query, actual_seq_lengths_key, block_table,
-                 coarse_count, has_window, candidates_out, aslk_out);
+                 coarse_count, has_window, group_size, candidates_out, aslk_out);
 
     return std::tuple<at::Tensor, at::Tensor>(candidates_out, aslk_out);
 }

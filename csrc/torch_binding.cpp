@@ -2428,7 +2428,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
             "Tensor? actual_seq_lengths_query=None, "
             "Tensor? actual_seq_lengths_key=None, "
             "Tensor block_table, "
-            "int coarse_count=4096, int has_window=1"
+            "int coarse_count=4096, int has_window=1, int group_size=4"
         ") -> (Tensor candidates, Tensor aslk)"
     );
     ops.impl("npu_indexer_coarse_screen", torch::kPrivateUse1, &vllm_ascend::npu_indexer_coarse_screen);

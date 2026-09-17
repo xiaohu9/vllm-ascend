@@ -65,6 +65,8 @@ public:
             .FormatList({ge::FORMAT_ND});
         this->Attr("coarse_count").AttrType(OPTIONAL).Int(4096); // 4096:候选预算(论文粗筛宽度)
         this->Attr("has_window").AttrType(OPTIONAL).Int(1);      // 1:输出阶段并集注入局部窗口(生产)
+        this->Attr("group_size").AttrType(OPTIONAL).Int(4);      // g:组内 query 数(窗口宽 2g-1;
+                                                                 // decode=MTP g,prefill=PREFILL_GROUP)
         OpAICoreConfig aicore_config;
         aicore_config.DynamicCompileStaticFlag(true)
             .DynamicFormatFlag(true)

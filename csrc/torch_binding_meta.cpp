@@ -325,7 +325,8 @@ std::tuple<at::Tensor, at::Tensor> npu_indexer_coarse_screen_meta(
     const at::Tensor &key,
     const c10::optional<at::Tensor> &actual_seq_lengths_query,
     const c10::optional<at::Tensor> &actual_seq_lengths_key,
-    const at::Tensor &block_table, int64_t coarse_count, int64_t has_window)
+    const at::Tensor &block_table, int64_t coarse_count, int64_t has_window,
+    int64_t group_size)
 {
     // npu tensor max size
     constexpr int64_t SIZE = 8;
@@ -341,13 +342,11 @@ std::tuple<at::Tensor, at::Tensor> npu_indexer_coarse_screen_meta(
                                        "than 0, but shape[", i, "] is ", q_bar.size(i));
     }
     TORCH_CHECK(coarse_count > 0, "coarse count should be greater than 0, but now is ", coarse_count);
-    // 固定 TND q_bar + PA_BSND key:候选 [R, W'],W' = coarse + (has_window ? 31 : 0)
-    // (M1 出核后 g 无张量来源,取 GROUP_SIZE_LIMIT=16 上限)
+    // 固定 TND q_bar + PA_BSND key:候选 [R, W'],W' = coarse + (has_window ? 2g-1 : 0)
     const int64_t req_num = q_bar.size(DIM_0);
-    constexpr int64_t MAX_GROUP = 16;
     int64_t out_w = coarse_count;
     if (has_window != 0) {
-        out_w = coarse_count + 2 * MAX_GROUP - 1;
+        out_w = coarse_count + 2 * group_size - 1;
     }
     at::SmallVector<int64_t, SIZE> candidates_size = {req_num, out_w};
     at::Tensor candidates_out = at::empty(candidates_size, q_bar.options().dtype(at::kInt));

@@ -44,6 +44,11 @@ static ge::graphStatus InferShapeIndexerCoarseScreen(gert::InferShapeContext *co
     OP_CHECK_NULL_WITH_CONTEXT(context, coarseCount);
     const int64_t *hasWindow = attrs->GetInt(ATTR_HAS_WINDOW_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, hasWindow);
+    const int64_t *gSize = attrs->GetInt(2); // ATTR_GROUP_SIZE_INDEX(第 3 个 attr)
+    OP_CHECK_NULL_WITH_CONTEXT(context, gSize);
+    OP_CHECK_IF((*gSize <= 0) || (*gSize > 16),
+               OP_LOGE(context, "group_size must be in (0, 16], but now is %ld.", *gSize),
+               return ge::GRAPH_FAILED);
 
     OP_CHECK_IF(qBarShape->GetDimNum() != 3,
                OP_LOGE(context, "Layout TND, q_bar dims (%zu) must be 3!", qBarShape->GetDimNum()),
@@ -60,10 +65,8 @@ static ge::graphStatus InferShapeIndexerCoarseScreen(gert::InferShapeContext *co
     OP_CHECK_NULL_WITH_CONTEXT(context, aslkOutShape);
 
     // 输出 candidates [R, W'](0-based 逻辑 key 位置,-1 终止)。
-    // 窗口宽 = 2g-1 ≤ 2*MAX_GROUP-1 = 31(GROUP_SIZE_LIMIT=16,M1 出核后 g 不再由
     // row_weights.shape 提供,取上限 31;实际有效宽度由 aslk' 逐行决定,行尾 -1)。
-    constexpr int64_t MAX_WINDOW_PAD = 31; // 2 * 16 - 1
-    int64_t outW = *coarseCount + (*hasWindow != 0 ? MAX_WINDOW_PAD : 0);
+        int64_t outW = *coarseCount + (*hasWindow != 0 ? 2 * *gSize - 1 : 0);
     candidatesShape->SetDimNum(2);
     candidatesShape->SetDim(0, reqNum);
     candidatesShape->SetDim(1, outW);

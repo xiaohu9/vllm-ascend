@@ -377,6 +377,7 @@ class PivotIndexer:
                 block_table=attn_metadata.block_table[:K],
                 coarse_count=_COARSE_BUDGET,
                 has_window=int(bool(envs.VLLM_ASCEND_PIVOT_LOCAL_WINDOW)),
+                group_size=g,
             )  # C: [K, W'] int32, aslk_op: [K] int32
             logger.info_once(
                 "PIVOT coarse: using npu_indexer_coarse_screen op "
@@ -746,6 +747,7 @@ class PivotIndexer:
                 block_table=group_bt,
                 coarse_count=_COARSE_BUDGET,
                 has_window=int(bool(envs.VLLM_ASCEND_PIVOT_LOCAL_WINDOW)),
+                group_size=g,
             )  # C: [P, W'] int32, aslk_op: [P] int32
             logger.info_once(
                 "PIVOT coarse(prefill): using npu_indexer_coarse_screen op "

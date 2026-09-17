@@ -56,6 +56,7 @@ constexpr uint32_t ASLK_OUT_INDEX = 1;
 // Attributes Index
 constexpr uint32_t ATTR_COARSE_COUNT_INDEX = 0;
 constexpr uint32_t ATTR_HAS_WINDOW_INDEX = 1;
+constexpr uint32_t ATTR_GROUP_SIZE_INDEX = 2;
 // Dim Index
 constexpr uint32_t DIM_IDX_ONE = 1;
 constexpr uint32_t DIM_IDX_TWO = 2;
@@ -110,6 +111,7 @@ struct LiParaInfo {
 
     const int32_t *coarseCount = nullptr;
     const int32_t *hasWindow = nullptr;
+    const int32_t *groupSizeAttr = nullptr;
 };
 
 // -----------算子Tiling入参信息类---------------

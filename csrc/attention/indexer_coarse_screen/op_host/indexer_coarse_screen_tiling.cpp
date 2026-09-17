@@ -147,6 +147,7 @@ ge::graphStatus IndexerCoarseScreenInfoParser::GetAndCheckAttrParaInfo()
     OP_LOGI(context_->GetNodeName(), "GetAndCheckAttrParaInfo start");
     opParamInfo_.coarseCount = attrs->GetAttrPointer<int32_t>(ATTR_COARSE_COUNT_INDEX);
     opParamInfo_.hasWindow = attrs->GetAttrPointer<int32_t>(ATTR_HAS_WINDOW_INDEX);
+    opParamInfo_.groupSizeAttr = attrs->GetAttrPointer<int32_t>(ATTR_GROUP_SIZE_INDEX);
     if (opParamInfo_.coarseCount != nullptr) {
         OP_LOGI(context_->GetNodeName(), "coarse count is:%d", *opParamInfo_.coarseCount);
     }
@@ -165,6 +166,9 @@ ge::graphStatus IndexerCoarseScreenInfoParser::GetAndCheckAttrParaInfo()
     // 0=纯粗筛 1=窗口注入(生产) 2=dump 3=仅M1+dump(阶段二分) 4=M1+主pass+dump
     OP_CHECK_IF((*opParamInfo_.hasWindow < 0) || (*opParamInfo_.hasWindow > 4),
                OP_LOGE(opName_, "input attr has_window must be 0..4."),
+               return ge::GRAPH_FAILED);
+    OP_CHECK_IF((*opParamInfo_.groupSizeAttr <= 0) || (*opParamInfo_.groupSizeAttr > static_cast<int32_t>(GROUP_SIZE_LIMIT)),
+               OP_LOGE(opName_, "input attr group_size must be in (0, 16]."),
                return ge::GRAPH_FAILED);
 
     return ge::GRAPH_SUCCESS;
@@ -303,10 +307,10 @@ ge::graphStatus IndexerCoarseScreenInfoParser::GetGSize()
 
 ge::graphStatus IndexerCoarseScreenInfoParser::GetGroupSize()
 {
-    // M1 出核后无 row_weights 输入;g 语义由 caller 保证(均匀组)。host 无 GM 读,
-    // groupSize 取 GROUP_SIZE_LIMIT 上限(kernel 窗口逐行 own=aslq 差分,groupSize
-    // 仅作 windowG=2g-1 保守上限与输出宽度计算)。
-    groupSize_ = GROUP_SIZE_LIMIT;
+    // M1 出核:g 由 attr 传入(编译期常量:decode=MTP g,prefill=PREFILL_GROUP)。
+    // 窗口 = [aslk-(g-1), aslk+aslq差分),宽度 2g-1 必须用真实 g,不能用上限
+    // (2026-09-17 实测:16 上限使窗口多扫 12 个池内位置,被 topk 排除的判"新"追加)。
+    groupSize_ = static_cast<uint32_t>(*opParamInfo_.groupSizeAttr);
     return ge::GRAPH_SUCCESS;
 }
 

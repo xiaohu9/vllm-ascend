@@ -30,18 +30,15 @@ constexpr uint64_t GM_ALIGN_BYTES = 512;   // workspace 段对齐
 // --------------------------IndexerCoarseScreenInfoParser类成员函数定义-------------------------------------
 ge::graphStatus IndexerCoarseScreenInfoParser::CheckRequiredInOutExistence() const
 {
-    OP_CHECK_IF(opParamInfo_.query.shape == nullptr, OP_LOGE(opName_, "Shape of tensor query is nullptr"),
+    OP_CHECK_IF(opParamInfo_.query.shape == nullptr, OP_LOGE(opName_, "Shape of tensor q_bar is nullptr"),
                return ge::GRAPH_FAILED);
     OP_CHECK_IF(opParamInfo_.query.desc == nullptr, OP_LOGE(opName_, "Desc of tensor query is nullptr"),
                return ge::GRAPH_FAILED);
-    OP_CHECK_IF(opParamInfo_.weights.shape == nullptr, OP_LOGE(opName_, "Shape of tensor weights is nullptr"),
+    OP_CHECK_IF(opParamInfo_.weights.shape == nullptr, OP_LOGE(opName_, "Shape of tensor w_bar is nullptr"),
                return ge::GRAPH_FAILED);
     OP_CHECK_IF(opParamInfo_.weights.desc == nullptr, OP_LOGE(opName_, "Desc of tensor weights is nullptr"),
                return ge::GRAPH_FAILED);
-    OP_CHECK_IF(opParamInfo_.rowWeights.shape == nullptr, OP_LOGE(opName_, "Shape of tensor row_weights is nullptr"),
-               return ge::GRAPH_FAILED);
-    OP_CHECK_IF(opParamInfo_.rowWeights.desc == nullptr, OP_LOGE(opName_, "Desc of tensor row_weights is nullptr"),
-               return ge::GRAPH_FAILED);
+
     OP_CHECK_IF(opParamInfo_.key.shape == nullptr, OP_LOGE(opName_, "Shape of tensor key is nullptr"),
                return ge::GRAPH_FAILED);
     OP_CHECK_IF(opParamInfo_.key.desc == nullptr, OP_LOGE(opName_, "Desc of tensor key is nullptr"),
@@ -125,12 +122,10 @@ void IndexerCoarseScreenInfoParser::GetOptionalInputParaInfo()
 
 void IndexerCoarseScreenInfoParser::GetInputParaInfo()
 {
-    opParamInfo_.query.desc = context_->GetInputDesc(QUERY_INDEX);
-    opParamInfo_.query.shape = context_->GetInputShape(QUERY_INDEX);
-    opParamInfo_.weights.desc = context_->GetInputDesc(WEIGHTS_INDEX);
-    opParamInfo_.weights.shape = context_->GetInputShape(WEIGHTS_INDEX);
-    opParamInfo_.rowWeights.desc = context_->GetInputDesc(ROW_WEIGHTS_INDEX);
-    opParamInfo_.rowWeights.shape = context_->GetInputShape(ROW_WEIGHTS_INDEX);
+    opParamInfo_.query.desc = context_->GetInputDesc(QBAR_INDEX);
+    opParamInfo_.query.shape = context_->GetInputShape(QBAR_INDEX);
+    opParamInfo_.weights.desc = context_->GetInputDesc(WBAR_INDEX);
+    opParamInfo_.weights.shape = context_->GetInputShape(WBAR_INDEX);
     opParamInfo_.key.desc = context_->GetInputDesc(KEY_INDEX);
     opParamInfo_.key.shape = context_->GetInputShape(KEY_INDEX);
     GetOptionalInputParaInfo();
@@ -198,9 +193,7 @@ ge::graphStatus IndexerCoarseScreenInfoParser::GetAndCheckInOutDataType()
     OP_CHECK_IF(((inputQType_ != ge::DT_FLOAT16) && (inputQType_ != ge::DT_BF16)),
                OP_LOGE(opName_, "The data types of the input query, key, and weights must be float16 or bfloat16."),
                return ge::GRAPH_FAILED);
-    OP_CHECK_IF(opParamInfo_.rowWeights.desc->GetDataType() != inputQType_,
-               OP_LOGE(opName_, "The data type of row_weights must be the same as query."),
-               return ge::GRAPH_FAILED);
+
     OP_CHECK_IF(outputType_ != ge::DT_INT32,
                OP_LOGE(opName_, "The data types of the output candidates must be int32."),
                return ge::GRAPH_FAILED);
@@ -245,7 +238,6 @@ ge::graphStatus IndexerCoarseScreenInfoParser::CheckShapeDim()
     uint32_t kShapeDim = opParamInfo_.key.shape->GetStorageShape().GetDimNum();
     uint32_t qShapeDim = opParamInfo_.query.shape->GetStorageShape().GetDimNum();
     uint32_t weightsShapeDim = opParamInfo_.weights.shape->GetStorageShape().GetDimNum();
-    uint32_t rowWeightsShapeDim = opParamInfo_.rowWeights.shape->GetStorageShape().GetDimNum();
     uint32_t candidatesShapeDim = opParamInfo_.candidatesOut.shape->GetStorageShape().GetDimNum();
     uint32_t aslkOutShapeDim = opParamInfo_.aslkOut.shape->GetStorageShape().GetDimNum();
     OP_CHECK_IF(kShapeDim != DIM_NUM_FOUR,
@@ -258,14 +250,6 @@ ge::graphStatus IndexerCoarseScreenInfoParser::CheckShapeDim()
     OP_CHECK_IF(!(weightsShapeDim == DIM_NUM_TWO),
                OP_LOGE(opName_, "the dim num of weights's shape should be %u, but now is %u", DIM_NUM_TWO,
                 weightsShapeDim),
-               return ge::GRAPH_FAILED);
-    OP_CHECK_IF(rowWeightsShapeDim != DIM_NUM_TWO,
-               OP_LOGE(opName_, "the dim num of row_weights's shape should be %u, but now is %u", DIM_NUM_TWO,
-                rowWeightsShapeDim),
-               return ge::GRAPH_FAILED);
-    OP_CHECK_IF(candidatesShapeDim != DIM_NUM_TWO,
-               OP_LOGE(opName_, "the dim num of candidates's shape should be %u, but now is %u", DIM_NUM_TWO,
-                candidatesShapeDim),
                return ge::GRAPH_FAILED);
     OP_CHECK_IF(aslkOutShapeDim != DIM_NUM_TWO - 1,
                OP_LOGE(opName_, "the dim num of aslk_out's shape should be 1, but now is %u", aslkOutShapeDim),
@@ -319,12 +303,10 @@ ge::graphStatus IndexerCoarseScreenInfoParser::GetGSize()
 
 ge::graphStatus IndexerCoarseScreenInfoParser::GetGroupSize()
 {
-    // g = row_weights.shape[1](组内 query 数;decode=MTP g,prefill=位置组 g)
-    groupSize_ = static_cast<uint32_t>(opParamInfo_.rowWeights.shape->GetStorageShape().GetDim(DIM_IDX_ONE));
-    OP_LOGI(context_->GetNodeName(), "groupSize is %d", groupSize_);
-    OP_CHECK_IF((groupSize_ == 0) || (groupSize_ > GROUP_SIZE_LIMIT),
-               OP_LOGE(opName_, "row_weights shape[1] (group size) is %u, must be (0, %u].",
-                groupSize_, GROUP_SIZE_LIMIT), return ge::GRAPH_FAILED);
+    // M1 出核后无 row_weights 输入;g 语义由 caller 保证(均匀组)。host 无 GM 读,
+    // groupSize 取 GROUP_SIZE_LIMIT 上限(kernel 窗口逐行 own=aslq 差分,groupSize
+    // 仅作 windowG=2g-1 保守上限与输出宽度计算)。
+    groupSize_ = GROUP_SIZE_LIMIT;
     return ge::GRAPH_SUCCESS;
 }
 
@@ -395,7 +377,6 @@ ge::graphStatus IndexerCoarseScreenInfoParser::ValidateInputShapesMatch()
     // -----------------------check BatchSize(R)-------------------
     OP_CHECK_IF((opParamInfo_.actualSeqLengths.tensor->GetShapeSize() != reqNum) ||
                 (opParamInfo_.blockTable.tensor->GetStorageShape().GetDim(0) != reqNum) ||
-                (opParamInfo_.rowWeights.shape->GetStorageShape().GetDim(0) != reqNum) ||
                 (opParamInfo_.candidatesOut.shape->GetStorageShape().GetDim(0) != reqNum) ||
                 (opParamInfo_.aslkOut.shape->GetStorageShape().GetDim(0) != reqNum),
                 OP_LOGE(opName_,

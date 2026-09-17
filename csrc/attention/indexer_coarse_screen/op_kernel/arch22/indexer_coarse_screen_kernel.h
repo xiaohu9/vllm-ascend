@@ -68,8 +68,8 @@ template <typename LIT>
 class IndexerCoarseScreenKernel {
 public:
     __aicore__ inline IndexerCoarseScreenKernel(){};
-    __aicore__ inline void Init(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *weights,
-                                __gm__ uint8_t *rowWeights, __gm__ uint8_t *actualSeqLengthsQ,
+    __aicore__ inline void Init(__gm__ uint8_t *qBar, __gm__ uint8_t *wBar, __gm__ uint8_t *key,
+                                __gm__ uint8_t *actualSeqLengthsQ,
                                 __gm__ uint8_t *actualSeqLengths,
                                 __gm__ uint8_t *blockTable, __gm__ uint8_t *candidatesOut, __gm__ uint8_t *aslkOut,
                                 __gm__ uint8_t *workspace,
@@ -116,15 +116,11 @@ protected:
 
     // ================================Global Buffer区=================================
     // caller 输入(M1 / 窗口阶段消费,仅 AIV)
-    GlobalTensor<Q_T> queryGm;          // caller query [N,H,Dh]
-    GlobalTensor<Q_T> callerWeightsGm;  // caller weights [N,H](原始存储视图,M1 读行用)
-    GlobalTensor<Q_T> rowWeightsGm;     // row_weights [R,g]
     GlobalTensor<uint32_t> callerSeqLenGmQ; // caller aslq [R] 累计(差分 own_tokens)
     GlobalTensor<uint32_t> actualSeqLengthsGm; // aslk [R] 粗筛域上界(绝对值)
     // M1 输出 / 主 pass 输入(workspace)
-    GlobalTensor<Q_T> qBarGm;           // q_bar [R,H,Dh](主 pass 的 query)
-    GlobalTensor<Q_T> wBarGm;           // w_bar [R,H](主 pass 的 weights,Q_T 视图,M1 写出用)
-    GlobalTensor<int32_t> proxyCumGm;   // [1..R](主 pass TND s1 累计,每请求 1 行 proxy)
+    GlobalTensor<Q_T> qBarGm;           // q_bar [R,H,Dh](caller 输入,主 pass 的 query)
+    GlobalTensor<Q_T> wBarGm;           // w_bar [R,H](caller 输入,主 pass 的 weights)
     GlobalTensor<int32_t> candidatesWsGm; // 窗口模式主 pass 候选中转 [R,sparseCount]
     // 主 pass 消费(克隆结构保留)
     GlobalTensor<int32_t> blockTableGm;
@@ -422,9 +418,8 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::DealActSeqLenIsZero(uint3
 }
 
 template <typename LIT>
-__aicore__ inline void IndexerCoarseScreenKernel<LIT>::Init(__gm__ uint8_t *query,
-                                            __gm__ uint8_t *key, __gm__ uint8_t *weights,
-                                            __gm__ uint8_t *rowWeights,
+__aicore__ inline void IndexerCoarseScreenKernel<LIT>::Init(__gm__ uint8_t *qBar,
+                                            __gm__ uint8_t *wBar, __gm__ uint8_t *key,
                                             __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths,
                                             __gm__ uint8_t *blockTable, __gm__ uint8_t *candidatesOut,
                                             __gm__ uint8_t *aslkOut,
@@ -446,8 +441,7 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Init(__gm__ uint8_t *quer
     SplitCore(aiCoreIdx, usedCoreNum, splitCoreInfo);
 
     pipe = tPipe;
-    // workspace 内存排布:
-    // |mm1ResGm(存S,DB/核)|qBarGm [R,H,Dh]|wBarGm [R,H]|proxyCumGm [R]|candidatesWsGm [R,sparseCount](窗口模式)|
+    // workspace 内存排布(M1 出核):|mm1ResGm(存S,DB/核)|candidatesWsGm [R,sparseCount](窗口模式)|
     uint64_t offset = 0;
 
     // mm1开DoubleBuffer
@@ -458,20 +452,12 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Init(__gm__ uint8_t *quer
     auto alignGm = [](uint64_t bytes) -> uint64_t {
         return (bytes + GM_ALIGN_BYTES - 1) / GM_ALIGN_BYTES * GM_ALIGN_BYTES;
     };
-    uint64_t proxyRowSize = constInfo.headDim * constInfo.gSize; // H*Dh
-    __gm__ uint8_t *qBarPtr = workspace + offset;
-    qBarGm.SetGlobalBuffer((__gm__ Q_T *)qBarPtr);
-    offset += alignGm(constInfo.batchSize * proxyRowSize * sizeof(Q_T));
-    __gm__ uint8_t *wBarPtr = workspace + offset;
-    wBarGm.SetGlobalBuffer((__gm__ Q_T *)wBarPtr);
-    offset += alignGm(constInfo.batchSize * constInfo.gSize * sizeof(Q_T));
-    // M1 输出的 int32 位视图(debug dump 用,与 Q_T 视图同地址)
-    GlobalTensor<int32_t> qBarI32;
-    qBarI32.SetGlobalBuffer((__gm__ int32_t *)qBarPtr);
-    GlobalTensor<int32_t> wBarI32;
-    wBarI32.SetGlobalBuffer((__gm__ int32_t *)wBarPtr);
-    proxyCumGm.SetGlobalBuffer((__gm__ int32_t *)(workspace + offset));
-    offset += alignGm(constInfo.batchSize * sizeof(int32_t));
+    // M1 出核(2026-09-17):q_bar/w_bar 为 caller 输入,直绑(原生 AIC 读 caller
+    // 输入模式);workspace 只剩 mm1 + candidatesWs(窗口中转)。proxyCum 删除
+    // (prefix 已硬编码 bIdx),qBar/wBar 相关 M1 位视图随 M1 一并移除。
+    qBarGm.SetGlobalBuffer((__gm__ Q_T *)qBar);
+    wBarGm.SetGlobalBuffer((__gm__ Q_T *)wBar);
+    __gm__ uint8_t *wBarPtr = wBar;
     if (constInfo.hasWindow) {
         candidatesWsGm.SetGlobalBuffer((__gm__ int32_t *)(workspace + offset));
         offset += alignGm(constInfo.batchSize * constInfo.sparseCount * sizeof(int32_t));
@@ -482,27 +468,14 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Init(__gm__ uint8_t *quer
     blockTableGm.SetGlobalBuffer((__gm__ int32_t *)blockTable);
     if ASCEND_IS_AIV {
         vectorService.InitParams(constInfo, tiling);
-        // debug 几何注入(dump 词28..33):块数/qBar/wBar 相对 workspace 偏移(KB)等
-        uint64_t wsBase = reinterpret_cast<uint64_t>(workspace);
-        vectorService.SetDebugGeo(static_cast<int32_t>(GetBlockNum()),
-                                  static_cast<int32_t>((reinterpret_cast<uint64_t>(qBarPtr) - wsBase) >> 10),
-                                  static_cast<int32_t>((reinterpret_cast<uint64_t>(wBarPtr) - wsBase) >> 10),
-                                  static_cast<int32_t>(constInfo.mBaseSizeAlign),
-                                  static_cast<int32_t>(constInfo.s1BaseSize),
-                                  static_cast<int32_t>(usedCoreNum));
-        queryGm.SetGlobalBuffer((__gm__ Q_T *)query);
-        callerWeightsGm.SetGlobalBuffer((__gm__ Q_T *)weights);
-        rowWeightsGm.SetGlobalBuffer((__gm__ Q_T *)rowWeights);
-        // dbg:mm1 core0 = workspace 头(int32 位视图,dump AIC 实际分数用)
+        // M1 出核:窗口阶段仅需 caller aslq/aslk/候选中转/输出(组均值由 caller 传)
         GlobalTensor<int32_t> dbgMm1;
         dbgMm1.SetGlobalBuffer((__gm__ int32_t *)workspace);
-        vectorService.InitCoarseGlobalTensor(queryGm, callerWeightsGm, rowWeightsGm, callerSeqLenGmQ,
-                                             actualSeqLengthsGm, qBarGm, wBarGm, qBarI32, wBarI32,
-                                             proxyCumGm, candidatesWsGm, candidatesOutGm, aslkOutGm,
-                                             dbgMm1);
+        vectorService.InitCoarseGlobalTensor(callerSeqLenGmQ, actualSeqLengthsGm, candidatesWsGm,
+                                             candidatesOutGm, aslkOutGm, dbgMm1);
         // 主 pass 直写目标:窗口模式先落 workspace(行距 sparseCount),否则直写输出(行距 outW=coarseCount)
         GlobalTensor<int32_t> mainPassOut = constInfo.hasWindow ? candidatesWsGm : candidatesOutGm;
-        // 主 pass weights = w_bar(M1 输出);W_T 视图(DT_W_FLAG=true 时为 float)
+        // 主 pass weights = w_bar(caller 输入);W_T 视图(DT_W_FLAG=true 时为 float)
         GlobalTensor<W_T> wBarW;
         wBarW.SetGlobalBuffer((__gm__ W_T *)wBarPtr);
         vectorService.InitVec1GlobalTensor(mm1ResGm, wBarW, mainPassOut);
@@ -637,16 +610,6 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Process()
         // 没有计算任务，直接清理输出
         ProcessInvalid();
         return;
-    }
-    if ASCEND_IS_AIV {
-        // M1 组均值代理(全局预阶段):本对偶 AIV 写同对 AIC 的 SplitCore 精确请求范围
-        // (依赖闭环:写者即种子方;奇 AIV 置空范围跳过,仍达 SyncAll)
-        uint32_t m1Begin = splitCoreInfo.isEmptyRange ? 0U : splitCoreInfo.bN2Start;
-        uint32_t m1End = splitCoreInfo.isEmptyRange ? 0U : splitCoreInfo.bN2End + 1U; // 闭→开
-        if (tmpBlockIdx % 2 == 1) {
-            m1Begin = m1End; // 奇 AIV(对的第 2 个)不承担 M1 写入
-        }
-        vectorService.ProcessGroupMean(m1Begin, m1End);
     }
     // 阶段门控调试:hasWindow==3 只跑 M1+dump(主 pass/窗口全跳,须双核同步跳过防
     // 种子 flag 悬空);==4 跑 M1+主 pass+dump(跳窗口)。用于多 chunk fault 的阶段二分。

@@ -69,17 +69,12 @@ public:
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
     // ---- coarse_screen 专属:M1 组均值(AIV 全局预阶段)/ M2.5 窗口注入(AIV 全局后阶段) ----
-    __aicore__ inline void InitCoarseGlobalTensor(GlobalTensor<Q_T> queryGm, GlobalTensor<Q_T> callerWeightsGm,
-                                                  GlobalTensor<Q_T> rowWeightsGm, GlobalTensor<uint32_t> callerSeqLenGmQ,
-                                                  GlobalTensor<uint32_t> aslkGm, GlobalTensor<Q_T> qBarGm,
-                                                  GlobalTensor<Q_T> wBarGm, GlobalTensor<int32_t> qBarI32Gm,
-                                                  GlobalTensor<int32_t> wBarI32Gm, GlobalTensor<int32_t> proxyCumGm,
+    __aicore__ inline void InitCoarseGlobalTensor(GlobalTensor<uint32_t> callerSeqLenGmQ,
+                                                  GlobalTensor<uint32_t> aslkGm,
                                                   GlobalTensor<int32_t> candidatesWsGm,
-                                                  GlobalTensor<int32_t> candidatesOutGm, GlobalTensor<int32_t> aslkOutGm,
+                                                  GlobalTensor<int32_t> candidatesOutGm,
+                                                  GlobalTensor<int32_t> aslkOutGm,
                                                   GlobalTensor<int32_t> dbgMm1);
-    __aicore__ inline void SetDebugGeo(int32_t blkNum, int32_t qbarKb, int32_t wbarKb,
-                                       int32_t mAlign, int32_t s1b, int32_t used);
-    __aicore__ inline void ProcessGroupMean(uint32_t rBegin, uint32_t rEnd);
     __aicore__ inline void ProcessWindow(TPipe *pipe, uint32_t rBegin, uint32_t rEnd);
 
 protected:
@@ -87,17 +82,9 @@ protected:
     GlobalTensor<W_T> weightsGm;
     GlobalTensor<int32_t> indiceOutGm;
     // ---- coarse_screen 专属(caller 输入 + M1 输出 + 窗口阶段读写)----
-    GlobalTensor<Q_T> queryGm_;          // caller query [N,H,Dh]
-    GlobalTensor<Q_T> callerWeightsGm_;  // caller weights [N,H](原始 bf16/f16 存储视图,M1 读行用)
-    GlobalTensor<Q_T> rowWeightsGm_;     // row_weights [R,g]
     GlobalTensor<uint32_t> callerSeqLenGmQ_; // caller aslq [R] 累计(差分 own_tokens)
     GlobalTensor<uint32_t> aslkGm_;      // aslk [R] 粗筛域上界(绝对值)
-    GlobalTensor<Q_T> qBarGm_;           // q_bar [R,H,Dh](M1 输出)
-    GlobalTensor<Q_T> wBarGm_;           // w_bar [R,H](M1 输出)
-    GlobalTensor<int32_t> qBarI32Gm_;   // q_bar 位视图(debug dump 用)
-    GlobalTensor<int32_t> wBarI32Gm_;   // w_bar 位视图(debug dump 用)
     GlobalTensor<int32_t> dbgMm1Gm_;    // mm1Res core0 位视图(workspace 头,dump 用)
-    GlobalTensor<int32_t> proxyCumGm_;  // [1..R](主 pass TND s1 累计)
     GlobalTensor<int32_t> candidatesWsGm_; // 窗口模式主 pass 候选中转 [R,sparseCount]
     GlobalTensor<int32_t> candidatesOutGm_; // 输出 candidates [R,outW]
     GlobalTensor<int32_t> aslkOutGm_;    // 输出 aslk' [R]
@@ -121,13 +108,6 @@ private:
     TBuf<TPosition::VECCALC> winOutBuf_;     // 输出行 int32 [outW]
     TBuf<TPosition::VECCALC> winAuxBuf_;     // [0,64) 窗口新增位置 + [64,...) aslk 行块
 
-    // debug 几何暂存(kernel Init 注入,dump 词 28..33 输出)
-    int32_t dbgBlkNum_ = -1;
-    int32_t dbgQbarKb_ = -1;
-    int32_t dbgWbarKb_ = -1;
-    int32_t dbgMAlign_ = -1;
-    int32_t dbgS1b_ = -1;
-    int32_t dbgUsed_ = -1;
 
     LocalTensor<float> tmpUb_;
     LocalTensor<int32_t> globalTopkIndice_;
@@ -495,40 +475,18 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
 // --------------------------coarse_screen 专属:全局张量注册--------------------------
 template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::InitCoarseGlobalTensor(
-    GlobalTensor<Q_T> queryGm, GlobalTensor<Q_T> callerWeightsGm, GlobalTensor<Q_T> rowWeightsGm,
-    GlobalTensor<uint32_t> callerSeqLenGmQ, GlobalTensor<uint32_t> aslkGm, GlobalTensor<Q_T> qBarGm,
-    GlobalTensor<Q_T> wBarGm, GlobalTensor<int32_t> qBarI32Gm, GlobalTensor<int32_t> wBarI32Gm,
-    GlobalTensor<int32_t> proxyCumGm, GlobalTensor<int32_t> candidatesWsGm,
-    GlobalTensor<int32_t> candidatesOutGm, GlobalTensor<int32_t> aslkOutGm,
-    GlobalTensor<int32_t> dbgMm1)
+    GlobalTensor<uint32_t> callerSeqLenGmQ, GlobalTensor<uint32_t> aslkGm,
+    GlobalTensor<int32_t> candidatesWsGm, GlobalTensor<int32_t> candidatesOutGm,
+    GlobalTensor<int32_t> aslkOutGm, GlobalTensor<int32_t> dbgMm1)
 {
-    queryGm_ = queryGm;
-    callerWeightsGm_ = callerWeightsGm;
-    rowWeightsGm_ = rowWeightsGm;
     callerSeqLenGmQ_ = callerSeqLenGmQ;
     aslkGm_ = aslkGm;
-    qBarGm_ = qBarGm;
-    wBarGm_ = wBarGm;
-    qBarI32Gm_ = qBarI32Gm;
-    wBarI32Gm_ = wBarI32Gm;
-    dbgMm1Gm_ = dbgMm1;
-    proxyCumGm_ = proxyCumGm;
     candidatesWsGm_ = candidatesWsGm;
     candidatesOutGm_ = candidatesOutGm;
     aslkOutGm_ = aslkOutGm;
+    dbgMm1Gm_ = dbgMm1;
 }
 
-template <typename LIT>
-__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::SetDebugGeo(
-    int32_t blkNum, int32_t qbarKb, int32_t wbarKb, int32_t mAlign, int32_t s1b, int32_t used)
-{
-    dbgBlkNum_ = blkNum;
-    dbgQbarKb_ = qbarKb;
-    dbgWbarKb_ = wbarKb;
-    dbgMAlign_ = mAlign;
-    dbgS1b_ = s1b;
-    dbgUsed_ = used;
-}
 
 // --------------------------M1 组均值代理(AIV 全局预阶段)--------------------------
 // q_bar[r] = Σ_{i<own_r} rw[r,i]·query[cum_{r-1}+i] / Σ_{i<own_r} rw[r,i](fp32 累加,一次舍入 bf16)
@@ -536,117 +494,6 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::SetDebugGeo(
 // proxyCum[r] = r+1(主 pass TND s1 累计,每请求 1 行 proxy)。
 // 收尾:PipeBarrier<MTE3>(本核 flush) + SyncAll(全 AIV 屏障)→ 所有 AIV 的 M1 写全局可见;
 // ProcessMain 随后预置 syncV1C1×2,AIC 首个 matmul 的 CrossCoreWaitFlag 由此放行(§4.11 模式)。
-template <typename LIT>
-__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessGroupMean(uint32_t rBegin, uint32_t rEnd)
-{
-    // 2026-09-17 行范围由 kernel 侧传入(= 同对 AIC 的 SplitCore 精确请求范围):
-    // AIC k 的首个 WaitFlag(syncV1C1)只被搭档 AIV(2k/2k+1)的种子放行,主 pass 中
-    // AIC k 读其 SplitCore 范围内的 qBar 行 —— 由同对偶 AIV 写这些行,依赖在"对"内
-    // 闭环,且对任意 P(含 prefill P>>24)精确对齐(复用同一 SplitCore 分配,无近似)。
-    // 奇 AIV 范围置空跳过写,仍达 SyncAll。
-    const uint32_t qRowSize = static_cast<uint32_t>(constInfo_.headDim * constInfo_.gSize); // H*Dh
-    const uint32_t hSize = static_cast<uint32_t>(constInfo_.gSize);
-
-    if (rBegin < rEnd) {
-        // proxyCum:[1..R](主 pass TND s1 累计)。tmpUb 复用段,词 13/14 调试回显同源。
-        LocalTensor<int32_t> cumRow = tmpUb_.template ReinterpretCast<int32_t>();
-        ArithProgression<int32_t>(cumRow, static_cast<int32_t>(rBegin) + 1, 1, rEnd - rBegin);
-        PipeBarrier<PIPE_V>();
-        SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-        DataCopyPad(proxyCumGm_[rBegin], cumRow,
-                    {1, static_cast<uint16_t>((rEnd - rBegin) * sizeof(int32_t)), 0, 0});
-        SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
-
-        // UB 布局(全 fp32 视图,元素粒度,零重叠):
-        //   [0, qRowSize)                 qInF32    当前 query 行(fp32)
-        //   [qRowSize, 2*qRowSize)        accQ      q_bar 累加器
-        //   [2*qRowSize, 2*qRowSize+N]    divF32    除数广播
-        //   [2*qRowSize+N, +2N+64)        rwF32/杂  row_weights → fp32 + 标量读区
-        //   bf16 暂存(ReinterpretCast 到后半区,与上面 fp32 区隔离):
-        //   [4*qRowSize, 4*qRowSize+N*H)  原始 bf16 暂存(query/weights/rw 共用,逐段即时)
-        LocalTensor<float> qInF32 = tmpUb_;
-        LocalTensor<float> accQ = tmpUb_[qRowSize];
-        LocalTensor<float> divF32 = tmpUb_[2 * qRowSize];
-        LocalTensor<float> miscF32 = tmpUb_[2 * qRowSize + 1024];
-        // bf16 暂存:字节偏移 3*qRowSize*4(fp32 三段之后),长 8KB,总占用 < tmpBuf_ 68KB ✓
-        LocalTensor<Q_T> bfStash =
-            tmpUb_.template ReinterpretCast<Q_T>()[(3 * qRowSize * sizeof(float)) / sizeof(Q_T)];
-
-        for (uint32_t r = rBegin; r < rEnd; r++) {
-            // row_weights 行(g 个 bf16,DataCopyPad 不足 32B 装载)→ fp32 → 标量读
-            DataCopyPad(bfStash, rowWeightsGm_[r * constInfo_.groupSize],
-                        {1, static_cast<uint16_t>(constInfo_.groupSize * sizeof(Q_T)), 0, 0},
-                        {false, 0, 0, 0});
-            SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
-            Cast(miscF32, bfStash, RoundMode::CAST_NONE, constInfo_.groupSize);
-            PipeBarrier<PIPE_V>();
-            SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
-
-            uint32_t cumEnd = callerSeqLenGmQ_.GetValue(r);
-            uint32_t cumBegin = (r == 0) ? 0U : callerSeqLenGmQ_.GetValue(r - 1);
-            uint32_t own = cumEnd - cumBegin;
-
-            // ---- q_bar:Σ rw_i·q_i / Σ rw_i(fp32 累加)----
-            Duplicate(accQ, 0.0f, qRowSize);
-            PipeBarrier<PIPE_V>();
-            float sumRw = 0.0f;
-            for (uint32_t i = 0; i < own; i++) {
-                float rw = miscF32.GetValue(i);
-                sumRw += rw;
-                DataCopy(bfStash, queryGm_[(cumBegin + i) * qRowSize], qRowSize);
-                SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
-                Cast(qInF32, bfStash, RoundMode::CAST_NONE, qRowSize);
-                PipeBarrier<PIPE_V>();
-                Muls(qInF32, qInF32, rw, qRowSize);
-                PipeBarrier<PIPE_V>();
-                Add(accQ, accQ, qInF32, qRowSize);
-                PipeBarrier<PIPE_V>();
-            }
-            if (sumRw != 0.0f) {
-                Duplicate(divF32, sumRw, qRowSize);
-                PipeBarrier<PIPE_V>();
-                Div(accQ, accQ, divF32, qRowSize);
-                PipeBarrier<PIPE_V>();
-            }
-            Cast(bfStash, accQ, RoundMode::CAST_RINT, qRowSize);
-            PipeBarrier<PIPE_V>();
-            SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-            DataCopy(qBarGm_[r * qRowSize], bfStash, qRowSize);
-            SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
-
-            // ---- w_bar(同式,weights [N,H])----
-            Duplicate(accQ, 0.0f, hSize);
-            PipeBarrier<PIPE_V>();
-            float sumW = 0.0f;
-            for (uint32_t i = 0; i < own; i++) {
-                float rw = miscF32.GetValue(i);
-                sumW += rw;
-                DataCopy(bfStash, callerWeightsGm_[(cumBegin + i) * hSize], hSize);
-                SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
-                Cast(qInF32, bfStash, RoundMode::CAST_NONE, hSize);
-                PipeBarrier<PIPE_V>();
-                Muls(qInF32, qInF32, rw, hSize);
-                PipeBarrier<PIPE_V>();
-                Add(accQ, accQ, qInF32, hSize);
-                PipeBarrier<PIPE_V>();
-            }
-            if (sumW != 0.0f) {
-                Duplicate(divF32, sumW, hSize);
-                PipeBarrier<PIPE_V>();
-                Div(accQ, accQ, divF32, hSize);
-                PipeBarrier<PIPE_V>();
-            }
-            Cast(bfStash, accQ, RoundMode::CAST_RINT, hSize);
-            PipeBarrier<PIPE_V>();
-            SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-            DataCopy(wBarGm_[r * hSize], bfStash, hSize);
-            SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
-        }
-    }
-
-    PipeBarrier<PIPE_MTE3>();
-    SyncAll();
-}
 
 // --------------------------M2.5 窗口注入(AIV 全局后阶段,hasWindow 门控)--------------------------
 // 每请求一行:win = [aslk-(g-1), aslk+aslq差分) 与候选行求差集,新增位置按升序 append 到有效前缀后,
@@ -687,101 +534,24 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
     LocalTensor<int32_t> auxI32 = winAuxBuf_.Get<int32_t>();
 
     if (constInfo_.hasWindow == 2U) {
-        // 候选行采样复用 winCandBuf_(公共段已 InitBuffer,禁二次分配)
+        // M1 出核后 dump 精简版:候选行采样(词16..22)+ mm1 core0(词23..24)+ mark(词15)
         LocalTensor<int32_t> dumpCand = winCandBuf_.Get<int32_t>();
-        // DEBUG dump(has_window=2,16 词/行,一次拿全地层真相):
-        //  [0..3] qBar 采样(+0/+1/+1024/+2047)  [4..5] wBar(+0/+15)  [6] proxyCum
-        //  [7..8] row_weights 输入位(r 行 4 个 bf16,全 1 应=0x3F803F80 —— 槽位映射直接验证)
-        //  [9] callerWeights 输入位(组首行前 2 bf16)  [10..11] query 输入位(组行 0/1 首 2 bf16)
-        //  [12] aslk 回显  [13] row_weights[0] 全局  [14] callerWeights[0] 全局  [15] 0xDEADBEEF
-        const uint32_t qRowI32 = (static_cast<uint32_t>(constInfo_.headDim) *
-                                  static_cast<uint32_t>(constInfo_.gSize)) / 2U;
-        const uint32_t hRowI32 = static_cast<uint32_t>(constInfo_.gSize) / 2U;
-        auto bfPair = [](Q_T t0, Q_T t1) -> int32_t {
-            uint16_t a = *reinterpret_cast<uint16_t *>(&t0);
-            uint16_t b = *reinterpret_cast<uint16_t *>(&t1);
-            return static_cast<int32_t>((static_cast<uint32_t>(b) << 16) | static_cast<uint32_t>(a));
-        };
-        const uint32_t gSz = constInfo_.groupSize;
-        const uint32_t hSz = static_cast<uint32_t>(constInfo_.gSize);
         for (uint32_t r = rBegin; r < rEnd; r++) {
-            // 2026-09-16 dump 读取改用已验证模式:输入回显(bfPair+GetValue)每轮全对,
-            // 而 int32 视图读同一 GM 却与 AIC 实读(mm1 已逐位正确)矛盾 ⇒ 视图不可靠。
-            // qBar/wBar 一律经 Q_T 标量读 + 位对打包(与 q0/calW/rowW 同款)。
-            outI32.SetValue(0, bfPair(qBarGm_.GetValue(r * qRowI32 * 2),
-                                      qBarGm_.GetValue(r * qRowI32 * 2 + 1)));
-            outI32.SetValue(1, bfPair(qBarGm_.GetValue(r * qRowI32 * 2 + 2),
-                                      qBarGm_.GetValue(r * qRowI32 * 2 + 3)));
-            outI32.SetValue(2, bfPair(qBarGm_.GetValue(r * qRowI32 * 2 + 2048),
-                                      qBarGm_.GetValue(r * qRowI32 * 2 + 2049)));
-            outI32.SetValue(3, bfPair(qBarGm_.GetValue((r + 1) * qRowI32 * 2 - 2),
-                                      qBarGm_.GetValue((r + 1) * qRowI32 * 2 - 1)));
-            outI32.SetValue(4, bfPair(wBarGm_.GetValue(r * hSz),
-                                      wBarGm_.GetValue(r * hSz + 1)));
-            outI32.SetValue(5, bfPair(wBarGm_.GetValue((r + 1) * hSz - 2),
-                                      wBarGm_.GetValue((r + 1) * hSz - 1)));
-            outI32.SetValue(6, static_cast<int32_t>(proxyCumGm_.GetValue(r)));
-            outI32.SetValue(7, bfPair(rowWeightsGm_.GetValue(r * gSz), rowWeightsGm_.GetValue(r * gSz + 1)));
-            outI32.SetValue(8, bfPair(rowWeightsGm_.GetValue(r * gSz + 2), rowWeightsGm_.GetValue(r * gSz + 3)));
-            uint32_t cumB = (r == 0) ? 0U : callerSeqLenGmQ_.GetValue(r - 1);
-            outI32.SetValue(9, bfPair(callerWeightsGm_.GetValue(cumB * hSz),
-                                      callerWeightsGm_.GetValue(cumB * hSz + 1)));
-            outI32.SetValue(10, bfPair(queryGm_.GetValue(cumB * qRowI32 * 2),
-                                       queryGm_.GetValue(cumB * qRowI32 * 2 + 1)));
-            outI32.SetValue(11, bfPair(queryGm_.GetValue((cumB + 1) * qRowI32 * 2),
-                                       queryGm_.GetValue((cumB + 1) * qRowI32 * 2 + 1)));
-            outI32.SetValue(12, static_cast<int32_t>(aslkGm_.GetValue(r)));
-            // 词13/14: aslq 回显(own, cumBegin)——直接暴露 M1 读到的组跨度(就地重算,勿引用下方循环变量)
-            uint32_t cumEndEcho = callerSeqLenGmQ_.GetValue(r);
-            uint32_t cumBeginEcho = (r == 0) ? 0U : callerSeqLenGmQ_.GetValue(r - 1);
-            outI32.SetValue(13, static_cast<int32_t>(cumEndEcho - cumBeginEcho));
-            outI32.SetValue(14, static_cast<int32_t>(cumBeginEcho));
-            outI32.SetValue(15, static_cast<int32_t>(0xC0FFEE33)); // 版本标记:SplitCore-exact M1
-            // 词16..19: mm1Res core0 首 4 个 fp32 分数(AIC 实际打分用 —— 与期望对照
-            //   直接暴露 AIC 读到的 qBar);词20..27: proxyCum[0..7] 全量(M1 写入完整性)
-            // 词16..19: core r(=行 r)的 mm1 首分数 —— AIC r 实际拿到的 qBar 行的
-            // 直接判决(ZERO=qBar零/CORRECT/垃圾),mm1 读法已证可靠,绕开 qBar 直读悖论。
-            // 每核 mm1 区 512KB = 131072 个 int32。
-            {
-                // 经 dbgMm1Gm_(workspace+0 绝对地址)读 core r 区:mm1ResGm 自带本 AIV 的
-                // aiCoreIdx 偏移,直读会落到 core(r/2+r) —— 上轮判决矩阵的索引错根因。
-                constexpr uint32_t MM1_CORE_I32 = 131072;
-                // 词16..22: 候选行原位采样 cand[upper-3..upper+3](窗口读回的原始数据):
-                // 正确时 [upper-3..upper-1) = 真池位(任意序)、[upper..upper+3) = -1 填充;
-                // 若为上一轮遗留值 ⇒ 窗口读撞上主 pass 未写完(CopyOut 竞态实锤+定位)。
-                DataCopy(dumpCand, candidatesWsGm_[r * c], c);
-                PipeBarrier<PIPE_MTE2>();
-                SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
-                for (uint32_t j = 0; j < 7; j++) {
-                    uint32_t idx = aslkGm_.GetValue(r) - 3U + j;
-                    outI32.SetValue(16 + j, dumpCand.GetValue(idx));
-                }
-                // 词23..24: mm1 core0 首分数参考
-                float v0 = dbgMm1Gm_.GetValue(0);
-                float v1 = dbgMm1Gm_.GetValue(1);
-                outI32.SetValue(23, *reinterpret_cast<int32_t *>(&v0));
-                outI32.SetValue(24, *reinterpret_cast<int32_t *>(&v1));
-                outI32.SetValue(25, static_cast<int32_t>(0x0BADC0DE));
-                outI32.SetValue(26, static_cast<int32_t>(0x0BADC0DE));
-                outI32.SetValue(27, static_cast<int32_t>(0x0BADC0DE));
+            DataCopy(dumpCand, candidatesWsGm_[r * c], c);
+            PipeBarrier<PIPE_MTE2>();
+            SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+            for (uint32_t j = 0; j < 7; j++) {
+                uint32_t idx = aslkGm_.GetValue(r) - 3U + j;
+                outI32.SetValue(16 + j, dumpCand.GetValue(idx));
             }
-            if (r == rBegin) {
-                for (uint32_t j = 0; j < 8; j++) {
-                    outI32.SetValue(20 + j, proxyCumGm_.GetValue(j < rowNum ? j : 0U));
-                }
-                // 词28..33: 几何(GetBlockNum/qBar偏移KB/wBar偏移KB/mBaseAlign/s1Base/usedCoreNum)
-                outI32.SetValue(28, dbgBlkNum_);
-                outI32.SetValue(29, dbgQbarKb_);
-                outI32.SetValue(30, dbgWbarKb_);
-                outI32.SetValue(31, dbgMAlign_);
-                outI32.SetValue(32, dbgS1b_);
-                outI32.SetValue(33, dbgUsed_);
-            } else {
-                outI32.SetValue(16, static_cast<int32_t>(0x0BADC0DE));
-            }
+            float v0 = dbgMm1Gm_.GetValue(0);
+            float v1 = dbgMm1Gm_.GetValue(1);
+            outI32.SetValue(23, *reinterpret_cast<int32_t *>(&v0));
+            outI32.SetValue(24, *reinterpret_cast<int32_t *>(&v1));
+            outI32.SetValue(15, static_cast<int32_t>(0xC0FFEE34)); // M1 出核版标记
             SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
             SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-            DataCopyPad(candidatesOutGm_[r * W], outI32, {1, static_cast<uint16_t>(34 * sizeof(int32_t)), 0, 0});
+            DataCopyPad(candidatesOutGm_[r * W], outI32, {1, static_cast<uint16_t>(28 * sizeof(int32_t)), 0, 0});
             auxI32.SetValue(0, static_cast<int32_t>(aslkGm_.GetValue(r)));
             SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
             DataCopyPad(aslkOutGm_[r], auxI32, {1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0});

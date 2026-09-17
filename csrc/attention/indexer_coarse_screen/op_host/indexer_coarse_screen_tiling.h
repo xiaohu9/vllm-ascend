@@ -43,14 +43,13 @@ enum class DataLayout : uint32_t {
 };
 
 // ------------------算子原型索引常量定义----------------
-// Inputs Index(与 kernel 形参顺序一致: query,weights,row_weights,key,actual_seq_q,actual_seq_k,block_table)
-constexpr uint32_t QUERY_INDEX = 0;
-constexpr uint32_t WEIGHTS_INDEX = 1;
-constexpr uint32_t ROW_WEIGHTS_INDEX = 2;
-constexpr uint32_t KEY_INDEX = 3;
-constexpr uint32_t ACTUAL_SEQ_Q_INDEX = 4;
-constexpr uint32_t ACTUAL_SEQ_K_INDEX = 5;
-constexpr uint32_t BLOCK_TABLE_INDEX = 6;
+// Inputs Index(与 kernel 形参顺序一致: q_bar,w_bar,key,actual_seq_q,actual_seq_k,block_table)
+constexpr uint32_t QBAR_INDEX = 0;
+constexpr uint32_t WBAR_INDEX = 1;
+constexpr uint32_t KEY_INDEX = 2;
+constexpr uint32_t ACTUAL_SEQ_Q_INDEX = 3;
+constexpr uint32_t ACTUAL_SEQ_K_INDEX = 4;
+constexpr uint32_t BLOCK_TABLE_INDEX = 5;
 // Outputs Index
 constexpr uint32_t CANDIDATES_INDEX = 0;
 constexpr uint32_t ASLK_OUT_INDEX = 1;

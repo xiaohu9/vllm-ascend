@@ -22,8 +22,7 @@
 using namespace ge;
 
 namespace ops {
-constexpr uint32_t QUERY_INDEX = 0;
-constexpr uint32_t ROW_WEIGHTS_INDEX = 2;
+constexpr uint32_t QBAR_INDEX = 0;
 constexpr uint32_t ACTUAL_SEQ_Q_INDEX = 4;
 constexpr uint32_t CANDIDATES_INDEX = 0;
 constexpr uint32_t ASLK_OUT_INDEX = 1;
@@ -34,10 +33,8 @@ static ge::graphStatus InferShapeIndexerCoarseScreen(gert::InferShapeContext *co
 {
     OP_CHECK_IF(context == nullptr, OP_LOGE("IndexerCoarseScreen", "InferShapeContext is nullptr!"),
                return ge::GRAPH_FAILED);
-    const gert::Shape *queryShape = context->GetInputShape(QUERY_INDEX);
-    OP_CHECK_NULL_WITH_CONTEXT(context, queryShape);
-    const gert::Shape *rowWeightsShape = context->GetInputShape(ROW_WEIGHTS_INDEX);
-    OP_CHECK_NULL_WITH_CONTEXT(context, rowWeightsShape);
+    const gert::Shape *qBarShape = context->GetInputShape(QBAR_INDEX);
+    OP_CHECK_NULL_WITH_CONTEXT(context, qBarShape);
     const gert::Shape *actualSeqQShape = context->GetOptionalInputShape(ACTUAL_SEQ_Q_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, actualSeqQShape);
 
@@ -48,29 +45,25 @@ static ge::graphStatus InferShapeIndexerCoarseScreen(gert::InferShapeContext *co
     const int64_t *hasWindow = attrs->GetInt(ATTR_HAS_WINDOW_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, hasWindow);
 
-    OP_CHECK_IF(queryShape->GetDimNum() != 3,
-               OP_LOGE(context, "Layout TND, queryDims (%zu) must be 3!", queryShape->GetDimNum()),
-               return ge::GRAPH_FAILED);
-    OP_CHECK_IF(rowWeightsShape->GetDimNum() != 2,
-               OP_LOGE(context, "row_weights dims (%zu) must be 2!", rowWeightsShape->GetDimNum()),
+    OP_CHECK_IF(qBarShape->GetDimNum() != 3,
+               OP_LOGE(context, "Layout TND, q_bar dims (%zu) must be 3!", qBarShape->GetDimNum()),
                return ge::GRAPH_FAILED);
     const int64_t reqNum = actualSeqQShape->GetDim(0);
-    OP_CHECK_IF(rowWeightsShape->GetDim(0) != reqNum,
-               OP_LOGE(context, "row_weights dim0 (%ld) must equal actual_seq_lengths_query dim0 (%ld).",
-                       rowWeightsShape->GetDim(0), reqNum),
+    OP_CHECK_IF(qBarShape->GetDim(0) != reqNum,
+               OP_LOGE(context, "q_bar dim0 (%ld) must equal actual_seq_lengths_query dim0 (%ld).",
+                       qBarShape->GetDim(0), reqNum),
                return ge::GRAPH_FAILED);
-    // 窗口并集宽度 = 2g-1(g = row_weights.shape[1],组内 query 数)
-    int64_t outW = *coarseCount;
-    if (*hasWindow != 0) {
-        outW = *coarseCount + 2 * rowWeightsShape->GetDim(1) - 1;
-    }
 
     gert::Shape *candidatesShape = context->GetOutputShape(CANDIDATES_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, candidatesShape);
     gert::Shape *aslkOutShape = context->GetOutputShape(ASLK_OUT_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, aslkOutShape);
 
-    // 输出 candidates [R, W'](0-based 逻辑 key 位置,-1 终止)
+    // 输出 candidates [R, W'](0-based 逻辑 key 位置,-1 终止)。
+    // 窗口宽 = 2g-1 ≤ 2*MAX_GROUP-1 = 31(GROUP_SIZE_LIMIT=16,M1 出核后 g 不再由
+    // row_weights.shape 提供,取上限 31;实际有效宽度由 aslk' 逐行决定,行尾 -1)。
+    constexpr int64_t MAX_WINDOW_PAD = 31; // 2 * 16 - 1
+    int64_t outW = *coarseCount + (*hasWindow != 0 ? MAX_WINDOW_PAD : 0);
     candidatesShape->SetDimNum(2);
     candidatesShape->SetDim(0, reqNum);
     candidatesShape->SetDim(1, outW);

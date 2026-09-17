@@ -21,17 +21,14 @@ class IndexerCoarseScreen : public OpDef {
 public:
     explicit IndexerCoarseScreen(const char *name) : OpDef(name)
     {
-        this->Input("query")
+        // 2026-09-17 M1 出核:组均值由 caller 侧算好传入(原 query/weights/row_weights
+        // 三输入的内核内 M1 是仓内孤立的 AIV写→AIC读 模式,910B 上 SyncAll 不可靠)
+        this->Input("q_bar")
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16, ge::DT_FLOAT16})
             .FormatList({ge::FORMAT_ND})
             .AutoContiguous();
-        this->Input("weights")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_BF16, ge::DT_FLOAT16})
-            .FormatList({ge::FORMAT_ND})
-            .AutoContiguous();
-        this->Input("row_weights")
+        this->Input("w_bar")
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16, ge::DT_FLOAT16})
             .FormatList({ge::FORMAT_ND})

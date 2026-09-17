@@ -27,8 +27,7 @@ using namespace LIKernel;
         templateClass<IndexerCoarseScreenType<__VA_ARGS__>> op;                                                        \
         GET_TILING_DATA_WITH_STRUCT(IndexerCoarseScreenTilingData, tiling_data_in, tiling);                            \
         const IndexerCoarseScreenTilingData *__restrict tiling_data = &tiling_data_in;                                 \
-        op.Init(query, key, weights, rowWeights, actualSeqLengthsQ, actualSeqLengths, blocktable, candidatesOut,        \
-                aslkOut, user, tiling_data, &tPipe);                                                                   \
+        op.Init(qBar, wBar, key, actualSeqLengthsQ, actualSeqLengths, blocktable, candidatesOut,              \n                aslkOut, user, tiling_data, &tPipe);                                                                   \
         op.Process();                                                                                                  \
     } while (0)
 
@@ -38,8 +37,8 @@ using namespace LIKernel;
 // 导致 key/weights/row_weights 三槽错位 —— M1 的 rw 读成 key 字节、主 pass 的 key 读成
 // weights,分数与 query 无关且随分配非确定(A6 位级 dump 定位)。
 template <int DT_Q, int DT_K, int DT_OUT, int PAGE_ATTENTION, int LAYOUT_T, int K_LAYOUT_T, int DT_W_FLAG>
-__global__ __aicore__ void indexer_coarse_screen(__gm__ uint8_t *query, __gm__ uint8_t *weights,
-                                                 __gm__ uint8_t *rowWeights, __gm__ uint8_t *key,
+__global__ __aicore__ void indexer_coarse_screen(__gm__ uint8_t *qBar, __gm__ uint8_t *wBar,
+                                                 __gm__ uint8_t *key,
                                                  __gm__ uint8_t *actualSeqLengthsQ,
                                                  __gm__ uint8_t *actualSeqLengths,
                                                  __gm__ uint8_t *blocktable, __gm__ uint8_t *candidatesOut,

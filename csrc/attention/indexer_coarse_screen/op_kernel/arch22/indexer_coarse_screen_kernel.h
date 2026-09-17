@@ -658,8 +658,14 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Process()
         }
     }
     if ASCEND_IS_AIV {
-        // M2.5 窗口注入(全局后阶段,hasWindow>=2 走 dump/窗口)
-        vectorService.ProcessWindow(pipe);
+        // M2.5 窗口注入(全局后阶段):行范围 = 本对 SplitCore 请求范围(偶 AIV 承担,
+        // 与 M1 同款配对 —— 行 r 的窗口读者 = 主 pass CopyOut 写者 AIV 2r,同核有序)
+        uint32_t wBegin = splitCoreInfo.isEmptyRange ? 0U : splitCoreInfo.bN2Start;
+        uint32_t wEnd = splitCoreInfo.isEmptyRange ? 0U : splitCoreInfo.bN2End + 1U;
+        if (tmpBlockIdx % 2 == 1) {
+            wBegin = wEnd; // 奇 AIV(对的第 2 个)不承担窗口读写
+        }
+        vectorService.ProcessWindow(pipe, wBegin, wEnd);
     }
 }
 

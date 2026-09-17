@@ -80,7 +80,7 @@ public:
     __aicore__ inline void SetDebugGeo(int32_t blkNum, int32_t qbarKb, int32_t wbarKb,
                                        int32_t mAlign, int32_t s1b, int32_t used);
     __aicore__ inline void ProcessGroupMean(uint32_t rBegin, uint32_t rEnd);
-    __aicore__ inline void ProcessWindow(TPipe *pipe);
+    __aicore__ inline void ProcessWindow(TPipe *pipe, uint32_t rBegin, uint32_t rEnd);
 
 protected:
     GlobalTensor<MM1_OUT_T> mm1ResGm;
@@ -653,8 +653,13 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessGroupMean(u
 // 尾部 -1 补齐到 outW(与 torch _inject_local_window 逐位一致:有效数 = min(upper,c),topk 行内
 // -1 恒在尾部);aslk'[r] = validC + nNew。hasWindow=0 时主 pass 已直写输出,仅算 aslk'=min(upper,c)。
 template <typename LIT>
-__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPipe *pipe)
+__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPipe *pipe, uint32_t rBegin, uint32_t rEnd)
 {
+    // 行范围由 kernel 传入(= 同对 AIC 的 SplitCore 精确请求范围,偶 AIV 承担):
+    // 行 r 的候选行由主 pass 的 AIV 2r CopyOut(MTE3)写出 —— 本分区让 AIV 2r 同时
+    // 承担行 r 的窗口读(MTE2),同核 MTE3→MTE2 经 PipeBarrier 严格有序,消除跨对
+    // GM 可见性时序(NPU 实测 3 行 S2 重复+S4 缺失双向判错 = 该读竞争的签名,
+    // 与 qBar/proxyCum 竞态同族第三例)。
     // 主 pass 候选写(MTE3)全部完成后才可读回
     PipeBarrier<PIPE_MTE3>();
     SyncAll();
@@ -664,13 +669,11 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
     const uint32_t W = constInfo_.outW;
     const uint32_t cAlign = IndexerCoarseScreenCommon::Align<uint32_t>(c, 8);
     const uint32_t rowNum = static_cast<uint32_t>(constInfo_.batchSize);
-    const uint32_t aivNum = GetBlockNum() * 2;
-    const uint32_t rowsPerAiv = IndexerCoarseScreenCommon::CeilDiv(rowNum, aivNum);
     pipe->InitBuffer(winCandBuf_, c * sizeof(int32_t));
     pipe->InitBuffer(winPosBuf_, cAlign * sizeof(int32_t));
     pipe->InitBuffer(winMskBuf_, cAlign * sizeof(int32_t));
     pipe->InitBuffer(winOutBuf_, W * sizeof(int32_t));
-    pipe->InitBuffer(winAuxBuf_, (64 + rowsPerAiv) * sizeof(int32_t));
+    pipe->InitBuffer(winAuxBuf_, (64 + (rEnd - rBegin)) * sizeof(int32_t));
 
     LocalTensor<int32_t> candI32 = winCandBuf_.Get<int32_t>();
     LocalTensor<int32_t> posI32 = winPosBuf_.Get<int32_t>();
@@ -678,8 +681,6 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
     LocalTensor<int32_t> outI32 = winOutBuf_.Get<int32_t>();
     LocalTensor<int32_t> auxI32 = winAuxBuf_.Get<int32_t>();
 
-    const uint32_t rBegin = static_cast<uint32_t>(GetBlockIdx()) * rowsPerAiv;
-    const uint32_t rEnd = IndexerCoarseScreenCommon::Min(rBegin + rowsPerAiv, rowNum);
     if (constInfo_.hasWindow == 2U) {
         // DEBUG dump(has_window=2,16 词/行,一次拿全地层真相):
         //  [0..3] qBar 采样(+0/+1/+1024/+2047)  [4..5] wBar(+0/+15)  [6] proxyCum

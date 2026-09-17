@@ -25,9 +25,8 @@ extern "C" {
  */
 __attribute__((visibility("default")))
 aclnnStatus aclnnIndexerCoarseScreenGetWorkspaceSize(
-    const aclTensor *query,
-    const aclTensor *weights,
-    const aclTensor *rowWeights,
+    const aclTensor *qBar,
+    const aclTensor *wBar,
     const aclTensor *key,
     const aclTensor *actualSeqLengthsQueryOptional,
     const aclTensor *actualSeqLengthsKeyOptional,

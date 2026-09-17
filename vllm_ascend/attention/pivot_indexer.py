@@ -358,25 +358,19 @@ class PivotIndexer:
 
         if envs.VLLM_ASCEND_PIVOT_COARSE_USE_OP:
             # ---- 1+2+2b fused coarse screen op (T3, plans/pivot_graph_entry_
-            # design.md §4.3/§8/§9.14) --------------------------------------
-            # npu_indexer_coarse_screen does the group weighted mean proxy
-            # (row_weights all-ones == the torch uniform mean above), the
-            # full-prefix top-_COARSE_BUDGET scan (score formula identical to
-            # _coarse_screen, fp32 accumulation, PA block-table reads) and the
-            # local-window union injection (== _inject_local_window, window
-            # = [aslk-(g-1), aslk+own)) in one kernel. It returns the
-            # compacted candidate rows (int32 LOGICAL positions, -1 tail,
-            # score-descending -- order is irrelevant downstream) plus aslk'
-            # (per-row valid candidate count) that feeds the refine op
-            # directly. The proxy domain is [0, aslk) with aslk = seq_lens-g
-            # (== L, §9.14: the caller passes the coarse-domain upper bound).
-            # Off by default (VLLM_ASCEND_PIVOT_COARSE_USE_OP=0) until the op
-            # passes its NPU probe (P1 gate); the torch reference below stays
-            # the golden for that comparison.
+            # design.md §4.3/§8/§9.14;2026-09-17 M1 出核) ----------------------
+            # 组均值由 caller 侧算好传入(原内核内 M1 是仓内孤立的 AIV写→AIC 读
+            # 模式,910B 上 SyncAll 不可靠,三轮竞态后移出);mean 为纯 ATen 图内
+            # 节点,同流序保可见性,入图不受损。算子做全前缀 top-_COARSE_BUDGET 扫描
+            # (score 公式同 _coarse_screen,fp32 累加,PA 块表读)+ 局部窗口并集
+            # 注入(== _inject_local_window,窗口 = [aslk-(g-1), aslk+own)),返回
+            # compact 候选行(int32 逻辑位置,-1 尾,顺序无关)+ aslk'(每行有效数)。
+            # 代理域 [0, aslk),aslk = seq_lens-g(§9.14:粗筛域上界)。
+            q_bar = q_dq.view(K, g, H, Dh).mean(dim=1)  # [K, H, Dh]
+            w_bar = weights[:D].view(K, g, H).mean(dim=1)  # [K, H]
             C, aslk_op = torch.ops._C_ascend.npu_indexer_coarse_screen(
-                q_dq,
-                weights[:D],
-                torch.ones((K, g), dtype=q_dq.dtype, device=device),
+                q_bar.to(q_dq.dtype),
+                w_bar.to(q_dq.dtype),
                 kv_cache[2],
                 actual_seq_lengths_query=cum[:K].to(torch.int32),
                 actual_seq_lengths_key=(seq_lens[:K] - g).to(torch.int32),
@@ -723,16 +717,29 @@ class PivotIndexer:
         w_t = weights[D:N]    # [N_tail, H]
         H, Dh = q_dq.shape[1], q_dq.shape[2]
         if envs.VLLM_ASCEND_PIVOT_COARSE_USE_OP:
-            # ---- 1+2+2b fused coarse screen op (prefill 位置组模式,§9.14) ----
-            # op1 从既有输入推导窗口界(零新增张量):粗筛域 = [0, group_start)
+            # ---- 2+2b coarse screen op (prefill 位置组模式,§9.14;M1 出核) ----
+            # 组均值由 caller 算(均匀组 = view-mean 快路径,通用 scatter_add 兜底,
+            # 同 torch 分支公式);op 只做粗筛 + 窗口注入。粗筛域 = [0, group_start)
             # (aslk=group_start,组首位置,含更早组 own tokens 的完整因果域);
             # win = [group_start-(g-1), group_start+aslq差分)(末组 partial 由
-            # own_tokens 自动 cap),与 torch 分支逐位一致。row_weights 全 1 =
-            # 均匀组均值。输出候选 [P, W'] int32 逻辑位置 + aslk' [P]。
+            # own_tokens 自动 cap)。输出候选 [P, W'] int32 逻辑位置 + aslk' [P]。
+            if bool((group_sizes == g).all()):
+                q_bar = q_dq.view(P, g, H, Dh).mean(dim=1)  # [P, H, Dh]
+                w_bar = w_t.view(P, g, H).mean(dim=1)  # [P, H]
+            else:
+                q_bar = q_dq.new_zeros(P, H, Dh)
+                w_bar = w_t.new_zeros(P, H)
+                _MT = 256
+                for s in range(0, N_tail, _MT):
+                    e = min(s + _MT, N_tail)
+                    gs = group_ids[s:e]
+                    q_bar.scatter_add_(0, gs.view(-1, 1, 1).expand(e - s, H, Dh), q_dq[s:e])
+                    w_bar.scatter_add_(0, gs.view(-1, 1).expand(e - s, H), w_t[s:e])
+                q_bar = q_bar / group_sizes.view(P, 1, 1)
+                w_bar = w_bar / group_sizes.view(P, 1)
             C, aslk_op = torch.ops._C_ascend.npu_indexer_coarse_screen(
-                q_dq,
-                w_t,
-                torch.ones((P, g), dtype=q_dq.dtype, device=device),
+                q_bar.to(q_dq.dtype),
+                w_bar.to(q_dq.dtype),
                 kv_cache[2],
                 actual_seq_lengths_query=aslq_refine.to(torch.int32),
                 actual_seq_lengths_key=group_start.to(torch.int32),

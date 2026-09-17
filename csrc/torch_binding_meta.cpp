@@ -321,7 +321,7 @@ at::Tensor npu_indexer_refine_meta(
 }
 
 std::tuple<at::Tensor, at::Tensor> npu_indexer_coarse_screen_meta(
-    const at::Tensor &query, const at::Tensor &weights, const at::Tensor &row_weights,
+    const at::Tensor &q_bar, const at::Tensor &w_bar,
     const at::Tensor &key,
     const c10::optional<at::Tensor> &actual_seq_lengths_query,
     const c10::optional<at::Tensor> &actual_seq_lengths_key,
@@ -332,22 +332,22 @@ std::tuple<at::Tensor, at::Tensor> npu_indexer_coarse_screen_meta(
     constexpr int64_t DIM_0 = 0;
     constexpr int64_t DIM_1 = 1;
 
-    TORCH_CHECK(query.numel() > 0, "Query is empty.");
-    TORCH_CHECK(weights.numel() > 0, "Weights is empty.");
-    TORCH_CHECK(row_weights.numel() > 0, "Row weights is empty.");
+    TORCH_CHECK(q_bar.numel() > 0, "q_bar is empty.");
+    TORCH_CHECK(w_bar.numel() > 0, "w_bar is empty.");
     TORCH_CHECK(key.numel() > 0, "Key is empty.");
     TORCH_CHECK(block_table.numel() > 0, "Block table is empty.");
-    for (size_t i = 0; i < query.sizes().size(); i++) {
-        TORCH_CHECK(query.size(i) > 0, "All values within query's shape should be greater "
-                                       "than 0, but shape[", i, "] is ", query.size(i));
+    for (size_t i = 0; i < q_bar.sizes().size(); i++) {
+        TORCH_CHECK(q_bar.size(i) > 0, "All values within q_bar's shape should be greater "
+                                       "than 0, but shape[", i, "] is ", q_bar.size(i));
     }
     TORCH_CHECK(coarse_count > 0, "coarse count should be greater than 0, but now is ", coarse_count);
-    // 固定 TND query + PA_BSND key:候选 [R, W'],W' = coarse + (has_window ? 2g-1 : 0)
-    const int64_t req_num = row_weights.size(DIM_0);
-    const int64_t group_size = row_weights.size(DIM_1);
+    // 固定 TND q_bar + PA_BSND key:候选 [R, W'],W' = coarse + (has_window ? 31 : 0)
+    // (M1 出核后 g 无张量来源,取 GROUP_SIZE_LIMIT=16 上限)
+    const int64_t req_num = q_bar.size(DIM_0);
+    constexpr int64_t MAX_GROUP = 16;
     int64_t out_w = coarse_count;
     if (has_window != 0) {
-        out_w = coarse_count + 2 * group_size - 1;
+        out_w = coarse_count + 2 * MAX_GROUP - 1;
     }
     at::SmallVector<int64_t, SIZE> candidates_size = {req_num, out_w};
     at::Tensor candidates_out = at::empty(candidates_size, query.options().dtype(at::kInt));

@@ -670,7 +670,7 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessMain()
     }
 
     if ASCEND_IS_AIV {
-        // M1 已在 ProcessGroupMean 完成并 SyncAll;此处预置 syncV1C1×2 种子 flag。
+        // M1 已出核(q_bar/w_bar 为 caller 输入);此处预置 syncV1C1×2 种子 flag。
         // 2026-09-16:种子管道由 MTE2 改绑 MTE3 —— qBar/wBar 落地走 MTE3 管道,
         // MTE2 语义种子(原生无 M1 的写法)不等 MTE3 队列,rows≥1 的 M1 写出
         // 相对 AIC 首轮读取存在窗口(NPU 实测 rows≥1 间歇坏、row 0 恒好);

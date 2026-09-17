@@ -32,7 +32,7 @@ extern "C" {
 namespace {
 
 extern aclnnStatus aclnnInnerIndexerCoarseScreenGetWorkspaceSize(
-    const aclTensor *query, const aclTensor *weights, const aclTensor *rowWeights, const aclTensor *key,
+    const aclTensor *qBar, const aclTensor *wBar, const aclTensor *key,
     const aclTensor *actualSeqLengthsQueryOptional, const aclTensor *actualSeqLengthsKeyOptional,
     const aclTensor *blockTableOptional, int64_t coarseCount, int64_t hasWindow,
     const aclTensor *candidatesOut, const aclTensor *aslkOut,
@@ -62,7 +62,7 @@ aclnnStatus aclnnIndexerCoarseScreenGetWorkspaceSize(
     }
 
     return aclnnInnerIndexerCoarseScreenGetWorkspaceSize(
-        query, weights, rowWeights, key, actualSeqLengthsQueryOptional, actualSeqLengthsKeyOptional,
+        qBar, wBar, key, actualSeqLengthsQueryOptional, actualSeqLengthsKeyOptional,
         blockTableOptional, coarseCount, hasWindow, candidatesOut, aslkOut, workspaceSize, executor);
 }
 

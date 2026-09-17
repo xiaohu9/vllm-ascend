@@ -687,6 +687,8 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
     LocalTensor<int32_t> auxI32 = winAuxBuf_.Get<int32_t>();
 
     if (constInfo_.hasWindow == 2U) {
+        // 候选行采样复用 winCandBuf_(公共段已 InitBuffer,禁二次分配)
+        LocalTensor<int32_t> dumpCand = winCandBuf_.Get<int32_t>();
         // DEBUG dump(has_window=2,16 词/行,一次拿全地层真相):
         //  [0..3] qBar 采样(+0/+1/+1024/+2047)  [4..5] wBar(+0/+15)  [6] proxyCum
         //  [7..8] row_weights 输入位(r 行 4 个 bf16,全 1 应=0x3F803F80 —— 槽位映射直接验证)
@@ -744,14 +746,24 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
                 // 经 dbgMm1Gm_(workspace+0 绝对地址)读 core r 区:mm1ResGm 自带本 AIV 的
                 // aiCoreIdx 偏移,直读会落到 core(r/2+r) —— 上轮判决矩阵的索引错根因。
                 constexpr uint32_t MM1_CORE_I32 = 131072;
-                float v0 = dbgMm1Gm_.GetValue(r * MM1_CORE_I32);
-                float v1 = dbgMm1Gm_.GetValue(r * MM1_CORE_I32 + 1);
-                float v2 = dbgMm1Gm_.GetValue(r * MM1_CORE_I32 + 2);
-                float v3 = dbgMm1Gm_.GetValue(r * MM1_CORE_I32 + 3);
-                outI32.SetValue(16, *reinterpret_cast<int32_t *>(&v0));
-                outI32.SetValue(17, *reinterpret_cast<int32_t *>(&v1));
-                outI32.SetValue(18, *reinterpret_cast<int32_t *>(&v2));
-                outI32.SetValue(19, *reinterpret_cast<int32_t *>(&v3));
+                // 词16..22: 候选行原位采样 cand[upper-3..upper+3](窗口读回的原始数据):
+                // 正确时 [upper-3..upper-1) = 真池位(任意序)、[upper..upper+3) = -1 填充;
+                // 若为上一轮遗留值 ⇒ 窗口读撞上主 pass 未写完(CopyOut 竞态实锤+定位)。
+                DataCopy(dumpCand, candidatesWsGm_[r * c], c);
+                PipeBarrier<PIPE_MTE2>();
+                SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+                for (uint32_t j = 0; j < 7; j++) {
+                    uint32_t idx = aslkGm_.GetValue(r) - 3U + j;
+                    outI32.SetValue(16 + j, dumpCand.GetValue(idx));
+                }
+                // 词23..24: mm1 core0 首分数参考
+                float v0 = dbgMm1Gm_.GetValue(0);
+                float v1 = dbgMm1Gm_.GetValue(1);
+                outI32.SetValue(23, *reinterpret_cast<int32_t *>(&v0));
+                outI32.SetValue(24, *reinterpret_cast<int32_t *>(&v1));
+                outI32.SetValue(25, static_cast<int32_t>(0x0BADC0DE));
+                outI32.SetValue(26, static_cast<int32_t>(0x0BADC0DE));
+                outI32.SetValue(27, static_cast<int32_t>(0x0BADC0DE));
             }
             if (r == rBegin) {
                 for (uint32_t j = 0; j < 8; j++) {

@@ -728,14 +728,24 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
             uint32_t cumBeginEcho = (r == 0) ? 0U : callerSeqLenGmQ_.GetValue(r - 1);
             outI32.SetValue(13, static_cast<int32_t>(cumEndEcho - cumBeginEcho));
             outI32.SetValue(14, static_cast<int32_t>(cumBeginEcho));
-            outI32.SetValue(15, static_cast<int32_t>(0xDEADBEEF));
+            outI32.SetValue(15, static_cast<int32_t>(0xC0FFEE33)); // 版本标记:SplitCore-exact M1
             // 词16..19: mm1Res core0 首 4 个 fp32 分数(AIC 实际打分用 —— 与期望对照
             //   直接暴露 AIC 读到的 qBar);词20..27: proxyCum[0..7] 全量(M1 写入完整性)
+            // 词16..19: core r(=行 r)的 mm1 首分数 —— AIC r 实际拿到的 qBar 行的
+            // 直接判决(ZERO=qBar零/CORRECT/垃圾),mm1 读法已证可靠,绕开 qBar 直读悖论。
+            // 每核 mm1 区 512KB = 131072 个 int32。
+            {
+                constexpr uint32_t MM1_CORE_I32 = 131072;
+                float v0 = mm1ResGm.GetValue(r * MM1_CORE_I32);
+                float v1 = mm1ResGm.GetValue(r * MM1_CORE_I32 + 1);
+                float v2 = mm1ResGm.GetValue(r * MM1_CORE_I32 + 2);
+                float v3 = mm1ResGm.GetValue(r * MM1_CORE_I32 + 3);
+                outI32.SetValue(16, *reinterpret_cast<int32_t *>(&v0));
+                outI32.SetValue(17, *reinterpret_cast<int32_t *>(&v1));
+                outI32.SetValue(18, *reinterpret_cast<int32_t *>(&v2));
+                outI32.SetValue(19, *reinterpret_cast<int32_t *>(&v3));
+            }
             if (r == rBegin) {
-                for (uint32_t j = 0; j < 4; j++) {
-                    float v = mm1ResGm.GetValue(j);
-                    outI32.SetValue(16 + j, *reinterpret_cast<int32_t *>(&v));
-                }
                 for (uint32_t j = 0; j < 8; j++) {
                     outI32.SetValue(20 + j, proxyCumGm_.GetValue(j < rowNum ? j : 0U));
                 }

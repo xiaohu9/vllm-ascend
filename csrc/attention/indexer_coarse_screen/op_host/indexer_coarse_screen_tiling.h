@@ -43,7 +43,7 @@ enum class DataLayout : uint32_t {
 };
 
 // ------------------算子原型索引常量定义----------------
-// Inputs Index(与 kernel 形参顺序一致: q_bar,w_bar,key,actual_seq_q,actual_seq_k,block_table)
+// Inputs Index(与 kernel 形参顺序一致: q_bar,w_bar,key,actual_seq_q,actual_seq_k,block_table);query 字段承载 q_bar
 constexpr uint32_t QBAR_INDEX = 0;
 constexpr uint32_t WBAR_INDEX = 1;
 constexpr uint32_t KEY_INDEX = 2;
@@ -101,7 +101,6 @@ struct IndexerCoarseScreenCompileInfo {};
 struct LiParaInfo {
     TilingRequiredParaInfo query = {nullptr, nullptr};
     TilingRequiredParaInfo weights = {nullptr, nullptr};
-    TilingRequiredParaInfo rowWeights = {nullptr, nullptr};
     TilingRequiredParaInfo key = {nullptr, nullptr};
     TilingOptionalParaInfo actualSeqLengthsQ = {nullptr, nullptr};
     TilingOptionalParaInfo actualSeqLengths = {nullptr, nullptr};

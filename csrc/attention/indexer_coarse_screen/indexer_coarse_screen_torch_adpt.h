@@ -46,8 +46,8 @@ std::tuple<at::Tensor, at::Tensor> construct_indexer_coarse_screen_output_tensor
     }
     output_size = {req_num, out_w};
 
-    at::Tensor candidates_out = at::empty(output_size, query.options().dtype(at::kInt));
-    at::Tensor aslk_out = at::empty({req_num}, query.options().dtype(at::kInt));
+    at::Tensor candidates_out = at::empty(output_size, q_bar.options().dtype(at::kInt));
+    at::Tensor aslk_out = at::empty({req_num}, q_bar.options().dtype(at::kInt));
     return std::tuple<at::Tensor, at::Tensor>(candidates_out, aslk_out);
 }
 

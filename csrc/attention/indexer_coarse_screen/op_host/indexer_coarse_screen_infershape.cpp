@@ -12,7 +12,7 @@
  * \file indexer_coarse_screen_infershape.cpp
  * \brief 输出 shape 推导:固定 query=TND [N,H,D], key=PA_BSND [BlockNum,BlockSize,1,D]
  *        candidates [R, W'], aslk_out [R]
- *        W' = coarse_count + (has_window ? 2*groupSize - 1 : 0),groupSize = row_weights.shape[1]
+ *        W' = coarse_count + (has_window ? 31 : 0)(M1 出核后 g 取 GROUP_SIZE_LIMIT=16 上限)
  */
 #include <graph/utils/type_utils.h>
 #include <register/op_impl_registry.h>

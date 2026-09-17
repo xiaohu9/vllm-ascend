@@ -34,7 +34,7 @@ namespace {
 extern aclnnStatus aclnnInnerIndexerCoarseScreenGetWorkspaceSize(
     const aclTensor *qBar, const aclTensor *wBar, const aclTensor *key,
     const aclTensor *actualSeqLengthsQueryOptional, const aclTensor *actualSeqLengthsKeyOptional,
-    const aclTensor *blockTableOptional, int64_t coarseCount, int64_t hasWindow,
+    const aclTensor *blockTableOptional, int64_t coarseCount, int64_t hasWindow, int64_t groupSize,
     const aclTensor *candidatesOut, const aclTensor *aslkOut,
     uint64_t *workspaceSize, aclOpExecutor **executor);
 

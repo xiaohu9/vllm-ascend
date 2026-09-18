@@ -554,7 +554,8 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
             for (uint32_t j = 0; j < 7; j++) {
                 outI32.SetValue(16 + j, dumpCand.GetValue(up - 3U + j));
             }
-            // dedup 全链复刻(每位置独立,从头初始化,与真实 dedup 同一序列)
+            // dedup 全链复刻(每位置独立,从头初始化,与真实 dedup 同一序列,
+            // 含钳位先于平方的长 L 溢出修复 —— 复刻链必须与真实链逐算子同步)
             uint32_t nb = IndexerCoarseScreenCommon::CeilDiv(validC, 64U);
             uint32_t cols = (nb <= 16) ? 16 : (nb <= 32) ? 32 : 64;
             for (uint32_t j = 0; j < 7; j++) {
@@ -569,9 +570,11 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
                 PipeBarrier<PIPE_V>();
                 Sub(mskI32, dumpCand, posI32, validC);
                 PipeBarrier<PIPE_V>();
-                Mul(mskI32, mskI32, mskI32, validC);
-                PipeBarrier<PIPE_V>();
                 Mins(mskI32, mskI32, static_cast<int32_t>(1), validC);
+                PipeBarrier<PIPE_V>();
+                Maxs(mskI32, mskI32, static_cast<int32_t>(-1), validC);
+                PipeBarrier<PIPE_V>();
+                Mul(mskI32, mskI32, mskI32, validC);
                 PipeBarrier<PIPE_V>();
                 uint32_t now = 64;
                 while (now > 1) {
@@ -624,8 +627,8 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
 
         // 窗口收集:win = [winStart, winEnd) 内的有效位置,不在候选行的按升序 append。
-        // validC > 0 时先去重:|cand-pos| 截断到 [0,1] 后树状求和,
-        // 和 < validC ⇔ 存在精确相等(present)。位置 ≤ 2^24,fp32 减法精确。
+        // validC > 0 时先去重:t = cand-pos 先钳位 [-1,1] 再平方(值域恰 {0,1})后求和,
+        // 和 < validC ⇔ 存在精确相等(present)。钳位先于平方 ⇒ 对任意 int32 t 全域无溢出。
         // validC == 0(如新请求 prefill 组 0,upper=0):候选行全 -1,无去重可言,
         // 但窗口收集仍必须执行(torch 同款:该组 own tokens 全部进精筛域)。
         int32_t winStart = static_cast<int32_t>(upper) - static_cast<int32_t>(constInfo_.groupSize - 1);
@@ -640,8 +643,11 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
                 // 全 int32 算术链(NPU 实测修复:float 链 Cast(int→float)+float
                 // Mins 在 dav_c220 上 diffSum 恒 = validC,相等候选永不出 0 → 全误判;
                 // refine scattered-mask 同源教训"dav_c220 float 链不可靠 → 算术替代")。
-                // m_j = min((cand_j - pos)^2, 1):整数精确,t==0⇔相等;t≠0 ⇒ t^2 ≥ 1
-                // (|t| < 8192,int32 平方无溢出)。两级对齐归并布局 [64,cols],
+                // m_j = clamp(t_j,-1,1)^2:t==0⇔相等;t≠0 ⇒ 1。钳位必须先于平方 ——
+                // |t| 上界是 seq_len(AIME 实测 65617),先平方在 |t|>46340 时 int32 溢出
+                // 为负(Mins 钳不住)、|t|=65536 时 ≡0 假匹配,own tokens 全被误判
+                // present 丢弃 → 长生成硬循环(2026-09-18 AIME 30 条中 2 条复现,
+                // 恰为仅有的 L>46341 两条)。两级对齐归并布局 [64,cols],
                 // cols∈{16,32,64},向量偏移 now*cols*4 ≥ 64B;二级折到 8 元素标量收尾。
                 uint32_t nb = IndexerCoarseScreenCommon::CeilDiv(validC, 64U);
                 uint32_t cols = (nb <= 16) ? 16 : (nb <= 32) ? 32 : 64;
@@ -651,9 +657,11 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
                 PipeBarrier<PIPE_V>();
                 Sub(mskI32, candI32, posI32, validC);
                 PipeBarrier<PIPE_V>();
-                Mul(mskI32, mskI32, mskI32, validC);
-                PipeBarrier<PIPE_V>();
                 Mins(mskI32, mskI32, static_cast<int32_t>(1), validC);
+                PipeBarrier<PIPE_V>();
+                Maxs(mskI32, mskI32, static_cast<int32_t>(-1), validC);
+                PipeBarrier<PIPE_V>();
+                Mul(mskI32, mskI32, mskI32, validC);
                 PipeBarrier<PIPE_V>();
                 // 一级:64 行按列折叠(in-place 重叠加法同 DoReduce 先例)
                 uint32_t now = 64;

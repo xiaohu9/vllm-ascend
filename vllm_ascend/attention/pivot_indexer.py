@@ -355,6 +355,7 @@ class PivotIndexer:
         device = q_li.device
         N_in = q_li.shape[0]
         q_dq = q_li[:D]  # raw BF16 [D, H, Dh] (no hadamard/quant on this path)
+        H, Dh = q_dq.shape[1], q_dq.shape[2]  # (M1 出核后 op 分支的组均值也需要)
 
         if envs.VLLM_ASCEND_PIVOT_COARSE_USE_OP:
             # ---- 1+2+2b fused coarse screen op (T3, plans/pivot_graph_entry_
@@ -384,7 +385,6 @@ class PivotIndexer:
                 "(VLLM_ASCEND_PIVOT_COARSE_USE_OP=1).")
         else:
             # ---- 1. mean proxy (segment mean over each request's g queries) --
-            H, Dh = q_dq.shape[1], q_dq.shape[2]
             q_bar = q_dq.view(K, g, H, Dh).mean(dim=1)  # [K, H, Dh]
             w_bar = weights[:D].view(K, g, H).mean(dim=1)  # [K, H]
 

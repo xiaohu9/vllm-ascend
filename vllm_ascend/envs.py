@@ -124,6 +124,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     # the torch _coarse_screen reference for the PIVOT coarse step. Off by
     # default until the op passes its NPU probe (P1 gate).
     "VLLM_ASCEND_PIVOT_COARSE_USE_OP": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_COARSE_USE_OP", "0"))),
+    # Per-step production audit of the coarse op against the torch reference
+    # (_coarse_screen + _inject_local_window) on REAL decode inputs: (1) the
+    # hard window invariant -- every valid window position must appear in the
+    # op's output row (its violation IS the "model cannot see recent tokens"
+    # signature behind long-generation n-gram loops); (2) per-row candidate
+    # set diff (op-only / golden-only, quantifies the boundary perturbation);
+    # (3) aslk' equality. DEBUG ONLY: doubles coarse cost per step and adds a
+    # device sync per step -- never enable in perf runs.
+    "VLLM_ASCEND_PIVOT_COARSE_AUDIT": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_COARSE_AUDIT", "0"))),
     # Per-query local window (paper Appendix B, decode variant) in the PIVOT
     # refine DOMAIN: each decode step's pool (proxy top-4096 over [0, L), L =
     # prefix before this step) is widened by the group's window union

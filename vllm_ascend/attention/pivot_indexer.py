@@ -380,6 +380,12 @@ class PivotIndexer:
                 has_window=int(bool(envs.VLLM_ASCEND_PIVOT_LOCAL_WINDOW)),
                 group_size=g,
             )  # C: [K, W'] int32, aslk_op: [K] int32
+            if envs.VLLM_ASCEND_PIVOT_COARSE_AUDIT:
+                # DEBUG (perf-negative: per-step D2H + full torch recompute)
+                _audit_coarse_vs_torch(
+                    C, aslk_op, q_bar, w_bar, kv_cache,
+                    attn_metadata.block_table[:K], attn_metadata.block_size,
+                    seq_lens[:K] - g, seq_lens[:K], g)
             logger.info_once(
                 "PIVOT coarse: using npu_indexer_coarse_screen op "
                 "(VLLM_ASCEND_PIVOT_COARSE_USE_OP=1).")
@@ -927,6 +933,65 @@ def _apply_output_guards(
             )
             topk_indices = torch.cat([topk_indices, pad], dim=-1)
     return topk_indices
+
+
+def _audit_coarse_vs_torch(C, aslk_op, q_bar, w_bar, kv_cache, block_table,
+                           block_size, L, seq_lens, g):
+    """Per-step production audit of the coarse op on REAL decode inputs
+    (VLLM_ASCEND_PIVOT_COARSE_AUDIT=1). Recomputes the full torch reference
+    (score topk via _coarse_screen + local-window injection) from the SAME
+    inputs the op consumed, then checks per row:
+      (1) WIN-VIOLATION: a valid window position missing from the op row --
+          the direct signature of "recent tokens invisible to attention"
+          (long-generation n-gram loops). Zero tolerance: structural, not
+          score-dependent.
+      (2) set diff op-only / golden-only: quantifies the bf16-w_bar + cube
+          rounding boundary perturbation (expected small and low-scored;
+          tie-boundary swaps are legitimate, unlike (1)).
+      (3) aslk' mismatch vs golden.
+    One summary line per step; full detail on violation. DEBUG ONLY: bulk
+    D2H per step + a full python coarse recompute (O(R*H*L) scores).
+    """
+    Cg, aslkg = _inject_local_window(
+        _coarse_screen(q_bar, w_bar, kv_cache, block_table, block_size, L),
+        L, seq_lens, g)
+    L_cpu = L.tolist()
+    seq_cpu = seq_lens.tolist()
+    a_op_cpu = aslk_op.tolist()
+    a_g_cpu = aslkg.tolist()
+    C_cpu = C.to(torch.int64).tolist()
+    Cg_cpu = Cg.to(torch.int64).tolist()
+    violations = []
+    worst_op_only = worst_gold_only = 0
+    for r in range(C.shape[0]):
+        # 负值(-1 pad)不入集合:op 行理论上紧致无中排 -1,若出现则经
+        # gold_only 侧体现为缺失位,集合差不被 pad 噪声污染
+        op_set = {x for x in C_cpu[r][:int(a_op_cpu[r])] if x >= 0}
+        g_set = {x for x in Cg_cpu[r][:int(a_g_cpu[r])] if x >= 0}
+        op_only = op_set - g_set
+        gold_only = g_set - op_set
+        worst_op_only = max(worst_op_only, len(op_only))
+        worst_gold_only = max(worst_gold_only, len(gold_only))
+        # window invariant: [L-(g-1), seq_lens) ∩ [0, seq_lens)
+        for pos in range(int(L_cpu[r]) - (g - 1), int(seq_cpu[r])):
+            if pos >= 0 and pos not in op_set:
+                violations.append(("WIN", r, pos, int(L_cpu[r]), int(seq_cpu[r])))
+        if int(a_op_cpu[r]) != int(a_g_cpu[r]):
+            violations.append(("ASLK", r, int(a_op_cpu[r]), int(a_g_cpu[r]),
+                               int(L_cpu[r])))
+    step = getattr(_audit_coarse_vs_torch, "_step", 0)
+    _audit_coarse_vs_torch._step = step + 1
+    if violations:
+        logger.error(
+            "PIVOT-AUDIT step=%d Lmax=%d: %d VIOLATIONS (first 8) %s | "
+            "set-diff max opOnly=%d goldOnly=%d",
+            step, int(max(L_cpu)), len(violations), violations[:8],
+            worst_op_only, worst_gold_only)
+    else:
+        logger.info(
+            "PIVOT-AUDIT step=%d Lmax=%d clean | set-diff max opOnly=%d "
+            "goldOnly=%d", step, int(max(L_cpu)), worst_op_only,
+            worst_gold_only)
 
 
 def _coarse_screen(

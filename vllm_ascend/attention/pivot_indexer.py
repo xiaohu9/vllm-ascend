@@ -263,23 +263,17 @@ class PivotIndexer:
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
         allow_whole_batch: bool = True,
-        handle_tail: bool = True,
     ) -> torch.Tensor | None:
         """Return decode-head topk_indices (0-based logical key positions).
 
         Decode requests sit at the head of the batch (the engine reorders to
         decode -> ... -> prefill), so the leading run of requests with a
         uniform query count g is the decode segment: requests [0, K), query
-        rows [0, D). That segment runs through PIVOT; the prefill tail is
-        handled by the caller:
-          - handle_tail=True (default): the tail runs through the NATIVE
-            indexer and the results are concatenated, then the full-batch
-            graph/index-cache guards are applied (legacy behavior, used when
-            prefill-PIVOT is off);
-          - handle_tail=False (prefill-PIVOT on): return the decode head raw
-            [0, D) with NO tail and NO full-batch guards -- the caller (the
-            three-way dispatch) owns the tail (via select_topk_prefill) and
-            the guards (via _apply_output_guards on the combined result).
+        rows [0, D). This method returns ONLY that segment's topk_indices --
+        the prefill tail [D, N) belongs to the caller: route it through
+        select_topk_prefill (prefill-PIVOT on) or _native_indexer_tail
+        (prefill-PIVOT off), then apply _apply_output_guards on the combined
+        result.
 
         Returns None when the batch has no grouped decode head (C8, g < 2,
         g > 16, or a uniform batch in a prefill state when the caller
@@ -353,7 +347,6 @@ class PivotIndexer:
             return None
 
         device = q_li.device
-        N_in = q_li.shape[0]
         q_dq = q_li[:D]  # raw BF16 [D, H, Dh] (no hadamard/quant on this path)
         H, Dh = q_dq.shape[1], q_dq.shape[2]  # (M1 出核后 op 分支的组均值也需要)
 
@@ -380,8 +373,10 @@ class PivotIndexer:
                 has_window=int(bool(envs.VLLM_ASCEND_PIVOT_LOCAL_WINDOW)),
                 group_size=g,
             )  # C: [K, W'] int32, aslk_op: [K] int32
-            if envs.VLLM_ASCEND_PIVOT_COARSE_AUDIT:
-                # DEBUG (perf-negative: per-step D2H + full torch recompute)
+            if envs.VLLM_ASCEND_PIVOT_COARSE_AUDIT and not _capturing():
+                # DEBUG (perf-negative: per-step D2H + full torch recompute);
+                # also skipped during graph capture -- the audit's host syncs
+                # are illegal inside a capture (same gate as _report).
                 _audit_coarse_vs_torch(
                     C, aslk_op, q_bar, w_bar, kv_cache,
                     attn_metadata.block_table[:K], attn_metadata.block_size,
@@ -557,42 +552,10 @@ class PivotIndexer:
         # repetition seen even on the torch path). Both paths emit valid
         # positions in score order; the kernel handles causality.
 
-        if handle_tail and K != R_all:
-            # Mixed batch, native tail (fallback, prefill-PIVOT off): the
-            # prefill tail (requests [K, R_all), rows [D, N)) stays on the
-            # native indexer.
-            topk_indices = torch.cat(
-                [
-                    topk_dec,
-                    _native_indexer_tail(
-                        sfa_impl,
-                        q_li,
-                        q_li_scale,
-                        q_li_shape_ori,
-                        weights,
-                        kv_cache,
-                        attn_metadata,
-                        actual_seq_lengths_query,
-                        actual_seq_lengths_key,
-                        K,
-                        D,
-                        N,
-                    ),
-                ],
-                dim=0,
-            )
-        else:
-            # Pure decode head (K == R_all), or the caller owns the tail and
-            # the full-batch guards (handle_tail=False): return the decode
-            # head raw.
-            topk_indices = topk_dec
-
-        if handle_tail:
-            # Full-batch guards (graph row pad + index-cache width pad). With
-            # handle_tail=False these are applied by the caller on the
-            # combined decode+prefill result instead.
-            topk_indices = _apply_output_guards(
-                topk_indices, sfa_impl, N_in, N)
+        # Decode head only: the prefill tail [D, N) and the full-batch
+        # output guards (graph row pad + index-cache width pad) are the
+        # caller's responsibility (see the docstring).
+        topk_indices = topk_dec
 
         if _ENABLE_REPORT and not _capturing():
             try:
@@ -906,8 +869,8 @@ def _apply_output_guards(
 ) -> torch.Tensor:
     """Pad PIVOT topk_indices to the native row count and index-cache width.
 
-    Shared by select_topk (handle_tail=True) and the three-way dispatch (on
-    the combined decode+prefill result). Two pads, both -1 tails:
+    Applied by the caller on the combined decode+prefill result. Two pads,
+    both -1 tails:
       - graph padding: rows [N, N_in) get -1 rows so the output row count
         matches the native path (num_input_tokens);
       - use_index_cache width: pad the width to the buffer width so the read

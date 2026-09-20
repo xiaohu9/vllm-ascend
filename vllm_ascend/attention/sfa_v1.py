@@ -27,7 +27,7 @@ from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
 from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE, MLAPO_MAX_SUPPORTED_TOKENS
-from vllm_ascend.attention.pivot_indexer import PivotIndexer, _apply_output_guards
+from vllm_ascend.attention.pivot_indexer import PivotIndexer, _apply_output_guards, _native_indexer_tail
 from vllm_ascend.attention.utils import (
     SFA_QSFA_TILE_SIZE,
     AscendCommonAttentionMetadata,
@@ -1607,45 +1607,75 @@ class AscendSFAImpl(MLAAttentionImpl):
                     # select_topk_prefill; the decode head is whole-batch only
                     # when nothing prefill is present.
                     allow_whole_batch=(n_pre == 0),
-                    # When prefill-PIVOT is on, select_topk must NOT consume
-                    # the tail (it returns the decode head raw and the tail is
-                    # handled below); otherwise it keeps its legacy native-tail
-                    # + full-batch-guard behavior.
-                    handle_tail=not use_pre_pivot,
                 )
-            pre_topk = None
-            if use_pre_pivot:
-                pre_topk = PivotIndexer.select_topk_prefill(
-                    self,
-                    q_li,
-                    q_li_scale,
-                    q_li_shape_ori,
-                    weights,
-                    kv_cache,
-                    attn_metadata,
-                    actual_seq_lengths_query,
-                    actual_seq_lengths_key,
-                    prefill_tail_start=n_dec,
-                )
-            if use_pre_pivot:
-                # Both segments must succeed, else a lone segment would leave
-                # the other's rows unhandled -- fall the whole batch to native.
-                if dec_topk is not None and pre_topk is not None:
-                    topk_indices = torch.cat([dec_topk, pre_topk], dim=0)
+            # PIVOT owns the decode head [0, n_dec); the prefill tail belongs
+            # to its owner -- select_topk_prefill under prefill-PIVOT, the
+            # native indexer otherwise. Any segment failing -> the whole
+            # batch falls back to the native indexer below.
+            if n_dec == 0:
+                # Pure prefill batch: prefill-PIVOT owns everything; without
+                # it the native indexer runs unchanged -- importantly WITHOUT
+                # the PIVOT output guards (they are a PIVOT-path contract:
+                # graph row pad + index-cache width pad).
+                if use_pre_pivot:
+                    pre_topk = PivotIndexer.select_topk_prefill(
+                        self,
+                        q_li,
+                        q_li_scale,
+                        q_li_shape_ori,
+                        weights,
+                        kv_cache,
+                        attn_metadata,
+                        actual_seq_lengths_query,
+                        actual_seq_lengths_key,
+                        prefill_tail_start=0,
+                    )
+                    if pre_topk is not None:
+                        return _apply_output_guards(
+                            pre_topk, self, q_li.shape[0],
+                            attn_metadata.num_actual_tokens)
+                    # prefill-PIVOT segment failed -> native fallback below.
+            elif dec_topk is not None:
+                tail_topk = None
+                if n_pre > 0:
+                    if use_pre_pivot:
+                        tail_topk = PivotIndexer.select_topk_prefill(
+                            self,
+                            q_li,
+                            q_li_scale,
+                            q_li_shape_ori,
+                            weights,
+                            kv_cache,
+                            attn_metadata,
+                            actual_seq_lengths_query,
+                            actual_seq_lengths_key,
+                            prefill_tail_start=n_dec,
+                        )
+                    else:
+                        tail_topk = _native_indexer_tail(
+                            self,
+                            q_li,
+                            q_li_scale,
+                            q_li_shape_ori,
+                            weights,
+                            kv_cache,
+                            attn_metadata,
+                            actual_seq_lengths_query,
+                            actual_seq_lengths_key,
+                            attn_metadata.num_decodes,
+                            n_dec,
+                            attn_metadata.num_actual_tokens,
+                        )
+                if n_pre == 0 or tail_topk is not None:
+                    topk_indices = (
+                        dec_topk
+                        if tail_topk is None
+                        else torch.cat([dec_topk, tail_topk], dim=0)
+                    )
                     return _apply_output_guards(
                         topk_indices, self, q_li.shape[0],
                         attn_metadata.num_actual_tokens)
-                if dec_topk is None and pre_topk is not None:
-                    # Pure prefill (n_dec == 0): the tail is the whole batch.
-                    return _apply_output_guards(
-                        pre_topk, self, q_li.shape[0],
-                        attn_metadata.num_actual_tokens)
-                # Any segment failed -> native fallback below.
-            elif dec_topk is not None:
-                # Prefill-PIVOT off: select_topk (handle_tail=True) already
-                # produced the full result (decode head PIVOT + native tail +
-                # guards) or None.
-                return dec_topk
+                # prefill-PIVOT segment failed -> native fallback below.
         return DeviceOperator.indexer_select_post_process(
             self,
             q_li,

@@ -90,7 +90,6 @@ private:
     // tmp buff for vector
     TBuf<TPosition::VECCALC> sortOutBuf_;
     TBuf<TPosition::VECCALC> tmpBuf_;
-    TBuf<TPosition::VECCALC> indexBuf_;
     TBuf<TPosition::VECCALC> reduceOutBuf_;
     TBuf<TPosition::VECCALC> brcBuf_;
     TBuf<TPosition::VECCALC> paramBuf_;
@@ -104,7 +103,6 @@ private:
     TBuf<> ldOutIdxBuf_;
 
     LocalTensor<float> tmpUb_;
-    LocalTensor<int32_t> globalTopkIndice_;
     LocalTensor<float> globalTopkUb_;
     LocalTensor<float> SortedBasicBlock_;
 
@@ -155,7 +153,6 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::InitBuffers(TPipe *pipe)
     // 68KB 在搬运cube核计算得到的结果和weight时，分成两块34KB，用于db；在mrgsort时，用作临时UB
     pipe->InitBuffer(tmpBuf_, (groupInner_ * s2BaseSize_ + s2BaseSize_) * 2 * sizeof(float));
     pipe->InitBuffer(sortOutBuf_, CeilDiv(s1BaseSize_, 2) * virTopK * 2 * sizeof(float));    // 64KB
-    pipe->InitBuffer(indexBuf_, s2BaseSize_ * sizeof(int32_t));                                // 2KB
     // refine:reduceOutBuf_ 扩到 5×s2BaseSize_(v6 2026-08-31) — 段1 [0,V) sort 分数(掩码后)、
     // 段2 [V,2V) sort 索引(cols,只写一次)、段3 [2V,3V)+段4 [3V,4V)+段5 [4V,5V) mask/score 链
     // 专用 scratch(mask / (score-NEG_INF)*mask 积 / score-NEG_INF 各占一段,全程非原地,规避
@@ -174,15 +171,12 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::InitBuffers(TPipe *pipe)
     pipe->InitBuffer(candsFullBuf_, s2BaseSize_ * sizeof(int32_t));
 
     tmpUb_ = tmpBuf_.Get<float>();
-    globalTopkIndice_ = indexBuf_.Get<int32_t>();
     globalTopkUb_ = sortOutBuf_.Get<float>();
     SortedBasicBlock_ = globalTopkUb_[virTopK * 2 * 2];
     globalTopkNum_ = 0;
 
     // 基本块执行前初始化UB和GM
-    // step1. 初始化一个有序索引 0 - s2BaseSize_
-    ArithProgression<int32_t>(globalTopkIndice_, 0, 1, s2BaseSize_);
-    // step2. globalTopkUb_ [CeilDiv(s1BaseSize_, 2), BASE_TOPK, 2]   -inf,-1
+    // step1. globalTopkUb_ [CeilDiv(s1BaseSize_, 2), BASE_TOPK, 2]   -inf,-1
     InitSortOutBuf(globalTopkUb_, CeilDiv(s1BaseSize_, 2) * virTopK * 2);
 
     // step3. 初始化vec1ParamGm，是否进行LD的标志位设为-1(needFd=-1)

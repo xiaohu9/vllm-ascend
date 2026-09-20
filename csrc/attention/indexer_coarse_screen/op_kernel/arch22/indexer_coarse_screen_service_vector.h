@@ -614,50 +614,6 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         uint32_t cumBegin = (r == 0) ? 0U : callerSeqLenGmQ_.GetValue(r - 1);
         uint32_t own = cumEnd - cumBegin;
         uint32_t validC = IndexerCoarseScreenCommon::Min(upper, c);
-        // 短序列直通(2026-09-20,与 ProcessMain 的行跳过配对):池域 [0,upper) 与
-        // own [upper, upper+own) 恰好相邻,恒等行 ∪ 窗口 = 纯等差 [0, upper+own),
-        // 去重/读回/组装全免。数值 = python 快路径的历史恒等输出(升序全前缀),
-        // 与全量路径集合恒等(仅行序不同,N1 集合语义覆盖)。仅 hasWindow==1。
-        if (constInfo_.hasWindow == 1U && upper <= c) {
-            // 走 VECOUT 队列(2026-09-20 终修):winOutBuf 直写 + 事件对方案两轮
-            // 实测均未绑定住跨行 MTE3/V 竞态;队列(depth 1)的 Alloc/EnQue/DeQue/
-            // Free 自带 V→MTE3 交接与槽位复用互斥(主 pass CopyOut 验证形态),
-            // 且 outQueue(32KB,over-2K 分支)≥ W*4B。
-            int32_t n = static_cast<int32_t>(upper) + static_cast<int32_t>(own);
-            LocalTensor<float> outValueUb = outQueue_.AllocTensor<float>();
-            LocalTensor<int32_t> outRow = outValueUb.template ReinterpretCast<int32_t>();
-            Duplicate(outRow, constInfo_.INVALID_IDX, W);
-            PipeBarrier<PIPE_V>();
-            // iota:标量头 32(S) + 向量倍增(偏移/长度 32 对齐) + 标量尾(S)
-            uint32_t filled = 0;
-            for (; filled < 32 && filled < static_cast<uint32_t>(n); filled++) {
-                outRow.SetValue(filled, static_cast<int32_t>(filled));
-            }
-            if (filled > 0) {
-                SetWaitFlag<HardEvent::S_V>(HardEvent::S_V);
-            }
-            while (filled < static_cast<uint32_t>(n)) {
-                uint32_t take = static_cast<uint32_t>(n) - filled;
-                if (take > filled) take = filled;
-                take &= ~31U;
-                if (take == 0) break;
-                Adds(outRow[filled], outRow[0], static_cast<int32_t>(filled), take);
-                PipeBarrier<PIPE_V>();
-                filled += take;
-            }
-            for (; filled < static_cast<uint32_t>(n); filled++) {
-                outRow.SetValue(filled, static_cast<int32_t>(filled));
-            }
-            // S 管道(标量头/尾)对 MTE3 的可见性;V 段由 EnQue 交接保证
-            SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
-            outQueue_.EnQue<float>(outValueUb);
-            outValueUb = outQueue_.DeQue<float>();
-            DataCopyPad(candidatesOutGm_[r * W], outRow,
-                        {1, static_cast<uint16_t>(W * sizeof(int32_t)), 0, 0});
-            outQueue_.FreeTensor(outValueUb);
-            auxI32.SetValue(64 + (r - rBegin), n);
-            continue;
-        }
         if (!constInfo_.hasWindow) {
             // 纯粗筛模式:主 pass 已直写输出(行距 = outW = coarseCount),仅算 aslk'
             auxI32.SetValue(64 + (r - rBegin), static_cast<int32_t>(validC));

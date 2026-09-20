@@ -613,13 +613,21 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Process()
         // 走已验证的 ProcessWindow(validC==0 分支:免去重,own 全追加)。
         // 纯粗筛/dump 模式保持原清理路径。
         if (constInfo.hasWindow == 1U && constInfo.batchSize > 0) {
-            // 0 号 AIV 走已验证窗口路径;validC==0 行现全程零 ws 访问
-            // (2026-09-21:此前 InitGlobalMemory 填 ws 方案挂起 —— 零批 tiling
-            //  的 workspace 为 0 尺寸,任何 ws 触碰都不可行)。
+            // 全零批走已验证窗口路径(validC==0 行全程零 ws 访问)。
+            // 关键(2026-09-21 挂起根因):ProcessWindow 内部首段有 SyncAll() 跨核
+            // 屏障 —— 必须与正常路径同形态:全部 AIV 进入(空范围也到屏障),
+            // 行按偶 AIV 均分、奇 AIV 空范围;单核进入 = 独自等全员屏障 = 死锁。
             if ASCEND_IS_AIV {
-                if (tmpBlockIdx == 0) {
-                    vectorService.ProcessWindow(pipe, 0, constInfo.batchSize);
+                uint32_t aivCoreNum = GetBlockNum() * 2;
+                uint32_t per = (constInfo.batchSize + aivCoreNum / 2 - 1) / (aivCoreNum / 2);
+                uint32_t idx = tmpBlockIdx / 2;
+                uint32_t wB = 0U;
+                uint32_t wE = 0U;
+                if (tmpBlockIdx % 2 == 0) {
+                    wB = idx * per;
+                    wE = wB + per > constInfo.batchSize ? constInfo.batchSize : wB + per;
                 }
+                vectorService.ProcessWindow(pipe, wB, wE);
             }
             return;
         }

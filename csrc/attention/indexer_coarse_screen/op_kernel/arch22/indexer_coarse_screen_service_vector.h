@@ -608,17 +608,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
         return;
     }
-    // 跨行 outI32 复用护栏(2026-09-20 隔离探针定界后终修):本行 DataCopyPad
-    // (MTE3 读)与下一行 V 重填竞态 —— 融合式 SetWaitFlag 同 ID 连发实测无效
-    // (L5: r0 抓拍到 r1 标量头刚写完的中间态),改分离式:SetFlag 紧跟每次
-    // DataCopyPad 之后落 MTE3 标记,下一行首 WaitFlag 消费(pingpong 先例同源:
-    // 事件一次一个,严格 set→wait→set 交替)。
-    bool mte3MarkerPending = false;
     for (uint32_t r = rBegin; r < rEnd; r++) {
-        if (mte3MarkerPending) {
-            WaitFlag<HardEvent::MTE3_V>(0);
-            mte3MarkerPending = false;
-        }
         uint32_t upper = aslkGm_.GetValue(r);
         uint32_t cumEnd = callerSeqLenGmQ_.GetValue(r);
         uint32_t cumBegin = (r == 0) ? 0U : callerSeqLenGmQ_.GetValue(r - 1);
@@ -629,16 +619,20 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         // 去重/读回/组装全免。数值 = python 快路径的历史恒等输出(升序全前缀),
         // 与全量路径集合恒等(仅行序不同,N1 集合语义覆盖)。仅 hasWindow==1。
         if (constInfo_.hasWindow == 1U && upper <= c) {
+            // 走 VECOUT 队列(2026-09-20 终修):winOutBuf 直写 + 事件对方案两轮
+            // 实测均未绑定住跨行 MTE3/V 竞态;队列(depth 1)的 Alloc/EnQue/DeQue/
+            // Free 自带 V→MTE3 交接与槽位复用互斥(主 pass CopyOut 验证形态),
+            // 且 outQueue(32KB,over-2K 分支)≥ W*4B。
             int32_t n = static_cast<int32_t>(upper) + static_cast<int32_t>(own);
-            Duplicate(outI32, constInfo_.INVALID_IDX, W);
+            LocalTensor<float> outValueUb = outQueue_.AllocTensor<float>();
+            LocalTensor<int32_t> outRow = outValueUb.template ReinterpretCast<int32_t>();
+            Duplicate(outRow, constInfo_.INVALID_IDX, W);
             PipeBarrier<PIPE_V>();
-            // iota:标量头 32 + 向量倍增(偏移/长度 32 对齐)+ 标量尾
+            // iota:标量头 32(S) + 向量倍增(偏移/长度 32 对齐) + 标量尾(S)
             uint32_t filled = 0;
             for (; filled < 32 && filled < static_cast<uint32_t>(n); filled++) {
-                outI32.SetValue(filled, static_cast<int32_t>(filled));
+                outRow.SetValue(filled, static_cast<int32_t>(filled));
             }
-            // A3(910B) S 管道标量头 → V 管道倍增读:跨管道必须 S_V 事件
-            // (PipeBarrier 只排本管道;同款教训见 V_S/MTE3_MTE2 先例)。
             if (filled > 0) {
                 SetWaitFlag<HardEvent::S_V>(HardEvent::S_V);
             }
@@ -647,21 +641,20 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
                 if (take > filled) take = filled;
                 take &= ~31U;
                 if (take == 0) break;
-                Adds(outI32[filled], outI32[0], static_cast<int32_t>(filled), take);
+                Adds(outRow[filled], outRow[0], static_cast<int32_t>(filled), take);
                 PipeBarrier<PIPE_V>();
                 filled += take;
             }
             for (; filled < static_cast<uint32_t>(n); filled++) {
-                outI32.SetValue(filled, static_cast<int32_t>(filled));
+                outRow.SetValue(filled, static_cast<int32_t>(filled));
             }
-            // A3: 标量尾(S)与向量段(V)都可能写了 outI32,MTE3 读前两者都要等
-            // (正常路径同款成对先例:S_MTE3 + V_MTE3)。
+            // S 管道(标量头/尾)对 MTE3 的可见性;V 段由 EnQue 交接保证
             SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
-            SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-            DataCopyPad(candidatesOutGm_[r * W], outI32,
+            outQueue_.EnQue<float>(outValueUb);
+            outValueUb = outQueue_.DeQue<float>();
+            DataCopyPad(candidatesOutGm_[r * W], outRow,
                         {1, static_cast<uint16_t>(W * sizeof(int32_t)), 0, 0});
-            SetFlag<HardEvent::MTE3_V>(0);
-            mte3MarkerPending = true;
+            outQueue_.FreeTensor(outValueUb);
             auxI32.SetValue(64 + (r - rBegin), n);
             continue;
         }
@@ -760,8 +753,6 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
         SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
         DataCopyPad(candidatesOutGm_[r * W], outI32, {1, static_cast<uint16_t>(W * sizeof(int32_t)), 0, 0});
-        SetFlag<HardEvent::MTE3_V>(0);
-        mte3MarkerPending = true;
         auxI32.SetValue(64 + (r - rBegin), static_cast<int32_t>(validC + nNew));
     }
     if (rEnd > rBegin) {

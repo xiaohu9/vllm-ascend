@@ -613,17 +613,10 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Process()
         // 走已验证的 ProcessWindow(validC==0 分支:免去重,own 全追加)。
         // 纯粗筛/dump 模式保持原清理路径。
         if (constInfo.hasWindow == 1U && constInfo.batchSize > 0) {
+            // 0 号 AIV 走已验证窗口路径;validC==0 行现全程零 ws 访问
+            // (2026-09-21:此前 InitGlobalMemory 填 ws 方案挂起 —— 零批 tiling
+            //  的 workspace 为 0 尺寸,任何 ws 触碰都不可行)。
             if ASCEND_IS_AIV {
-                uint32_t aivCoreNum = GetBlockNum() * 2;
-                uint64_t wsTotal = (uint64_t)constInfo.batchSize * constInfo.sparseCount;
-                uint64_t wsPer = IndexerCoarseScreenCommon::Align(
-                    (wsTotal + aivCoreNum - 1) / aivCoreNum, GM_ALIGN_BYTES / sizeof(int32_t));
-                uint64_t wsBase = tmpBlockIdx * wsPer;
-                if (wsBase < wsTotal) {
-                    uint64_t wsDeal = (wsBase + wsPer <= wsTotal) ? wsPer : wsTotal - wsBase;
-                    GlobalTensor<int32_t> wsTarget = candidatesWsGm[wsBase];
-                    AscendC::InitGlobalMemory(wsTarget, wsDeal, constInfo.INVALID_IDX);
-                }
                 if (tmpBlockIdx == 0) {
                     vectorService.ProcessWindow(pipe, 0, constInfo.batchSize);
                 }

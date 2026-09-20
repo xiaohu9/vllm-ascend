@@ -619,12 +619,16 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
             auxI32.SetValue(64 + (r - rBegin), static_cast<int32_t>(validC));
             continue;
         }
-        DataCopy(candI32, candidatesWsGm_[r * c], c);
         // 2026-09-17 竞态终修(A3 判决实证):dedup 首个 Sub(V) 可越过未完成的
         // MTE2 拷贝读 candI32 —— winStart 位置被判"缺席"追加重复(A3 的 61 即证)。
         // PipeBarrier<PIPE_MTE2> 只排 MTE2 内部;跨管道 MTE2→V 必须事件同步
         // (M1/复刻链同款先例:复刻链因先做 MTE2_S 等待而全对,真实链缺此事件)。
-        SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+        // validC==0(粗筛域空,如 prefill 首组)无去重,candI32 无人消费;且全零批
+        // 的 workspace 为 0 尺寸,读之挂起 —— 装载与等待一并跳过(2026-09-21)。
+        if (validC > 0) {
+            DataCopy(candI32, candidatesWsGm_[r * c], c);
+            SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+        }
 
         // 窗口收集:win = [winStart, winEnd) 内的有效位置,不在候选行的按升序 append。
         // validC > 0 时先去重:t = cand-pos 先钳位 [-1,1] 再平方(值域恰 {0,1})后求和,
@@ -697,9 +701,12 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         // outI32 → MTE2_V → V_S → S 补丁 → S_MTE3 + V_MTE3 → MTE3 落盘,逐段显式配对。
         Duplicate(outI32, constInfo_.INVALID_IDX, W);
         PipeBarrier<PIPE_V>();
-        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
-        DataCopy(outI32, candidatesWsGm_[r * c], c);
-        SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+        // validC==0:跳过 ws 前缀拷贝(Duplicate 的 -1 即原语义,全零批 ws 为 0 尺寸)
+        if (validC > 0) {
+            SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+            DataCopy(outI32, candidatesWsGm_[r * c], c);
+            SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+        }
         SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
         if (nNew > 0) {
             for (uint32_t k = 0; k < nNew; k++) {

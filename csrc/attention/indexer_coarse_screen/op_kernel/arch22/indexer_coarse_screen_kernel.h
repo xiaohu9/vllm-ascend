@@ -691,6 +691,15 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessMain()
             DealActSeqLenIsZero(tempLoopInfo.bIdx, tempLoopInfo.n2Idx, 0U);
             continue;
         }
+        // 短序列直通(2026-09-20):粗筛域上界 ≤ sparseCount 时 top-N 即全前缀,
+        // 本行的 mm1+排序全为冗余 —— 窗口阶段直接发恒等行 [0, upper+own)。
+        // 仅生产窗口模式(hasWindow==1);dump(2)/阶段门控(3/4)保持全量计算。
+        // AIC/AIV 同步跳过整行:种子/配对 flag 均为一次性置位,全跳行无悬空等待
+        // (尾部 CrossCoreWaitFlag 由入口种子置位满足;needDealActS1LessThanS1
+        // 清理属 ws 的 S1 空槽,窗口模式下恒等行阶段不读 ws,跳过无害)。
+        if (constInfo.hasWindow == 1U && tempLoopInfo.actS2Size <= constInfo.sparseCount) {
+            continue;
+        }
         for (uint32_t gS1LoopIdx = splitCoreInfo.gS1Start; gS1LoopIdx <= tempLoopInfo.gS1LoopEnd; gS1LoopIdx++) {
             CalcS2LoopParams(bN2LoopIdx, gS1LoopIdx);
             for (int s2LoopIdx = splitCoreInfo.s2Start; s2LoopIdx <= tempLoopInfo.s2LoopEnd; s2LoopIdx++) {

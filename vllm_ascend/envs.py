@@ -110,60 +110,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # Whether to enable PIVOT-Refine indexer (group mean-proxy scan + torch
-    # refine) on the native SFA decode path. Only grouped MTP decode batches
-    # (attn_state DecodeOnly/SpecDecoding, g >= 2) take this path; everything
-    # else falls back to the native per-query indexer. BF16 indexer only.
+    # Whether to enable PIVOT-Refine indexer (group mean-proxy coarse screen
+    # via npu_indexer_coarse_screen + per-query refine via
+    # npu_indexer_refine) on the native SFA decode path. Only grouped MTP
+    # decode batches (attn_state DecodeOnly/SpecDecoding, g >= 2) take this
+    # path; everything else falls back to the native per-query indexer.
+    # BF16 indexer only. The op path is the only implementation -- there is
+    # no torch fallback.
     "VLLM_ASCEND_ENABLE_PIVOT_REFINE": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_PIVOT_REFINE", "0"))),
-    # Use the validated npu_indexer_refine op (instead of the torch
-    # _refine_topk reference) for the PIVOT refine step inside select_topk.
-    # The torch implementation stays as the reference/fallback. Set to "0" to
-    # force the torch path (e.g. for P2 gate cross-checks on the NPU box).
-    "VLLM_ASCEND_PIVOT_REFINE_USE_OP": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_REFINE_USE_OP", "1"))),
-    # Use the npu_indexer_coarse_screen op (once validated on NPU) instead of
-    # the torch _coarse_screen reference for the PIVOT coarse step. Off by
-    # default until the op passes its NPU probe (P1 gate).
-    "VLLM_ASCEND_PIVOT_COARSE_USE_OP": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_COARSE_USE_OP", "0"))),
-    # Per-step production audit of the coarse op against the torch reference
-    # (_coarse_screen + _inject_local_window) on REAL decode inputs: (1) the
-    # hard window invariant -- every valid window position must appear in the
-    # op's output row (its violation IS the "model cannot see recent tokens"
-    # signature behind long-generation n-gram loops); (2) per-row candidate
-    # set diff (op-only / golden-only, quantifies the boundary perturbation);
-    # (3) aslk' equality. DEBUG ONLY: doubles coarse cost per step and adds a
-    # device sync per step -- never enable in perf runs.
-    "VLLM_ASCEND_PIVOT_COARSE_AUDIT": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_COARSE_AUDIT", "0"))),
-    # Per-query local window (paper Appendix B, decode variant) in the PIVOT
-    # refine DOMAIN: each decode step's pool (proxy top-4096 over [0, L), L =
-    # prefix before this step) is widened by the group's window union
-    # [L-g+1, L+g) -- the g own tokens plus the last g-1 prefix tokens -- and
-    # those entries COMPETE BY SCORE in the refine (paper semantics, not a
-    # forced reserve slot). Off = ablation / rollback switch; the lossless
-    # region (L+g <= 2048) still reproduces the native full prefix
-    # bit-identically either way.
-    "VLLM_ASCEND_PIVOT_LOCAL_WINDOW": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_LOCAL_WINDOW", "1"))),
-    # Capture real PIVOT refine op inputs (+ the torch reference output) to
-    # disk so the single-op replay harness (plans/indexer_refine_realdata_replay.py)
-    # can reproduce a production (step, layer) exactly: precision diff vs the
-    # python implementation AND op-level perf isolation on real shapes.
-    "VLLM_ASCEND_PIVOT_REFINE_DUMP": lambda: bool(int(os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP", "0"))),
-    "VLLM_ASCEND_PIVOT_REFINE_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP_DIR", "/tmp/pivot_refine_dump"),
-    "VLLM_ASCEND_PIVOT_REFINE_DUMP_MAX": lambda: int(os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP_MAX", "8")),
-    # Sample every Nth op invocation (per rank). Without a stride the MAX
-    # quota is consumed by the EARLIEST (step, layer) hits -- early steps
-    # where L+g is still in the sub-512 safe window -- and the interesting
-    # prefix lengths (tail-chunk mixes, >4096 truncation) never get captured.
-    # Example: STRIDE=20, MAX=200 spreads captures over ~4000 invocations.
-    "VLLM_ASCEND_PIVOT_REFINE_DUMP_STRIDE": lambda: int(os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP_STRIDE", "1")),
-    # Dump only ONE indexer layer (all indexer layers in a step see highly
-    # similar inputs, so sampling them all just dilutes the stride coverage).
-    # Only layers that own an indexer ever reach the dump code, so the value
-    # must be the layer_name of a real indexer layer. "first" (default) pins
-    # the first indexer layer that shows up. Otherwise an exact layer-name
-    # substring (e.g. "layers.7"). If the substring matches no indexer layer,
-    # the dump logs the real indexer-layer names it sees and falls back to the
-    # current one instead of silently capturing nothing.
-    "VLLM_ASCEND_PIVOT_REFINE_DUMP_LAYER": lambda: os.getenv("VLLM_ASCEND_PIVOT_REFINE_DUMP_LAYER", "first"),
     # Enable PIVOT on the prefill stage (positional groups of g, paper Eq. 2).
     # Off by default: prefill tail keeps the native indexer path. Independent
     # of the decode MTP group env -- the two act on mutually exclusive segments

@@ -27,7 +27,7 @@ from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
 from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE, MLAPO_MAX_SUPPORTED_TOKENS
-from vllm_ascend.attention.pivot_indexer import PivotIndexer, _apply_output_guards, _native_indexer_tail
+from vllm_ascend.attention.pivot_indexer import PivotIndexer, _apply_output_guards, _native_indexer_tail, build_prefill_geometry
 from vllm_ascend.attention.utils import (
     SFA_QSFA_TILE_SIZE,
     AscendCommonAttentionMetadata,
@@ -248,6 +248,10 @@ class AscendSFAMetadata:
     group_len: torch.Tensor | None = None
     group_key_idx: torch.Tensor | None = None
     group_key_cache_idx: torch.Tensor | None = None
+    # PIVOT per-step geometry (computed once here, consumed by every layer):
+    # decode group size g (host int) and the prefill-PIVOT group geometry.
+    pivot_decode_g: int | None = None
+    pivot_prefill: object | None = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -525,6 +529,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         # cheap; the .item() sync only appears for genuinely mixed batches,
         # where it is acceptable.
         num_decodes = num_decode_tokens = num_prefills = 0
+        pivot_decode_g = None
+        pivot_prefill = None
         if envs.VLLM_ASCEND_ENABLE_PIVOT_REFINE:
             num_decodes, num_prefills, num_decode_tokens, _ = (
                 split_decodes_and_prefills(
@@ -532,6 +538,15 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     decode_threshold=self.decode_threshold,
                 )
             )
+            # PIVOT per-step geometry, computed ONCE here so every layer's
+            # indexer call only reads fields (TTFT/TPOT: was per-layer).
+            # g == decode_threshold == 1 + num_speculative_tokens.
+            if num_decodes > 0:
+                pivot_decode_g = self.decode_threshold
+            if envs.VLLM_ASCEND_PIVOT_PREFILL \
+                    and num_actual_tokens > num_decode_tokens:
+                pivot_prefill = build_prefill_geometry(
+                    cum_query_lens, seq_lens, block_table, num_decode_tokens)
 
         return self.metadata_cls(  # type: ignore
             num_input_tokens=common_attn_metadata.num_input_tokens,
@@ -554,6 +569,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
+            pivot_decode_g=pivot_decode_g,
+            pivot_prefill=pivot_prefill,
         )
 
     def build_for_graph_capture(
@@ -1596,17 +1613,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                 dec_topk = PivotIndexer.select_topk(
                     self,
                     q_li,
-                    q_li_scale,
-                    q_li_shape_ori,
                     weights,
                     kv_cache,
                     attn_metadata,
                     actual_seq_lengths_query,
                     actual_seq_lengths_key,
-                    # A uniform all-prefill batch (n_dec == 0) is handled by
-                    # select_topk_prefill; the decode head is whole-batch only
-                    # when nothing prefill is present.
-                    allow_whole_batch=(n_pre == 0),
                 )
             # PIVOT owns the decode head [0, n_dec); the prefill tail belongs
             # to its owner -- select_topk_prefill under prefill-PIVOT, the
@@ -1642,8 +1653,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                         tail_topk = PivotIndexer.select_topk_prefill(
                             self,
                             q_li,
-                            q_li_scale,
-                            q_li_shape_ori,
                             weights,
                             kv_cache,
                             attn_metadata,

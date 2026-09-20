@@ -96,6 +96,9 @@ private:
     TBuf<TPosition::VECCALC> paramBuf_;
     // candidates 行全量(mask / true_pos 共用)
     TBuf<TPosition::VECCALC> candsFullBuf_;
+    // CopyOut 列号→KV 位置映射专用(不复用在途缓冲): [0,kSeqSize) 候选行 +
+    // [kSeqSize,+copyLen) m 掩码 + [+copyLen,+2copyLen) gather 结果
+    TBuf<TPosition::VECCALC> posMapBuf_;
 
     // tmp buff for LD
     TBuf<> ldToBeMrgBuf_;
@@ -152,6 +155,9 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::InitBuffers(TPipe *pipe)
     virTopK = constInfo_.isSparseCountOver2K ? constInfo_.sparseCount : BASE_TOPK;
 
     pipe->InitBuffer(outQueue_, 1, outNeedBufSize);                                            // 32KB  extract
+    // 列号→位置直出缓冲(2026-09-20):槽 [0,8) 哨兵 -1,候选行在 [8, 8+kSeqSize);
+    // gather id = 列号+8,idx=-1(INVALID) 落槽 0 → 直取 -1,无需掩码链。
+    pipe->InitBuffer(posMapBuf_, (constInfo_.kSeqSize + 8) * sizeof(int32_t));
     // 68KB 在搬运cube核计算得到的结果和weight时，分成两块34KB，用于db；在mrgsort时，用作临时UB
     pipe->InitBuffer(tmpBuf_, (groupInner_ * s2BaseSize_ + s2BaseSize_) * 2 * sizeof(float));
     pipe->InitBuffer(sortOutBuf_, CeilDiv(s1BaseSize_, 2) * virTopK * 2 * sizeof(float));    // 64KB
@@ -550,17 +556,40 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
                 //   交错对,经 outQueue_ EnQue/DeQue 缓冲后拷贝 idx 到输出。取代 v3/v4 TEMP DIAG
                 //   直出 raw 对(其 MTE3 直读 globalTopkUb_ 与下块 InitSortOutBuf 竞态,且污染输出
                 //   格式)。refine 无 value 输出(returnValue=false),只拷贝索引。
+                // 2026-09-20 语义升级:op 直出 KV 位置(不再是候选列号)—— 列号经本请求候选行
+                //   间接查表后写出,caller 侧 gather 全部删除。纯整数间接,零数值影响;
+                //   -1 空槽经 m 掩码保持(pos = m*(g+1)-1, m=0 ⇔ 原列号==-1)。
                 int64_t offset = (constInfo_.sparseCount <= SPARSE_COUNT_4K) ? virTopK : constInfo_.sparseCount / 2;
                 int64_t copyLen = (constInfo_.sparseCount <= SPARSE_COUNT_4K)
                                 ? constInfo_.sparseCount
                                 : constInfo_.sparseCount / 2;
                 int64_t copyNum = (constInfo_.sparseCount <= SPARSE_COUNT_4K) ? 1 : 2;
+                // 哨兵+候选行一次性装入 posMapBuf_:槽 [0,8) = -1(V),候选行
+                // [8, 8+c) (MTE2)。gather id = idx+8 ⇒ idx=-1 落槽 0 取 -1,
+                // 无需掩码/钳位链(位型经 float 视图保留)。
+                LocalTensor<int32_t> posMapUb = posMapBuf_.Get<int32_t>();
+                Duplicate(posMapUb, static_cast<int32_t>(-1), 8);
+                PipeBarrier<PIPE_V>();
+                DataCopyPad(posMapUb[8], candidatesGm_[info.bIdx * constInfo_.kSeqSize],
+                            {1, static_cast<uint16_t>(constInfo_.kSeqSize * sizeof(int32_t)), 0, 0});
+                SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
                 for (int64_t i = 0; i < copyNum; i++) {
                     LocalTensor<float> outValueUb = outQueue_.AllocTensor<float>();
                     LocalTensor<uint32_t> outIdxUb = outValueUb[offset].template ReinterpretCast<uint32_t>();
                     Extract(outValueUb, outIdxUb,
                             globalTopkUb_[innerS1Idx * virTopK * 2 + 2 * i * offset], offset / 32);
+                    PipeBarrier<PIPE_V>();
                     LocalTensor<int32_t> idxULocal1 = outValueUb[offset].template ReinterpretCast<int32_t>();
+                    // ids = idx+8 写入 values 半区(空闲);gather 结果就地覆写 idx 槽
+                    LocalTensor<int32_t> idsUb = outValueUb.template ReinterpretCast<int32_t>();
+                    Adds(idsUb, idxULocal1, static_cast<int32_t>(8), copyLen);
+                    PipeBarrier<PIPE_V>();
+                    LocalTensor<float> candFUb = posMapUb.template ReinterpretCast<float>();
+                    LocalTensor<uint32_t> idsU32 = idsUb.template ReinterpretCast<uint32_t>();
+                    LocalTensor<float> idxFUb = idxULocal1.template ReinterpretCast<float>();
+                    Gather(idxFUb, candFUb, idsU32, static_cast<uint32_t>(0),
+                           static_cast<uint32_t>(copyLen));
+                    PipeBarrier<PIPE_V>();
                     outQueue_.EnQue<float>(outValueUb);
                     outValueUb = outQueue_.DeQue<float>();
                     IndexerRefineServiceVec::CopyOut(indiceOutGm[info.indiceOutOffset + cuS1Idx *

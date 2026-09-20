@@ -614,6 +614,45 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         uint32_t cumBegin = (r == 0) ? 0U : callerSeqLenGmQ_.GetValue(r - 1);
         uint32_t own = cumEnd - cumBegin;
         uint32_t validC = IndexerCoarseScreenCommon::Min(upper, c);
+        // 短序列直通(2026-09-20,与 ProcessMain 的行跳过配对):池域 [0,upper) 与
+        // own [upper, upper+own) 恰好相邻,恒等行 ∪ 窗口 = 纯等差 [0, upper+own),
+        // 去重/读回/组装全免。数值 = python 快路径的历史恒等输出(升序全前缀),
+        // 与全量路径集合恒等(仅行序不同,N1 集合语义覆盖)。仅 hasWindow==1。
+        if (constInfo_.hasWindow == 1U && upper <= c) {
+            int32_t n = static_cast<int32_t>(upper) + static_cast<int32_t>(own);
+            Duplicate(outI32, constInfo_.INVALID_IDX, W);
+            PipeBarrier<PIPE_V>();
+            // iota:标量头 32 + 向量倍增(偏移/长度 32 对齐)+ 标量尾
+            uint32_t filled = 0;
+            for (; filled < 32 && filled < static_cast<uint32_t>(n); filled++) {
+                outI32.SetValue(filled, static_cast<int32_t>(filled));
+            }
+            // A3(910B) S 管道标量头 → V 管道倍增读:跨管道必须 S_V 事件
+            // (PipeBarrier 只排本管道;同款教训见 V_S/MTE3_MTE2 先例)。
+            if (filled > 0) {
+                SetWaitFlag<HardEvent::S_V>(HardEvent::S_V);
+            }
+            while (filled < static_cast<uint32_t>(n)) {
+                uint32_t take = static_cast<uint32_t>(n) - filled;
+                if (take > filled) take = filled;
+                take &= ~31U;
+                if (take == 0) break;
+                Adds(outI32[filled], outI32[0], static_cast<int32_t>(filled), take);
+                PipeBarrier<PIPE_V>();
+                filled += take;
+            }
+            for (; filled < static_cast<uint32_t>(n); filled++) {
+                outI32.SetValue(filled, static_cast<int32_t>(filled));
+            }
+            // A3: 标量尾(S)与向量段(V)都可能写了 outI32,MTE3 读前两者都要等
+            // (正常路径同款成对先例:S_MTE3 + V_MTE3)。
+            SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+            SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+            DataCopyPad(candidatesOutGm_[r * W], outI32,
+                        {1, static_cast<uint16_t>(W * sizeof(int32_t)), 0, 0});
+            auxI32.SetValue(64 + (r - rBegin), n);
+            continue;
+        }
         if (!constInfo_.hasWindow) {
             // 纯粗筛模式:主 pass 已直写输出(行距 = outW = coarseCount),仅算 aslk'
             auxI32.SetValue(64 + (r - rBegin), static_cast<int32_t>(validC));

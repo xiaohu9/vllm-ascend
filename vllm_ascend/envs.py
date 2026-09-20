@@ -126,14 +126,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Positional group size for prefill-PIVOT (paper default 4). Number of
     # groups per request = ceil(q_r / g); a request's last group may be smaller.
     "VLLM_ASCEND_PIVOT_PREFILL_GROUP": lambda: int(os.getenv("VLLM_ASCEND_PIVOT_PREFILL_GROUP", "4")),
-    # ---- T5: baseline (non-PIVOT native path) topk characteristic probe ----
-    # Single gate (dump dir / layer roster / rank are module constants inside
-    # pivot_topk_probe.py, not env vars). When on, baseline_topk_probe.capture in
-    # indexer_select_post_process records the native top-2048 indices VERBATIM
-    # (no fp32 re-score -- the baseline output is kept as-is, never touched).
-    # The analyzer emits a TEXT report (json/markdown, no figures) so the
-    # numbers survive off-box transport and can be re-plotted locally.
-    "VLLM_ASCEND_TOPK_PROBE": lambda: bool(int(os.getenv("VLLM_ASCEND_TOPK_PROBE", "0"))),
 }
 
 # end-env-vars-definition

@@ -570,8 +570,10 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
                 LocalTensor<int32_t> posMapUb = posMapBuf_.Get<int32_t>();
                 Duplicate(posMapUb, static_cast<int32_t>(-1), 8);
                 PipeBarrier<PIPE_V>();
-                DataCopyPad(posMapUb[8], candidatesGm_[info.bIdx * constInfo_.kSeqSize],
-                            {1, static_cast<uint16_t>(constInfo_.kSeqSize * sizeof(int32_t)), 0, 0});
+                // DataCopy 按 32B 对齐计数向上取整(多拷的 ≤7 lane 属相邻行,
+                // gather id 上界 c+7 永不触达;CANN 9.1.0 无 GM→UB 3 参 Pad 形态)
+                DataCopy(posMapUb[8], candidatesGm_[info.bIdx * constInfo_.kSeqSize],
+                         (constInfo_.kSeqSize + 7) / 8 * 8);
                 SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
                 for (int64_t i = 0; i < copyNum; i++) {
                     LocalTensor<float> outValueUb = outQueue_.AllocTensor<float>();

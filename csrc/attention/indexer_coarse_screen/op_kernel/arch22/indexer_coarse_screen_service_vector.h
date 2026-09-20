@@ -616,7 +616,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
     bool mte3MarkerPending = false;
     for (uint32_t r = rBegin; r < rEnd; r++) {
         if (mte3MarkerPending) {
-            WaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+            WaitFlag<HardEvent::MTE3_V>(0);
             mte3MarkerPending = false;
         }
         uint32_t upper = aslkGm_.GetValue(r);
@@ -660,7 +660,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
             SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
             DataCopyPad(candidatesOutGm_[r * W], outI32,
                         {1, static_cast<uint16_t>(W * sizeof(int32_t)), 0, 0});
-            SetFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+            SetFlag<HardEvent::MTE3_V>(0);
             mte3MarkerPending = true;
             auxI32.SetValue(64 + (r - rBegin), n);
             continue;
@@ -760,7 +760,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
         SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
         DataCopyPad(candidatesOutGm_[r * W], outI32, {1, static_cast<uint16_t>(W * sizeof(int32_t)), 0, 0});
-        SetFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+        SetFlag<HardEvent::MTE3_V>(0);
         mte3MarkerPending = true;
         auxI32.SetValue(64 + (r - rBegin), static_cast<int32_t>(validC + nNew));
     }

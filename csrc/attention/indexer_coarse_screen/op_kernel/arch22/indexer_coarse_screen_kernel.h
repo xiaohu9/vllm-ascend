@@ -607,7 +607,29 @@ template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Process()
 {
     if (usedCoreNum == 0) {
-        // 没有计算任务，直接清理输出
+        // 全零批(所有行粗筛域空,如 prefill-PIVOT 的请求首组单独成批):窗口模式
+        // 仍须发恒等语义行(池空,own tokens [0, upper+own) 全进精筛域)—— 主 pass
+        // 未运行,ws 无 DealActSeqLenIsZero 的 -1 预填,各 AIV 协作补填后由 0 号核
+        // 走已验证的 ProcessWindow(validC==0 分支:免去重,own 全追加)。
+        // 纯粗筛/dump 模式保持原清理路径。
+        if (constInfo.hasWindow == 1U && constInfo.batchSize > 0) {
+            if ASCEND_IS_AIV {
+                uint32_t aivCoreNum = GetBlockNum() * 2;
+                uint64_t wsTotal = (uint64_t)constInfo.batchSize * constInfo.sparseCount;
+                uint64_t wsPer = IndexerCoarseScreenCommon::Align(
+                    (wsTotal + aivCoreNum - 1) / aivCoreNum, GM_ALIGN_BYTES / sizeof(int32_t));
+                uint64_t wsBase = tmpBlockIdx * wsPer;
+                if (wsBase < wsTotal) {
+                    uint64_t wsDeal = (wsBase + wsPer <= wsTotal) ? wsPer : wsTotal - wsBase;
+                    GlobalTensor<int32_t> wsTarget = candidatesWsGm[wsBase];
+                    AscendC::InitGlobalMemory(wsTarget, wsDeal, constInfo.INVALID_IDX);
+                }
+                if (tmpBlockIdx == 0) {
+                    vectorService.ProcessWindow(pipe, 0, constInfo.batchSize);
+                }
+            }
+            return;
+        }
         ProcessInvalid();
         return;
     }

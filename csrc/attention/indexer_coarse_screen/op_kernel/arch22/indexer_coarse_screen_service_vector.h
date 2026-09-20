@@ -614,6 +614,10 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         uint32_t cumBegin = (r == 0) ? 0U : callerSeqLenGmQ_.GetValue(r - 1);
         uint32_t own = cumEnd - cumBegin;
         uint32_t validC = IndexerCoarseScreenCommon::Min(upper, c);
+        // A3: 上一行 DataCopyPad(MTE3 读 outI32)与本行 V 重填的跨行竞态 ——
+        // 正常路径靠行首 MTE2 装载链隐式串行;恒等行无 MTE2,必须显式 MTE3_V。
+        // (NPU 实证 2026-09-20 zero_prefix r0 读到 r1 内容 = 本竞态签名)
+        SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
         // 短序列直通(2026-09-20,与 ProcessMain 的行跳过配对):池域 [0,upper) 与
         // own [upper, upper+own) 恰好相邻,恒等行 ∪ 窗口 = 纯等差 [0, upper+own),
         // 去重/读回/组装全免。数值 = python 快路径的历史恒等输出(升序全前缀),

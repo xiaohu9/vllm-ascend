@@ -644,11 +644,17 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Process()
         }
     }
     if ASCEND_IS_AIV {
-        // M2.5 窗口注入(全局后阶段):行范围 = 本对 SplitCore 请求范围(偶 AIV 承担,
-        // 与 M1 同款配对 —— 行 r 的窗口读者 = 主 pass CopyOut 写者 AIV 2r,同核有序)
-        uint32_t wBegin = splitCoreInfo.isEmptyRange ? 0U : splitCoreInfo.bN2Start;
-        uint32_t wEnd = splitCoreInfo.isEmptyRange ? 0U : splitCoreInfo.bN2End + 1U;
-        if (tmpBlockIdx % 2 == 1) {
+        // M2.5 窗口注入。2026-09-21 窗口行覆盖修复:SplitCore 的 bN2Start 跳过空
+        // 请求(upper=0 ⇒ 块数 0),其相邻行的窗口输出将无人写出(隔离探针 L2-L5
+        // 实证)。改为全请求 [0,batchSize) 按 AIV 对均分切片——每请求恰被一对处理
+        // 一次;validC==0 行走 ws-free 恒等分支,任意对可安全处理任意行(SyncAll
+        // 已保证主 pass MTE3 写对全体可见)。全员仍到 ProcessWindow 内部 SyncAll。
+        uint32_t aivPairs = GetBlockNum();
+        uint32_t myPair = tmpBlockIdx / 2;
+        uint32_t slice = (constInfo.batchSize + aivPairs - 1) / aivPairs;
+        uint32_t wBegin = myPair * slice;
+        uint32_t wEnd = (wBegin + slice > constInfo.batchSize) ? constInfo.batchSize : wBegin + slice;
+        if (tmpBlockIdx % 2 == 1 || myPair >= aivPairs) {
             wBegin = wEnd; // 奇 AIV(对的第 2 个)不承担窗口读写
         }
         vectorService.ProcessWindow(pipe, wBegin, wEnd);

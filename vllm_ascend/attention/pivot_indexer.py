@@ -117,7 +117,15 @@ class PivotIndexer:
             w_bar,
             kv_cache[2],
             actual_seq_lengths_query=cum[:K].to(torch.int32),
-            actual_seq_lengths_key=(seq_lens[:K] - g).to(torch.int32),
+            # Graph replay pads seq_lens rows [num_reqs, K) with 0
+            # (model_runner_v1.py:1264); subtracting g turns pad rows into a
+            # NEGATIVE S2 walk bound and the key gather runs out of the KV
+            # pool -- MTE invalid-GM AICORE fault on the first sub-capacity
+            # replay (2026-09-21 19:41, fault kernel IndexerCoarseScreen).
+            # Real rows have seq_lens >= g so aslk >= 0 already: the clamp
+            # only neutralizes pad rows, eager output is bit-identical, and
+            # clamp is a plain capturable op.
+            actual_seq_lengths_key=torch.clamp(seq_lens[:K] - g, min=0).to(torch.int32),
             block_table=attn_metadata.block_table[:K],
             coarse_count=_COARSE_BUDGET,
             has_window=1,

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import inspect
 import weakref
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -21,6 +22,7 @@ from vllm.logger import logger
 from vllm.platforms import current_platform
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend import envs as ascend_envs
 
 from ..utils import weak_ref_tensors
 
@@ -49,6 +51,19 @@ def _is_stream_resource_capture_error(exc: RuntimeError) -> bool:
 
 def _raise_stream_resource_capture_error(exc: RuntimeError) -> None:
     raise RuntimeError(f"{_STREAM_RESOURCE_GUIDANCE}\nOriginal error:\n{exc}") from exc
+
+
+def _capture_error_mode_supported() -> bool:
+    # torch_npu gained capture_error_mode on torch.npu.graph (forwarded to
+    # aclmdlRICaptureBegin) in newer releases; probe once instead of
+    # assuming -- older wheels reject the kwarg with a TypeError.
+    try:
+        return "capture_error_mode" in inspect.signature(torch.npu.graph).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+_CAPTURE_ERROR_MODE_SUPPORTED = _capture_error_mode_supported()
 
 
 @dataclasses.dataclass
@@ -189,7 +204,15 @@ class ACLGraphWrapper:
                 get_offloader().sync_prev_onload()
                 forward_context.capturing = True
                 try:
-                    with torch.npu.graph(aclgraph, pool=self.graph_pool):
+                    capture_mode_kwargs = (
+                        {
+                            "capture_error_mode": ascend_envs
+                            .VLLM_ASCEND_ACLGRAPH_CAPTURE_ERROR_MODE
+                        }
+                        if _CAPTURE_ERROR_MODE_SUPPORTED
+                        else {}
+                    )
+                    with torch.npu.graph(aclgraph, pool=self.graph_pool, **capture_mode_kwargs):
                         # `output` is managed by pytorch's aclgraph pool
                         output = self.runnable(*args, **kwargs)
                         # Join offloader's copy stream after forward to avoid

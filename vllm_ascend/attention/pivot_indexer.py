@@ -122,10 +122,15 @@ class PivotIndexer:
             # NEGATIVE S2 walk bound and the key gather runs out of the KV
             # pool -- MTE invalid-GM AICORE fault on the first sub-capacity
             # replay (2026-09-21 19:41, fault kernel IndexerCoarseScreen).
-            # Real rows have seq_lens >= g so aslk >= 0 already: the clamp
-            # only neutralizes pad rows, eager output is bit-identical, and
-            # clamp is a plain capturable op.
-            actual_seq_lengths_key=torch.clamp(seq_lens[:K] - g, min=0).to(torch.int32),
+            # The floor is 1, NOT 0: an aslk=0 (empty-walk) row corrupts its
+            # NEIGHBORS' candidate sets in the coarse kernel (graph_smoke_
+            # service_shape.py S6b 2026-09-21: pad=0 -> real-row C_diff=2507
+            # while the eager-determinism control is clean; pad=1/4/4096 all
+            # clean) -- clamp-to-0 traded the crash for silent candidate
+            # corruption. Real rows have aslk = L >= 1, so the floor only
+            # touches pads; a pad row walks 1 stale-but-pooled block id --
+            # memory-safe, and its output is masked downstream.
+            actual_seq_lengths_key=torch.clamp(seq_lens[:K] - g, min=1).to(torch.int32),
             block_table=attn_metadata.block_table[:K],
             coarse_count=_COARSE_BUDGET,
             has_window=1,

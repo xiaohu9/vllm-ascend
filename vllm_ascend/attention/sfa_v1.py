@@ -1632,8 +1632,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                     pre_topk = PivotIndexer.select_topk_prefill(
                         self,
                         q_li,
-                        q_li_scale,
-                        q_li_shape_ori,
                         weights,
                         kv_cache,
                         attn_metadata,

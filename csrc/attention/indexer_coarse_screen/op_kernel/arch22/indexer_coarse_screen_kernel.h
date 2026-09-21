@@ -618,16 +618,8 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Process()
             // 屏障 —— 必须与正常路径同形态:全部 AIV 进入(空范围也到屏障),
             // 行按偶 AIV 均分、奇 AIV 空范围;单核进入 = 独自等全员屏障 = 死锁。
             if ASCEND_IS_AIV {
-                uint32_t aivCoreNum = GetBlockNum() * 2;
-                uint32_t per = (constInfo.batchSize + aivCoreNum / 2 - 1) / (aivCoreNum / 2);
-                uint32_t idx = tmpBlockIdx / 2;
-                uint32_t wB = 0U;
-                uint32_t wE = 0U;
-                if (tmpBlockIdx % 2 == 0) {
-                    wB = idx * per;
-                    wE = wB + per > constInfo.batchSize ? constInfo.batchSize : wB + per;
-                }
-                vectorService.ProcessWindow(pipe, wB, wE);
+                vectorService.ProcessWindow(pipe, tmpBlockIdx, GetBlockNum() * 2,
+                                            constInfo.batchSize);
             }
             return;
         }
@@ -644,20 +636,24 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Process()
         }
     }
     if ASCEND_IS_AIV {
-        // M2.5 窗口注入。2026-09-21 窗口行覆盖修复:SplitCore 的 bN2Start 跳过空
-        // 请求(upper=0 ⇒ 块数 0),其相邻行的窗口输出将无人写出(隔离探针 L2-L5
-        // 实证)。改为全请求 [0,batchSize) 按 AIV 对均分切片——每请求恰被一对处理
-        // 一次;validC==0 行走 ws-free 恒等分支,任意对可安全处理任意行(SyncAll
-        // 已保证主 pass MTE3 写对全体可见)。全员仍到 ProcessWindow 内部 SyncAll。
-        uint32_t aivPairs = GetBlockNum();
-        uint32_t myPair = tmpBlockIdx / 2;
-        uint32_t slice = (constInfo.batchSize + aivPairs - 1) / aivPairs;
-        uint32_t wBegin = myPair * slice;
-        uint32_t wEnd = (wBegin + slice > constInfo.batchSize) ? constInfo.batchSize : wBegin + slice;
-        if (tmpBlockIdx % 2 == 1 || myPair >= aivPairs) {
+        // M2.5 窗口注入。2026-09-21 终版:恢复 pd 验证的 splitCoreInfo 配对分区
+        // (行 r 的窗口读者 = 主 pass CopyOut 写者同核,同核 MTE3→MTE2 有序 ——
+        // 这是消除跨对 GM 可见性时序的原始设计,aivPairs 均分切片方案在 16 卡
+        // 生产冷启动首次调用时间歇输出垃圾 = 打破配对的竞态签名)。
+        // 空请求行(upper=0 ⇒ 块数 0,被 bN2Start 跳过、原版无人写出)由 pair 0
+        // 在进 ProcessWindow 前直写恒等行 [0, upper+own)(ws-free,零同步依赖,
+        // 主 pass 从未写这些行的 ws,无可见性问题)。
+        uint32_t wBegin = splitCoreInfo.isEmptyRange ? 0U : splitCoreInfo.bN2Start;
+        uint32_t wEnd = splitCoreInfo.isEmptyRange ? 0U : splitCoreInfo.bN2End + 1U;
+        if (tmpBlockIdx % 2 == 1) {
             wBegin = wEnd; // 奇 AIV(对的第 2 个)不承担窗口读写
         }
         vectorService.ProcessWindow(pipe, wBegin, wEnd);
+        // 空请求行补写放 ProcessWindow 之后:其内部 pipe->Reset()+InitBuffer
+        // 已初始化 winOut/winAux,EmitIdentityRows 直接复用(零 ws 依赖)。
+        if (constInfo.hasWindow == 1U && tmpBlockIdx == 0 && wBegin > 0) {
+            vectorService.EmitIdentityRows(wBegin); // [0, wBegin) = 被跳过的空请求行
+        }
     }
 }
 

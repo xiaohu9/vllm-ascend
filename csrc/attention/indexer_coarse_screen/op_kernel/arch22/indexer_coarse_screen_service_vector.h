@@ -75,7 +75,8 @@ public:
                                                   GlobalTensor<int32_t> candidatesOutGm,
                                                   GlobalTensor<int32_t> aslkOutGm,
                                                   GlobalTensor<int32_t> dbgMm1);
-    __aicore__ inline void ProcessWindow(TPipe *pipe, uint32_t rBegin, uint32_t rEnd);
+    __aicore__ inline void ProcessWindow(TPipe *pipe, uint32_t aivIdx, uint32_t aivCount, uint32_t totalRows);
+    __aicore__ inline void EmitIdentityRows(uint32_t rowCount);
 
 protected:
     GlobalTensor<MM1_OUT_T> mm1ResGm;
@@ -500,7 +501,41 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::InitCoarseGlobalTe
 // 尾部 -1 补齐到 outW(与 torch _inject_local_window 逐位一致:有效数 = min(upper,c),topk 行内
 // -1 恒在尾部);aslk'[r] = validC + nNew。hasWindow=0 时主 pass 已直写输出,仅算 aslk'=min(upper,c)。
 template <typename LIT>
-__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPipe *pipe, uint32_t rBegin, uint32_t rEnd)
+__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::EmitIdentityRows(uint32_t rowCount)
+{
+    // 空请求行(upper==0)的恒等直写:池域为空,候选行 = [0, own)。
+    // 纯 S 管道标量 + 一次 DataCopyPad;不读 ws(主 pass 从未写这些行)、
+    // 不进 ProcessWindow(避免与配对分区的 SyncAll 参与集混淆)。
+    // aslk' 用 aux 逐行直写(DataCopyPad 4B)。
+    LocalTensor<int32_t> outI32 = winOutBuf_.Get<int32_t>();
+    LocalTensor<int32_t> auxI32 = winAuxBuf_.Get<int32_t>();
+    for (uint32_t r = 0; r < rowCount; r++) {
+        uint32_t cumEnd = callerSeqLenGmQ_.GetValue(r);
+        uint32_t cumBegin = (r == 0) ? 0U : callerSeqLenGmQ_.GetValue(r - 1);
+        uint32_t own = cumEnd - cumBegin;
+        const uint32_t W = constInfo_.outW;
+        Duplicate(outI32, constInfo_.INVALID_IDX, W);
+        PipeBarrier<PIPE_V>();
+        SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+        for (uint32_t k = 0; k < own && k < W; k++) {
+            outI32.SetValue(k, static_cast<int32_t>(k));
+        }
+        SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+        SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+        DataCopyPad(candidatesOutGm_[r * W], outI32,
+                    {1, static_cast<uint16_t>(W * sizeof(int32_t)), 0, 0});
+        auxI32.SetValue(0, static_cast<int32_t>(own));
+        SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+        DataCopyPad(aslkOutGm_[r], auxI32, {1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0});
+        // 行间 outI32 复用护栏:事件类方案实测全不可靠(坑 #45),空行路径低频,
+        // 直接 PIPE_ALL 排空(含 MTE3)—— 下一行 V 重填绝对安全。
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+    SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
+}
+
+template <typename LIT>
+__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPipe *pipe, uint32_t aivIdx, uint32_t aivCount, uint32_t totalRows)
 {
     // 行范围由 kernel 传入(= 同对 AIC 的 SplitCore 精确请求范围,偶 AIV 承担):
     // 行 r 的候选行由主 pass 的 AIV 2r CopyOut(MTE3)写出 —— 本分区让 AIV 2r 同时
@@ -525,7 +560,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
     pipe->InitBuffer(winPosBuf_, cAlign * sizeof(int32_t));
     pipe->InitBuffer(winMskBuf_, cAlign * sizeof(int32_t));
     pipe->InitBuffer(winOutBuf_, W * sizeof(int32_t));
-    pipe->InitBuffer(winAuxBuf_, (64 + (rEnd - rBegin)) * sizeof(int32_t));
+    pipe->InitBuffer(winAuxBuf_, (64 + totalRows) * sizeof(int32_t));
 
     LocalTensor<int32_t> candI32 = winCandBuf_.Get<int32_t>();
     LocalTensor<int32_t> posI32 = winPosBuf_.Get<int32_t>();
@@ -540,7 +575,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         LocalTensor<int32_t> dumpCand = winCandBuf_.Get<int32_t>();
         LocalTensor<int32_t> posI32 = winPosBuf_.Get<int32_t>();
         LocalTensor<int32_t> mskI32 = winMskBuf_.Get<int32_t>();
-        for (uint32_t r = rBegin; r < rEnd; r++) {
+        for (uint32_t r = aivIdx; r < totalRows; r += aivCount) {
             DataCopy(dumpCand, candidatesWsGm_[r * c], c);
             PipeBarrier<PIPE_MTE2>();
             SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
@@ -614,9 +649,12 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         uint32_t cumBegin = (r == 0) ? 0U : callerSeqLenGmQ_.GetValue(r - 1);
         uint32_t own = cumEnd - cumBegin;
         uint32_t validC = IndexerCoarseScreenCommon::Min(upper, c);
+        // 2026-09-21 补:validC==0 行的 MTE3(V Identity 写)与本行/下一行
+        // MTE2 装载的跨管道序,由下方分支内 MTE2_V/V_S 的既有配对保证;
+        // 此处不再有其他裸写。
         if (!constInfo_.hasWindow) {
             // 纯粗筛模式:主 pass 已直写输出(行距 = outW = coarseCount),仅算 aslk'
-            auxI32.SetValue(64 + (r - rBegin), static_cast<int32_t>(validC));
+            auxI32.SetValue(64 + (r - aivIdx), static_cast<int32_t>(validC));
             continue;
         }
         // 2026-09-17 竞态终修(A3 判决实证):dedup 首个 Sub(V) 可越过未完成的
@@ -716,7 +754,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
         SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
         DataCopyPad(candidatesOutGm_[r * W], outI32, {1, static_cast<uint16_t>(W * sizeof(int32_t)), 0, 0});
-        auxI32.SetValue(64 + (r - rBegin), static_cast<int32_t>(validC + nNew));
+        auxI32.SetValue(64 + (r - aivIdx), static_cast<int32_t>(validC + nNew));
     }
     if (rEnd > rBegin) {
         SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);

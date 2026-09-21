@@ -618,8 +618,16 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Process()
             // 屏障 —— 必须与正常路径同形态:全部 AIV 进入(空范围也到屏障),
             // 行按偶 AIV 均分、奇 AIV 空范围;单核进入 = 独自等全员屏障 = 死锁。
             if ASCEND_IS_AIV {
-                vectorService.ProcessWindow(pipe, tmpBlockIdx, GetBlockNum() * 2,
-                                            constInfo.batchSize);
+                uint32_t aivCoreNum = GetBlockNum() * 2;
+                uint32_t per = (constInfo.batchSize + aivCoreNum / 2 - 1) / (aivCoreNum / 2);
+                uint32_t idx = tmpBlockIdx / 2;
+                uint32_t wB = 0U;
+                uint32_t wE = 0U;
+                if (tmpBlockIdx % 2 == 0) {
+                    wB = idx * per;
+                    wE = wB + per > constInfo.batchSize ? constInfo.batchSize : wB + per;
+                }
+                vectorService.ProcessWindow(pipe, wB, wE);
             }
             return;
         }

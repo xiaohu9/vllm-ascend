@@ -206,7 +206,16 @@ class PivotIndexer:
             w_bar,
             kv_cache[2],
             actual_seq_lengths_query=geo.aslq_refine.to(torch.int32),
-            actual_seq_lengths_key=geo.group_start.to(torch.int32),
+            # Floor 1, same as the decode path: a fresh request's FIRST-chunk
+            # first groups have group_start = 0 (no prefix) -> aslk=0
+            # empty-walk rows, which the coarse kernel turns into NEIGHBOR
+            # candidate-set corruption (proven: graph_smoke_service_shape.py
+            # S6b, pad=0 -> real-row C_diff~2500 with a clean eager control;
+            # the precision probe's zero_prefix case at R=4 did NOT trigger
+            # it -- geometry-dependent, R=8 does). Walking 1 position reads
+            # the request's own token-0 key -- real pooled data, so this
+            # only converts the empty walk into a harmless 1-key scan.
+            actual_seq_lengths_key=torch.clamp(geo.group_start, min=1).to(torch.int32),
             block_table=geo.group_bt,
             coarse_count=_COARSE_BUDGET,
             has_window=1,

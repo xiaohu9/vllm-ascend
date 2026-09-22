@@ -126,19 +126,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Positional group size for prefill-PIVOT (paper default 4). Number of
     # groups per request = ceil(q_r / g); a request's last group may be smaller.
     "VLLM_ASCEND_PIVOT_PREFILL_GROUP": lambda: int(os.getenv("VLLM_ASCEND_PIVOT_PREFILL_GROUP", "4")),
-    # Capture error mode forwarded to torch.npu.graph (aclmdlRICaptureBegin).
-    # "global" (default = upstream behavior) rejects synchronized host ops
-    # from ANY thread during capture; aclnn launch paths whose libopapi
-    # delivery performs a synchronized H2D memcpy then fail with EE1016
-    # (rtMemcpy 107030), the copy never lands, and the captured kernel
-    # replays with uninitialized params (2026-09-21 AICORE MTE fault,
-    # 0xa5a5a5a5-filled args). "relaxed" permits the operation per the
-    # EE1016 guidance: the copy executes once at capture time and replay
-    # reuses it (static shapes per captured graph make this safe).
-    # "thread_local" only silences other-thread violations. Any other value
-    # is rejected by torch_npu at capture time.
-    "VLLM_ASCEND_ACLGRAPH_CAPTURE_ERROR_MODE": lambda: os.getenv(
-        "VLLM_ASCEND_ACLGRAPH_CAPTURE_ERROR_MODE", "global"),
 }
 
 # end-env-vars-definition

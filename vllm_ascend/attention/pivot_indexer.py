@@ -125,7 +125,7 @@ class PivotIndexer:
             # The floor is 1, NOT 0: an aslk=0 (empty-walk) row corrupts its
             # NEIGHBORS' candidate sets in the coarse kernel (graph_smoke_
             # service_shape.py S6b 2026-09-21: pad=0 -> real-row C_diff=2507
-            # while the eager-determinism control is clean; pad=1/4/4096 all
+            # while the eager-determinism control is clean; pad =1/4/4096 all
             # clean) -- clamp-to-0 traded the crash for silent candidate
             # corruption. Real rows have aslk = L >= 1, so the floor only
             # touches pads; a pad row walks 1 stale-but-pooled block id --
@@ -186,8 +186,15 @@ class PivotIndexer:
         # expansion, unlike scatter_add_ (whose expanded index OOMed on large
         # tails). Numerically the same accumulation as the validated
         # scatter_add path.
-        q_dq = q_li[D:]
-        w_t = weights[D:]
+        # SLICE TO THE ACTUAL TAIL, not to end-of-file: q_li rows =
+        # num_input_tokens >= num_actual_tokens (graph input padding -- the
+        # npugraph_ex piecewise path hit 129(geo) vs 144(q_li[D:]) rows,
+        # 2026-09-22). The native path bounds rows by aslq and ignores pad
+        # rows; our glue slices by SHAPE, so cut exactly geo.N_tail real tail
+        # rows (pad rows sit AFTER all real tokens). The caller's
+        # _apply_output_guards re-pads the result to the native row count.
+        q_dq = q_li[D:D + geo.N_tail]
+        w_t = weights[D:D + geo.N_tail]
         H, Dh = q_dq.shape[1], q_dq.shape[2]
         q_bar = q_dq.new_zeros(geo.P, H, Dh) \
             .index_add_(0, geo.group_ids, q_dq) / geo.group_sizes.view(-1, 1, 1)

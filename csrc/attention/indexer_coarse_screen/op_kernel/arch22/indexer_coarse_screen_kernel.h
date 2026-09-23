@@ -665,6 +665,10 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessBaseBlock(uint32_t
 {
     CalcRunInfo(loop, s2LoopIdx, runInfo);
     if ASCEND_IS_AIC {
+        if (aiCoreIdx == 23U) { // 2026-09-24 末行竞态插桩(定位后删除)
+            AscendC::PRINTF("[DBG-R63] AIC bN2=%d s2=%d loop=%d\n",
+                (int32_t)runInfo.bN2Idx, (int32_t)runInfo.s2Idx, (int32_t)runInfo.loop);
+        }
         CrossCoreWaitFlag(constInfo.syncV1C1);
         matmulService.ComputeMm1(runInfo);
         CrossCoreSetFlag<IndexerCoarseScreenCommon::ConstInfo::FIA_SYNC_MODE2, PIPE_FIX>(constInfo.syncC1V1);

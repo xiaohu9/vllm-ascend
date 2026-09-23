@@ -227,10 +227,6 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::CleanInvalidOutput
     outQueue_.FreeTensor(valueULocal);
 }
 
-// 2026-09-24 末行 CopyOut 竞态插桩(定位后整体删除):只追踪 core23 的 even AIV
-// (blockId_=46),plog 过滤 [DBG-R63]。
-constexpr bool DBG_R63_TRACE = true;
-
 template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const IndexerCoarseScreenCommon::RunInfo &info)
 {
@@ -269,12 +265,6 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
     // cuRealAcSeq: 当前基本块S1对应的AcSeq(粗筛域上界 upper[r],PA 布局恒绝对值;
     // attenMaskFlag 硬编码 false,掩码改写分支已随死代码删除)
     int32_t cuRealAcSeq = info.actS2Size;
-    if (DBG_R63_TRACE && blockId_ == 46U) {
-        AscendC::PRINTF("[DBG-R63] Vec bN2=%d s2=%d loop=%d actS2=%d bSS=%d cuReal=%d perAiv=%d\n",
-            (int32_t)info.bN2Idx, (int32_t)info.s2Idx, (int32_t)info.loop,
-            (int32_t)info.actS2Size, (int32_t)blockS2StartIdx_, cuRealAcSeq,
-            (int32_t)cuS1ProcNumPerAiv);
-    }
     LocalTensor<float> reduceOutBuff = reduceOutBuf_.Get<float>();
     LocalTensor<float> brcBuf = brcBuf_.Get<float>();
     for (int innerS1Idx = 0; innerS1Idx < cuS1ProcNumPerAiv; innerS1Idx++) {
@@ -353,12 +343,6 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
             outQueue_.FreeTensor(tmpSortBuf);
 
             bool needCopyOutGm = blockS2StartIdx_ == 0 && isS2End;
-            if (DBG_R63_TRACE && blockId_ == 46U) {
-                AscendC::PRINTF("[DBG-R63] gate=%d off=%d len=%d\n",
-                    (int32_t)needCopyOutGm,
-                    (int32_t)(info.indiceOutOffset + cuS1Idx * constInfo_.sparseCount),
-                    (int32_t)(needCopyOutGm ? constInfo_.sparseCount : 0));
-            }
 
             if (needCopyOutGm) {
                 // 生产形态 CopyOut: Extract 分离 globalTopkUb_ 的 (value,index) 交错对,经 outQueue_

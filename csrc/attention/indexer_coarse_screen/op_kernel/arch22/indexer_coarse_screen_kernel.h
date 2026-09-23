@@ -335,6 +335,15 @@ __aicore__ void inline IndexerCoarseScreenKernel<LIT>::SplitCore(uint32_t curCor
                     coreDealBlockCnt = coreIdx < deal1MoreBlockCoreNum ? minBlockPerCore + 1 : minBlockPerCore;
                 } else {
                     lastGS1RemainBlockCnt += s2RemainBaseNum;
+                    if (constInfo.isSparseCountOver2K) {
+                        // 2026-09-24 末行丢失根修(NPU PRINTF 判决):over-2K 下
+                        // s2Loop≡1 且本循环在非切分路径不自增 s2Idx —— 不 break
+                        // 则同一行原地重迭代把整核预算吸干,每核恰得 1 行,R>核数
+                        // 时尾部行全部沦为遗留,extension 以 s2End=0(为尾零行设计)
+                        // 补接 → 末行只扫 1 块,isS2End 永假,CopyOut 永不执行。
+                        // break 后按行推进,Σ预算=Σ行 精确覆盖,extension 不再触发。
+                        break;
+                    }
                 }
             }
         }
@@ -665,10 +674,6 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessBaseBlock(uint32_t
 {
     CalcRunInfo(loop, s2LoopIdx, runInfo);
     if ASCEND_IS_AIC {
-        if (aiCoreIdx == 23U) { // 2026-09-24 末行竞态插桩(定位后删除)
-            AscendC::PRINTF("[DBG-R63] AIC bN2=%d s2=%d loop=%d\n",
-                (int32_t)runInfo.bN2Idx, (int32_t)runInfo.s2Idx, (int32_t)runInfo.loop);
-        }
         CrossCoreWaitFlag(constInfo.syncV1C1);
         matmulService.ComputeMm1(runInfo);
         CrossCoreSetFlag<IndexerCoarseScreenCommon::ConstInfo::FIA_SYNC_MODE2, PIPE_FIX>(constInfo.syncC1V1);

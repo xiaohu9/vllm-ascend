@@ -547,7 +547,15 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
     // 跨管道 MTE3→MTE2 必须用事件同步,PipeBarrier<PIPE_MTE3> 只排 MTE3 管道内部,
     // MTE2 读可越过未落地的 MTE3 写(NPU 实测 dedup 双向判错 +1dup/-1miss 即半写快照)。
     // M1 段同款先例:SetWaitFlag<MTE3_MTE2> 后 qBar 行为验证正确。
-    PipeBarrier<PIPE_MTE3>();
+    // 2026-09-23 竞态第四例修复(graph_smoke_service_shape.py S7 二分判决):
+    //   批内含 aslk=0 行(零行走 DealActSeqLenIsZero 清理分支)时,上述
+    //   MTE3 局部 barrier + SyncAll(任务级,不保证各核 MTE3 落地)不足以
+    //   闭合"全部核的 ws 写 → 全部核的窗口读"——实数行候选集非确定损坏
+    //   (S6b/S7:C_diff 2507~4043 随时序漂移,同输入紧邻两跑互差 848;
+    //   hasWindow=0 纯粗筛零污染 = 窗口阶段定点)。修复 = 本核 PIPE_ALL
+    //   排空后再过 SyncAll(坑 #45 同款先例:EmitIdentityRows 事件类不可靠,
+    //   PIPE_ALL 绝对安全),每 launch 仅一次,代价可忽略。
+    AscendC::PipeBarrier<PIPE_ALL>();
     SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
     SyncAll();
     // 独立窗口缓冲(pipe->Reset 释放主 pass 缓冲,先例 = InitLDBuffers)

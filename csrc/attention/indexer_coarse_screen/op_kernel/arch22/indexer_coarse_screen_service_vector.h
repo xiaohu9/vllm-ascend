@@ -547,14 +547,15 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
     // 跨管道 MTE3→MTE2 必须用事件同步,PipeBarrier<PIPE_MTE3> 只排 MTE3 管道内部,
     // MTE2 读可越过未落地的 MTE3 写(NPU 实测 dedup 双向判错 +1dup/-1miss 即半写快照)。
     // M1 段同款先例:SetWaitFlag<MTE3_MTE2> 后 qBar 行为验证正确。
-    // 2026-09-23 竞态第四例修复(graph_smoke_service_shape.py S7 二分判决):
-    //   批内含 aslk=0 行(零行走 DealActSeqLenIsZero 清理分支)时,上述
-    //   MTE3 局部 barrier + SyncAll(任务级,不保证各核 MTE3 落地)不足以
-    //   闭合"全部核的 ws 写 → 全部核的窗口读"——实数行候选集非确定损坏
-    //   (S6b/S7:C_diff 2507~4043 随时序漂移,同输入紧邻两跑互差 848;
-    //   hasWindow=0 纯粗筛零污染 = 窗口阶段定点)。修复 = 本核 PIPE_ALL
-    //   排空后再过 SyncAll(坑 #45 同款先例:EmitIdentityRows 事件类不可靠,
-    //   PIPE_ALL 绝对安全),每 launch 仅一次,代价可忽略。
+    // 2026-09-23 竞态第四例(graph_smoke_service_shape.py S7 二分判决):
+    //   批内含 aslk=0 行(零行走 DealActSeqLenIsZero 清理分支)时,实数行
+    //   候选集非确定损坏(C_diff 2507~4043 随时序漂移,同输入紧邻两跑互差
+    //   998;hasWindow=0 纯粗筛零污染 = 窗口阶段定点)。曾试本入口加
+    //   PIPE_ALL + SyncAll(写入可见性保证)——S7 复测仍污染,证明竞态不在
+    //   ws 写可见性,而在窗口阶段自身并发执行的 UB/队列复用时序
+    //   (hasWindow=2 dump 判别实验见 graph_smoke_service_shape.py S8)。
+    //   本屏障保留为深度防御(无害),生产修复 = caller 侧 clamp(min=1)
+    //   结构性消除零行走行(pivot_indexer.py decode :133 + prefill :218)。
     AscendC::PipeBarrier<PIPE_ALL>();
     SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
     SyncAll();
@@ -595,7 +596,14 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
             int32_t winStart = static_cast<int32_t>(up) - static_cast<int32_t>(constInfo_.groupSize - 1);
             int32_t winEnd = static_cast<int32_t>(up) + static_cast<int32_t>(own);
             for (uint32_t j = 0; j < 7; j++) {
-                outI32.SetValue(16 + j, dumpCand.GetValue(up - 3U + j));
+                // dumpCand 只装载了 c 个元素;up-3+j 可能 >= c(长前缀行)或下溢
+                // (pad 行 up=0)——域外/下溢统一写 -12345 标记,禁止裸标量越界
+                // (hasWindow=2 dump 在 up=81920 用例 AIV scalar-UB OOB 崩,
+                // _mix_aiv+0x74c8,2026-09-23)。
+                uint32_t idx = up - 3U + j;
+                outI32.SetValue(16 + j,
+                    (up >= 3U + j && idx < validC) ? dumpCand.GetValue(idx)
+                                                   : static_cast<int32_t>(-12345));
             }
             // dedup 全链复刻(每位置独立,从头初始化,与真实 dedup 同一序列,
             // 含钳位先于平方的长 L 溢出修复 —— 复刻链必须与真实链逐算子同步)

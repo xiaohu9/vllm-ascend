@@ -578,6 +578,10 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
             auxI32.SetValue(0, static_cast<int32_t>(aslkGm_.GetValue(r)));
             SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
             DataCopyPad(aslkOutGm_[r], auxI32, {1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0});
+            // 2026-09-24 同款跨行竞态(dump 分支):行间 outI32 由 S 管道 SetValue
+            // 复用,上一行 DataCopyPad(MTE3)未落地即被覆写 —— 同坑 #45 先例,
+            // PIPE_ALL 排空,证据工具自身先保真。
+            AscendC::PipeBarrier<PIPE_ALL>();
         }
         SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
         return;
@@ -703,6 +707,15 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
         DataCopyPad(candidatesOutGm_[r * W], outI32, {1, static_cast<uint16_t>(W * sizeof(int32_t)), 0, 0});
         auxI32.SetValue(64 + (r - rBegin), static_cast<int32_t>(validC + nNew));
+        // 2026-09-24 竞态第六例根修(R≥25 多行核 NONDET 全量判决 + tail 延伸核行5
+        // 污染统一解释):行间复用 outI32 缺排空 —— 本行 DataCopyPad(MTE3 读
+        // outI32)未落地时,下一行 validC>0 走 MTE2 装载覆写 [0,c)、validC==0 走
+        // V Duplicate 覆写全行。覆写内容不同 ⇒ 三种签名:混入邻行内容(aime
+        // -1计数 0→0)/整行错位(svc 差4096)/-1 洪泛 PARTIAL(tail600 计数漂移)。
+        // 方案遵循 EmitIdentityRows 同构竞态的实测先例(坑 #45:事件类不可靠):
+        // 每行 PIPE_ALL 排空(含 MTE3),下一行 MTE2/V 重填绝对安全。每核窗口行数
+        // = ⌈R/24⌉,排空开销可忽略。
+        AscendC::PipeBarrier<PIPE_ALL>();
     }
     if (rEnd > rBegin) {
         SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);

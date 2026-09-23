@@ -70,16 +70,15 @@ constexpr uint32_t HEAD_DIM_LIMIT = 128;
 constexpr uint32_t SPARSE_LIMIT = 8192;          // coarseCount 上限(over-2K 骨架 s1BaseSize 公式的硬件边界)
 constexpr uint32_t QUERY_HEAD_NUM_LIMIT = 64;
 constexpr uint32_t GROUP_SIZE_LIMIT = 16;        // 组内 query 数上限(与 torch 侧 _MAX_GROUP 一致)
-constexpr int32_t WINDOW_ON = 1;                 // has_window 开窗口注入
 
 // -----------算子TilingData定义---------------
 // 字段语义(与 kernel InitTilingData 一一对应):
 //   bSize=R(batchSize,aslq 长度)  gSize=H(query head num,matmul g 轴)
 //   s2Size=PA 扫描上限=maxBlockNumPerBatch*blockSize(host 静态,捕获期常量)
 //   sparseCount=coarseCount(输出候选宽,4096>2048 → over-2K 骨架)
-//   groupSize=g(row_weights.shape[1],组内 query 数;窗口 = [aslk-(g-1), aslk+aslq差分))
-//   windowG=2g-1(窗口并集最大宽度)  outW=输出列宽(coarseCount + hasWindow*windowG)
-//   hasWindow=1 窗口注入(生产)/0 纯粗筛(transition/debug,输出宽=coarseCount)
+//   groupSize=g(组内 query 数;窗口 = [aslk-(g-1), aslk+aslq差分))
+//   windowG=2g-1(窗口并集最大宽度)  outW=输出列宽(coarseCount + (hasWindow!=0)*windowG)
+//   hasWindow=1 窗口注入(生产)/0 纯粗筛(transition/debug,输出宽=coarseCount)/2 dump(证据工具)
 BEGIN_TILING_DATA_DEF(IndexerCoarseScreenTilingData)
 TILING_DATA_FIELD_DEF(uint32_t, bSize)
 TILING_DATA_FIELD_DEF(uint32_t, gSize)

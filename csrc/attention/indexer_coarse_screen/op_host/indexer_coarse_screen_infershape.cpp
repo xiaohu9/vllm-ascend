@@ -12,7 +12,7 @@
  * \file indexer_coarse_screen_infershape.cpp
  * \brief 输出 shape 推导:固定 query=TND [N,H,D], key=PA_BSND [BlockNum,BlockSize,1,D]
  *        candidates [R, W'], aslk_out [R]
- *        W' = coarse_count + (has_window ? 31 : 0)(M1 出核后 g 取 GROUP_SIZE_LIMIT=16 上限)
+ *        W' = coarse_count + (has_window ? 2g-1 : 0)
  */
 #include <graph/utils/type_utils.h>
 #include <register/op_impl_registry.h>
@@ -23,7 +23,7 @@ using namespace ge;
 
 namespace ops {
 constexpr uint32_t QBAR_INDEX = 0;
-constexpr uint32_t ACTUAL_SEQ_Q_INDEX = 4;
+constexpr uint32_t ACTUAL_SEQ_Q_INDEX = 3;
 constexpr uint32_t CANDIDATES_INDEX = 0;
 constexpr uint32_t ASLK_OUT_INDEX = 1;
 constexpr uint32_t ATTR_COARSE_COUNT_INDEX = 0;
@@ -64,9 +64,9 @@ static ge::graphStatus InferShapeIndexerCoarseScreen(gert::InferShapeContext *co
     gert::Shape *aslkOutShape = context->GetOutputShape(ASLK_OUT_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, aslkOutShape);
 
-    // 输出 candidates [R, W'](0-based 逻辑 key 位置,-1 终止)。
-    // row_weights.shape 提供,取上限 31;实际有效宽度由 aslk' 逐行决定,行尾 -1)。
-        int64_t outW = *coarseCount + (*hasWindow != 0 ? 2 * *gSize - 1 : 0);
+    // 输出 candidates [R, W'](0-based 逻辑 key 位置,-1 终止);实际有效宽度由
+    // aslk' 逐行决定,行尾 -1。窗口列 = [aslk-(g-1), aslk+aslq差分) 并集上界 2g-1。
+    int64_t outW = *coarseCount + (*hasWindow != 0 ? 2 * *gSize - 1 : 0);
     candidatesShape->SetDimNum(2);
     candidatesShape->SetDim(0, reqNum);
     candidatesShape->SetDim(1, outW);

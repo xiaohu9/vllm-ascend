@@ -10,21 +10,16 @@
 
 /*!
  * \file indexer_coarse_screen_kernel.h
- * \brief PIVOT 粗筛内核(生产 lightning_indexer arch22 MIX 克隆 + 3-delta):
- *   Delta-A M1 组均值代理(AIV 全局预阶段,service_vector::ProcessGroupMean):
- *     q_bar/w_bar = 组内行按 row_weights 加权均值(fp32 累加,一次舍入),连同
- *     proxyCum=[1..R] 写 workspace;收尾 PipeBarrier<MTE3> + SyncAll + 预置
- *     syncV1C1×2(§4.11 同步模式),AIC 首个 matmul 的 WaitFlag 由此放行。
- *   主 pass = 生产原生 TND + PA_BSND 路径:query=q_bar(每请求 1 行 proxy)、
- *     weights=w_bar、key 经块表直读连续逻辑位置(KeyNd2NzForPA 原生语义)、
- *     aslk=粗筛域上界(绝对值)、sparseCount=coarseCount=4096 → over-2K 骨架
- *     (v11 双累积 2-list 归并,NPU 17/17 终验同款);输出候选 = 0-based 逻辑
- *     位置(分数降序,-1 终止),无候选列号间接层。
- *   Delta-B M2.5 窗口注入(AIV 全局后阶段,service_vector::ProcessWindow,hasWindow
- *     门控):win = [aslk-(g-1), aslk+aslq差分) 去重并入候选行(有效前缀 compact),
- *     尾部 -1 补齐到 outW;第二输出 aslk' = 每行有效候选数。
- *   LD 跨核归并删除:over-2K 下 SplitCore 恒整请求单核(s2End=s2BaseNum-1),
- *     isLD 恒 false,ProcessDecode 永不触发(原样保留属死代码,故裁剪)。
+ * \brief PIVOT 粗筛内核(生产 lightning_indexer arch22 MIX 克隆裁剪版):
+ *   主 pass = 原生 TND + PA_BSND 路径:query=q_bar(caller 输入,每请求 1 行
+ *     proxy)、weights=w_bar、key 经块表直读连续逻辑位置、aslk=粗筛域上界
+ *     (绝对值)、coarseCount=4096 → over-2K 单次归并骨架(SortAll+MergeSort);
+ *     输出候选 = 0-based 逻辑位置(分数降序,-1 终止)。q_bar/w_bar 为 caller
+ *     输入直绑(workspace 仅 mm1 + candidatesWs)。
+ *   窗口注入(M2.5,AIV 全局后阶段,hasWindow 门控):win =
+ *     [aslk-(g-1), aslk+aslq差分) 去重并入候选行(有效前缀 compact),尾部 -1
+ *     补齐到 outW;第二输出 aslk' = 每行有效候选数。
+ *   LD 跨核归并已裁剪:over-2K 下 SplitCore 恒整请求单核,isLD 恒 false。
  */
 
 #ifndef INDEXER_COARSE_SCREEN_KERNEL_H
@@ -58,7 +53,6 @@ struct TempLoopInfo {
     uint32_t actS1Size = 1ULL;     // 当前Batch循环处理的S1轴的实际大小
     uint32_t actS2Size = 0ULL;
     bool curActSeqLenIsZero = false;
-    bool needDealActS1LessThanS1 = false; // S1的实际长度小于shape的S1长度时，是否需要清理输出
     uint32_t actMBaseSize = 0U;    // m轴(gS1)方向实际大小
     uint32_t mBasicSizeTail = 0U;  // gS1方向循环的尾基本块大小
     uint32_t s2BasicSizeTail = 0U; // S2方向循环的尾基本块大小
@@ -94,7 +88,6 @@ public:
     IndexerCoarseScreenServiceVector<LIT> vectorService;
 
     // =================================常量区=================================
-    static constexpr uint32_t M_BASE_SIZE = 512;
     static constexpr uint32_t S2_BASE_SIZE = 512;
     static constexpr uint32_t HEAD_DIM = 128;
     static constexpr uint32_t K_HEAD_NUM = 1;
@@ -148,7 +141,6 @@ protected:
     __aicore__ inline void InitActualSeqLen(__gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths);
     // ================================Split Core================================
     __aicore__ inline void SplitCore(uint32_t curCoreIdx, uint32_t &coreNum, IndexerCoarseScreenCommon::SplitCoreInfo &info);
-    __aicore__ inline uint32_t GetS2BaseBlockNumOnMask(uint32_t s1gIdx, uint32_t actS1Size, uint32_t actS2Size);
     __aicore__ inline uint32_t GetTotalBaseBlockNum();
     // ================================Process functions================================
     __aicore__ inline void ProcessMain();
@@ -173,27 +165,20 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::InitTilingData(const Inde
     constInfo.batchSize = tilingData->bSize;
     constInfo.qHeadNum = constInfo.gSize = tilingData->gSize;
     constInfo.kSeqSize = tilingData->s2Size;
-    // 每请求 1 行 proxy(q_bar),主 pass 的 s1 = 1
-    constInfo.qSeqSize = 1ULL;
-    // 无窗口掩码、无 values 输出 → attenMaskFlag/returnValue 恒 false
+    // 每请求 1 行 proxy(q_bar),主 pass 的 s1 = 1(qSeqSize 字段已随 BSND 死支删除)
+    // 无窗口掩码 → attenMaskFlag 恒 false(相关掩码分支已删)
     constInfo.attenMaskFlag = false;
     constInfo.kCacheBlockSize = tilingData->blockSize;
     constInfo.maxBlockNumPerBatch = tilingData->maxBlockNumPerBatch;
     constInfo.sparseCount = tilingData->sparseCount; // = coarseCount(输出候选宽,4096)
-    constInfo.preTokens = INT64_MAX;
-    constInfo.nextTokens = INT64_MAX;
-    constInfo.returnValue = false;
 
-    // coarse_screen 专属(M1 组均值 / M2.5 窗口)
+    // coarse_screen 专属(M2.5 窗口)
     constInfo.groupSize = tilingData->groupSize;
     constInfo.windowG = tilingData->windowG;
     constInfo.outW = tilingData->outW;
     constInfo.hasWindow = tilingData->hasWindow; // 原值(0/1/2)直传,bool 折叠会废掉 debug dump
 
     constInfo.outputLayout = LAYOUT_T; // 输出和输入形状一致
-    if (LAYOUT_T == LI_LAYOUT::TND) {
-        constInfo.isAccumSeqS1 = true; // proxyCum 累计
-    }
     if (K_LAYOUT_T == LI_LAYOUT::TND) {
         constInfo.isAccumSeqS2 = true; // PA_BSND → false,aslk 绝对值
     }
@@ -252,6 +237,7 @@ __aicore__ inline uint32_t IndexerCoarseScreenKernel<LIT>::GetActualSeqLen(uint3
     } else {
         return actualSeqLengthsGm.GetValue(bIdx);
     }
+    // 注:唯一调用点传 isAccumSeqS2(PA_BSND → false),累减分支为克隆保留形态
 }
 
 template <typename LIT>
@@ -267,21 +253,6 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::GetS1S2ActualSeqLen(uint3
 }
 
 template <typename LIT>
-__aicore__ inline uint32_t IndexerCoarseScreenKernel<LIT>::GetS2BaseBlockNumOnMask(uint32_t s1gIdx, uint32_t actS1Size,
-                                                                   uint32_t actS2Size)
-{
-    if (actS2Size == 0) {
-        return 0;
-    }
-    uint32_t s1Offset = constInfo.s1BaseSize * s1gIdx;
-    int32_t validS2LenBase = static_cast<int32_t>(actS2Size) - static_cast<int32_t>(actS1Size);
-    int32_t validS2Len = s1Offset + validS2LenBase + constInfo.s1BaseSize;
-    validS2Len = Min(validS2Len, static_cast<int32_t>(actS2Size));
-    validS2Len = Max(validS2Len, 1);
-    return (validS2Len + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize;
-}
-
-template <typename LIT>
 __aicore__ inline uint32_t IndexerCoarseScreenKernel<LIT>::GetTotalBaseBlockNum()
 {
     uint32_t totalBlockNum = 0;
@@ -290,19 +261,10 @@ __aicore__ inline uint32_t IndexerCoarseScreenKernel<LIT>::GetTotalBaseBlockNum(
     for (uint32_t bIdx = 0; bIdx < constInfo.batchSize; bIdx++) {
         GetS1S2ActualSeqLen(bIdx, actS1Size, actS2Size);
         s1GBaseNum = CeilDiv(actS1Size, constInfo.s1BaseSize);
-        if (!constInfo.attenMaskFlag) {
-            s2BaseNum = constInfo.isSparseCountOver2K
-                      ? (actS2Size > 0 ? 1 : 0)
-                      : CeilDiv(actS2Size, constInfo.s2BaseSize);
-            totalBlockNum += s1GBaseNum * s2BaseNum * constInfo.kHeadNum;
-            continue;
-        }
-        for (uint32_t s1gIdx = 0; s1gIdx < s1GBaseNum; s1gIdx++) {
-            s2BaseNum = constInfo.isSparseCountOver2K
-                      ? (actS2Size > 0 ? 1 : 0)
-                      : GetS2BaseBlockNumOnMask(s1gIdx, actS1Size, actS2Size);
-            totalBlockNum += s2BaseNum * constInfo.kHeadNum;
-        }
+        s2BaseNum = constInfo.isSparseCountOver2K
+                  ? (actS2Size > 0 ? 1 : 0)
+                  : CeilDiv(actS2Size, constInfo.s2BaseSize);
+        totalBlockNum += s1GBaseNum * s2BaseNum * constInfo.kHeadNum;
     }
     return totalBlockNum;
 }
@@ -331,18 +293,7 @@ __aicore__ void inline IndexerCoarseScreenKernel<LIT>::SplitCore(uint32_t curCor
             s1GBaseNum = CeilDiv(actS1Size, constInfo.s1BaseSize);
             s2BaseNum = CeilDiv(actS2Size, constInfo.s2BaseSize);
         }
-        if constexpr (LAYOUT_T == LI_LAYOUT::BSND) {
-            if (findLastCoreEnd && (s1GBaseNum == 0U || s2BaseNum == 0U)) {
-                info.bN2Start = bN2Idx;
-                info.gS1Start = 0;
-                info.s2Start = 0;
-                findLastCoreEnd = false;
-            }
-        }
         for (uint32_t gS1Idx = 0; gS1Idx < s1GBaseNum; gS1Idx++) {
-            if (constInfo.attenMaskFlag) {
-                s2BaseNum = GetS2BaseBlockNumOnMask(gS1Idx, actS1Size, actS2Size);
-            }
             if (findLastCoreEnd && s2BaseNum == 0U) {
                 info.bN2Start = bN2Idx;
                 info.gS1Start = gS1Idx;
@@ -394,25 +345,15 @@ template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenKernel<LIT>::DealActSeqLenIsZero(uint32_t bIdx, uint32_t n2Idx, uint32_t s1Start)
 {
     if ASCEND_IS_AIV {
-        if (constInfo.outputLayout == LI_LAYOUT::TND) {
-            uint32_t tSize = constInfo.batchSize;                 // 每请求 1 行 proxy:总行数 == R
-            uint32_t tBase = bIdx;                                // prefix 硬编码(同 CalcRunInfo,零 GM 读)
-            uint32_t s1Count = tempLoopInfo.actS1Size;
+        // TND:每请求 1 行 proxy,总行数 == R,prefix 硬编码(同 CalcRunInfo,零 GM 读)
+        uint32_t tBase = bIdx;
+        uint32_t s1Count = tempLoopInfo.actS1Size;
 
-            for (uint32_t s1Idx = s1Start; s1Idx < s1Count; s1Idx++) {
-                uint64_t indiceOutOffset =
-                    (tBase + s1Idx) * constInfo.kHeadNum * constInfo.sparseCount + // T轴、s1轴偏移
-                    n2Idx * constInfo.sparseCount;                                 // N2轴偏移
-                vectorService.CleanInvalidOutput(indiceOutOffset);
-            }
-        } else if (constInfo.outputLayout == LI_LAYOUT::BSND) {
-            for (uint32_t s1Idx = s1Start; s1Idx < constInfo.qSeqSize; s1Idx++) {
-                // B,S1,N2,K
-                uint64_t indiceOutOffset = bIdx * constInfo.qSeqSize * constInfo.kHeadNum * constInfo.sparseCount +
-                                           s1Idx * constInfo.kHeadNum * constInfo.sparseCount + // B轴、S1轴偏移
-                                           n2Idx * constInfo.sparseCount;                       // N2轴偏移
-                vectorService.CleanInvalidOutput(indiceOutOffset);
-            }
+        for (uint32_t s1Idx = s1Start; s1Idx < s1Count; s1Idx++) {
+            uint64_t indiceOutOffset =
+                (tBase + s1Idx) * constInfo.kHeadNum * constInfo.sparseCount + // T轴、s1轴偏移
+                n2Idx * constInfo.sparseCount;                                 // N2轴偏移
+            vectorService.CleanInvalidOutput(indiceOutOffset);
         }
     }
 }
@@ -457,7 +398,6 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Init(__gm__ uint8_t *qBar
     // (prefix 已硬编码 bIdx),qBar/wBar 相关 M1 位视图随 M1 一并移除。
     qBarGm.SetGlobalBuffer((__gm__ Q_T *)qBar);
     wBarGm.SetGlobalBuffer((__gm__ Q_T *)wBar);
-    __gm__ uint8_t *wBarPtr = wBar;
     if (constInfo.hasWindow) {
         candidatesWsGm.SetGlobalBuffer((__gm__ int32_t *)(workspace + offset));
         offset += alignGm(constInfo.batchSize * constInfo.sparseCount * sizeof(int32_t));
@@ -477,7 +417,7 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Init(__gm__ uint8_t *qBar
         GlobalTensor<int32_t> mainPassOut = constInfo.hasWindow ? candidatesWsGm : candidatesOutGm;
         // 主 pass weights = w_bar(caller 输入);W_T 视图(DT_W_FLAG=true 时为 float)
         GlobalTensor<W_T> wBarW;
-        wBarW.SetGlobalBuffer((__gm__ W_T *)wBarPtr);
+        wBarW.SetGlobalBuffer((__gm__ W_T *)wBar);
         vectorService.InitVec1GlobalTensor(mm1ResGm, wBarW, mainPassOut);
     } else {
         matmulService.InitParams(constInfo);
@@ -509,12 +449,7 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::CalcS2LoopParams(uint32_t
     }
 
     bool isEnd = (bN2LoopIdx == splitCoreInfo.bN2End) && (gS1LoopIdx == splitCoreInfo.gS1End);
-    uint32_t s2BlockNum;
-    if (constInfo.attenMaskFlag) {
-        s2BlockNum = GetS2BaseBlockNumOnMask(gS1LoopIdx, tempLoopInfo.actS1Size, tempLoopInfo.actS2Size);
-    } else {
-        s2BlockNum = (tempLoopInfo.actS2Size + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize;
-    }
+    uint32_t s2BlockNum = (tempLoopInfo.actS2Size + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize;
     tempLoopInfo.s2LoopEnd = isEnd ? splitCoreInfo.s2End : s2BlockNum - 1;
 }
 
@@ -537,11 +472,6 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::CalcGS1LoopParams(uint32_
 
     uint32_t gS1SplitNum = (tempLoopInfo.actS1Size * constInfo.gSize + constInfo.mBaseSize - 1) / constInfo.mBaseSize;
     tempLoopInfo.gS1LoopEnd = (bN2LoopIdx == splitCoreInfo.bN2End) ? splitCoreInfo.gS1End : gS1SplitNum - 1;
-    if constexpr (LAYOUT_T == LI_LAYOUT::BSND) {
-        if (tempLoopInfo.gS1LoopEnd == gS1SplitNum - 1 && constInfo.qSeqSize > tempLoopInfo.actS1Size) {
-            tempLoopInfo.needDealActS1LessThanS1 = true;
-        }
-    }
 }
 
 template <typename LIT>
@@ -572,19 +502,12 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::CalcRunInfo(uint32_t loop
                            (runInfo.s2Idx == splitCoreInfo.s2End);
 
     if (runInfo.isFirstS2InnerLoop) {
-        uint64_t actualSeqQPrefixSum;
-        uint64_t actualSeqKPrefixSum;
-        if constexpr (LAYOUT_T == LI_LAYOUT::TND) {
-            // 2026-09-17 prefix 硬编码:每请求恒 1 行 proxy ⟹ prefix(bIdx) == bIdx。
-            // 旧版读 proxyCum[bIdx-1](M1 写于 pair bIdx-1,读于 pair bIdx —— 跨对 GM 读,
-            // NPU mm1 判决实证 AIC3 读到 prefix=4 即 row4 的分):种子只闭环本对依赖,
-            // SyncAll 不足以保证跨对可见时序。硬编码后计算路径零 proxyCum 读,跨对依赖清零。
-            actualSeqQPrefixSum = runInfo.bIdx;
-            actualSeqKPrefixSum = (runInfo.bIdx <= 0) ? 0 : actualSeqLengthsGm.GetValue(runInfo.bIdx - 1);
-        } else { // BSND
-            actualSeqQPrefixSum = (runInfo.bIdx <= 0) ? 0 : runInfo.bIdx * constInfo.qSeqSize;
-            actualSeqKPrefixSum = (runInfo.bIdx <= 0) ? 0 : runInfo.bIdx * constInfo.kSeqSize;
-        }
+        // 2026-09-17 prefix 硬编码:每请求恒 1 行 proxy ⟹ prefix(bIdx) == bIdx。
+        // 旧版读 proxyCum[bIdx-1](M1 写于 pair bIdx-1,读于 pair bIdx —— 跨对 GM 读,
+        // NPU mm1 判决实证 AIC3 读到 prefix=4 即 row4 的分):种子只闭环本对依赖,
+        // SyncAll 不足以保证跨对可见时序。硬编码后计算路径零 proxyCum 读,跨对依赖清零。
+        uint64_t actualSeqQPrefixSum = runInfo.bIdx;
+        uint64_t actualSeqKPrefixSum = (runInfo.bIdx <= 0) ? 0 : actualSeqLengthsGm.GetValue(runInfo.bIdx - 1);
         uint64_t tndBIdxOffset = actualSeqQPrefixSum * constInfo.qHeadNum * constInfo.headDim;
         uint64_t tndKeyBIdxOffset = actualSeqKPrefixSum * constInfo.kHeadNum * constInfo.headDim;
         // B,S1,N1(N2,G),D(PA 模式 key 走块表直读,tensorKeyOffset 仅非 PA 克隆分支消费)
@@ -634,15 +557,7 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Process()
         ProcessInvalid();
         return;
     }
-    // 阶段门控调试:hasWindow==3 只跑 M1+dump(主 pass/窗口全跳,须双核同步跳过防
-    // 种子 flag 悬空);==4 跑 M1+主 pass+dump(跳窗口)。用于多 chunk fault 的阶段二分。
-    if (constInfo.hasWindow != 3U) {
-        ProcessMain();
-    } else {
-        if ASCEND_IS_AIC {
-            return; // 无主 pass 时 AIC 无事可做,直接退出(不参与任何同步)
-        }
-    }
+    ProcessMain();
     if ASCEND_IS_AIV {
         // M2.5 窗口注入。2026-09-21 终版:恢复 pd 验证的 splitCoreInfo 配对分区
         // (行 r 的窗口读者 = 主 pass CopyOut 写者同核,同核 MTE3→MTE2 有序 ——
@@ -731,9 +646,6 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessMain()
                 ++gloop;
             }
             splitCoreInfo.s2Start = 0;
-        }
-        if (tempLoopInfo.needDealActS1LessThanS1) {
-            DealActSeqLenIsZero(tempLoopInfo.bIdx, tempLoopInfo.n2Idx, tempLoopInfo.actS1Size);
         }
         splitCoreInfo.gS1Start = 0;
     }

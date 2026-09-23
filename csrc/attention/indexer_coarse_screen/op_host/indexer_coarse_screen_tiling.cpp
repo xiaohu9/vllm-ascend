@@ -22,7 +22,6 @@ using std::map;
 using std::string;
 namespace optiling {
 namespace {
-constexpr uint32_t Q_T_ELEM_SIZE = 2;      // bf16/f16
 constexpr uint32_t I32_ELEM_SIZE = 4;      // int32
 constexpr uint64_t GM_ALIGN_BYTES = 512;   // workspace 段对齐
 } // namespace
@@ -163,9 +162,9 @@ ge::graphStatus IndexerCoarseScreenInfoParser::GetAndCheckAttrParaInfo()
     OP_CHECK_IF((*opParamInfo_.coarseCount % 1024 != 0),
                OP_LOGE(opName_, "coarse_count must be an integer multiple of 1024."),
                return ge::GRAPH_FAILED);
-    // 0=纯粗筛 1=窗口注入(生产) 2=dump 3=仅M1+dump(阶段二分) 4=M1+主pass+dump
-    OP_CHECK_IF((*opParamInfo_.hasWindow < 0) || (*opParamInfo_.hasWindow > 4),
-               OP_LOGE(opName_, "input attr has_window must be 0..4."),
+    // 0=纯粗筛 1=窗口注入(生产) 2=dump(证据工具;3/4 阶段二分门已删)
+    OP_CHECK_IF((*opParamInfo_.hasWindow < 0) || (*opParamInfo_.hasWindow > 2),
+               OP_LOGE(opName_, "input attr has_window must be 0..2."),
                return ge::GRAPH_FAILED);
     OP_CHECK_IF((*opParamInfo_.groupSizeAttr <= 0) || (*opParamInfo_.groupSizeAttr > static_cast<int32_t>(GROUP_SIZE_LIMIT)),
                OP_LOGE(opName_, "input attr group_size must be in (0, 16]."),
@@ -491,8 +490,12 @@ ge::graphStatus IndexerCoarseScreenTiling::DoTiling(IndexerCoarseScreenTilingInf
     context_->SetBlockDim(blockDim);
 
     // -------------set workspacesize-----------------
-    // 布局:|mm1ResGm(主 pass,双缓冲/核)|qBarGm(M1 输出)|wBarGm|proxyCumGm|candidatesWsGm(窗口模式中转)|
-    // 仅 arch22(910b/910_93),无 DAV_3510 分支(def 未注册 950)
+    // 布局(与 kernel Init 严格对齐,KERN candidatesWsGm = workspace + mm1 段尾):
+    //   |mm1ResGm(主 pass,双缓冲/核)|candidatesWsGm(窗口模式中转)|
+    // 仅 arch22(910b/910_93),无 DAV_3510 分支(def 未注册 950)。
+    // 2026-09-23 重构:删除 M1 出核前的 qBar/wBar/proxyCum 三段残留预留 ——
+    // kernel 早已不消费(KERN Init 只绑 mm1+candidatesWs),且旧布局中 kernel
+    // 实际把 candidatesWs 写在 mm1 段尾(即旧 qBar 段),三段纯属浪费。
     constexpr uint32_t MM1_RES_ELEM_SIZE = 4;         // 4: fp32
     constexpr uint32_t DOUBLE_BUFFER = 2;             // 双Buffer
     constexpr uint32_t M_BASE_SIZE = 512;             // m轴基本块大小
@@ -501,15 +504,9 @@ ge::graphStatus IndexerCoarseScreenTiling::DoTiling(IndexerCoarseScreenTilingInf
     workspaceSize += static_cast<uint64_t>(M_BASE_SIZE) * S2_BASE_SIZE * MM1_RES_ELEM_SIZE * DOUBLE_BUFFER * aicNum;
 
     const uint64_t reqNum = tilingInfo->bSize;
-    const uint64_t headNum = tilingInfo->gSize;
     auto align512 = [](uint64_t bytes) -> uint64_t {
         return (bytes + GM_ALIGN_BYTES - 1) / GM_ALIGN_BYTES * GM_ALIGN_BYTES;
     };
-    // M1 组均值代理输出(主 pass 的 query/weights 输入)
-    workspaceSize += align512(reqNum * headNum * HEAD_DIM_LIMIT * Q_T_ELEM_SIZE);               // qBar [R,H,Dh]
-    workspaceSize += align512(reqNum * headNum * Q_T_ELEM_SIZE);                                // wBar [R,H]
-    // 主 pass TND s1 累计(每请求 1 行 proxy → [1..R],kernel 写入)
-    workspaceSize += align512(reqNum * I32_ELEM_SIZE);                                          // proxyCum [R]
     // 窗口模式:主 pass 候选 [R,coarseCount] 先落 workspace,窗口阶段并集注入后写输出
     if (tilingInfo->hasWindow) {
         workspaceSize += align512(reqNum * tilingInfo->sparseCount * I32_ELEM_SIZE);            // candidatesWs

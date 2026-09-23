@@ -113,21 +113,16 @@ private:
     LocalTensor<float> tmpUb_;
     LocalTensor<int32_t> globalTopkIndice_;
     LocalTensor<float> globalTopkUb_;
-    LocalTensor<float> SortedBasicBlock_;
 
     int32_t blockId_ = -1;
     // para for vector
     int32_t groupInner_ = 0;
-    int32_t globalTopkNum_ = 0;
     int64_t blockS2StartIdx_ = 0;
     int32_t gSize_ = 0;
     int32_t kHeadNum_ = 0;
     int32_t s1BaseSize_ = 0;
     int32_t s2BaseSize_ = 0;
 
-    // para for LD
-    uint32_t mrgListNum_ = 4;
-    uint32_t paramNum_ = 16;
     int32_t virTopK = 0;
 
     constexpr static uint32_t REDUCE_BANK_CONFLICT_OFFSETS = 256;
@@ -166,8 +161,6 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::InitBuffers(TPipe 
     tmpUb_ = tmpBuf_.Get<float>();
     globalTopkIndice_ = indexBuf_.Get<int32_t>();
     globalTopkUb_ = sortOutBuf_.Get<float>();
-    SortedBasicBlock_ = globalTopkUb_[virTopK * 2 * 2];
-    globalTopkNum_ = 0;
 
     // 基本块执行前初始化UB和GM
     // step1. 初始化一个有序索引 0 - s2BaseSize_
@@ -269,20 +262,12 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
     } else if (info.loop == 0) {
         blockS2StartIdx_ = info.s2Idx;
     }
-    // cuRealAcSeq: 当前基本块S1对应的AcSeq(粗筛域上界 upper[r],PA 布局恒绝对值)
+    // cuRealAcSeq: 当前基本块S1对应的AcSeq(粗筛域上界 upper[r],PA 布局恒绝对值;
+    // attenMaskFlag 硬编码 false,掩码改写分支已随死代码删除)
     int32_t cuRealAcSeq = info.actS2Size;
-    if (constInfo_.attenMaskFlag) {
-        // attenMask true场景
-        cuRealAcSeq = info.actS2Size - (info.actS1Size - cuS1BeginIdxPerAiv);
-    }
     LocalTensor<float> reduceOutBuff = reduceOutBuf_.Get<float>();
     LocalTensor<float> brcBuf = brcBuf_.Get<float>();
-    // LD输出S1方向偏移，保证2个Vector输出的内容连续
-    uint32_t ldS1Offset = (blockId_ % 2 == 0) ? s1BaseSize_ / 2 - cuS1ProcNumPerAiv : 0;
     for (int innerS1Idx = 0; innerS1Idx < cuS1ProcNumPerAiv; innerS1Idx++) {
-        if (constInfo_.attenMaskFlag) {
-            cuRealAcSeq += 1;
-        }
         int32_t cuS2Len = cuBaseS2Idx + s2BaseSize_ >= cuRealAcSeq ? cuRealAcSeq - cuBaseS2Idx : s2BaseSize_;
         int32_t cuS1Idx = cuS1BeginIdxPerAiv + innerS1Idx;
         if (cuRealAcSeq > 0 && cuS2Len > 0) {
@@ -316,8 +301,6 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
                 WaitFlag<HardEvent::MTE2_V>(pingpong);
                 IndexerCoarseScreenServiceVec::DoScale(reduceCacheBuf[REDUCE_BANK_CONFLICT_NUM], dbTmpUb, weightsInUb, weightsInTUb,
                                       brcBuf, procGnum, s2BaseSize_, outerGidx);
-                // confused reduceOp in DoScale
-                // neednot use IndexerCoarseScreenServiceVec::doReduce(mmInUb, reduceOutInner, procGnum, (s2BaseSize_+8));
                 SetFlag<HardEvent::V_MTE2>(pingpong);
             }
 
@@ -346,68 +329,15 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
             AscendC::PipeBarrier<PIPE_ALL>();
 
             LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
-            // over-2K(coarseCount=4096>2048)恒走 SortAll + 原生单次 MergeSort(virTopK):
-            //   原生 lightning_indexer 生产同款(2026-09-16 起,替换 v11 双累积 —— 该形态
-            //   从未 NPU 验证且多 chunk 实测 fault,详见分支内注释)。
-            if (info.actS1Size > 4 || constInfo_.isSparseCountOver2K) {
-                // info.actS1Size > 4 则单个vector核内处理的 s1>2，缓存方案无法处理
-                if (constInfo_.isSparseCountOver2K) {
-                    // 2026-09-16 对齐原生生产形态:单次 MergeSort(mrgDstNum=virTopK)。
-                    //   v11 双累积(2×2048)源于当年"3-segment 腐蚀"假设 —— 已被证伪(实为
-                    //   tie 误判,见 indexer-refine-tie-root-cause 记忆),该形态仅 CPU 仿真背书、
-                    //   从未 NPU 验证(refine 的 17/17 全部 sparseCount=2048 非 over-2K);本算子
-                    //   NPU 实测多 chunk(aslk>512)在 v11 路径 aicore MTE fault(A7/A8/A9 复现,
-                    //   单 chunk 全过)。原生 lightning_indexer 的 over-2K 即单次归并(生产代码):
-                    //   SortAll(chunk) + MergeSort(acc, virTopK, chunk, len, tmpUb_)。
-                    SortAll(reduceOutBuff, tmpSortBuf, cuS2LenVecAlign);
-                    PipeBarrier<PIPE_V>();
-                    LocalTensor<float> ubTmpSort = tmpUb_;
-                    IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK,
-                                            reduceOutBuff, cuS2LenVecAlign, ubTmpSort);
-                } else if (cuS2LenVecAlign == s2BaseSize_) {
-                    IndexerCoarseScreenServiceVec::SortAll(reduceOutBuff, tmpSortBuf, cuS2LenVecAlign);
-                    PipeBarrier<PIPE_V>();
-                    IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK, reduceOutBuff,
-                                            cuS2LenVecAlign, tmpSortBuf);
-                } else {
-                    IndexerCoarseScreenServiceVec::SortAll(reduceOutBuff, tmpSortBuf,
-                                          cuS2LenVecAlign); //  cuS2LenVecAlign <= s2BaseSize_, fill -inf
-                    PipeBarrier<PIPE_V>();
-                    LocalTensor<float> UbTmpSort = constInfo_.isSparseCountOver2K ? tmpUb_ : tmpSortBuf;
-                    IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK, reduceOutBuff,
-                                            cuS2LenVecAlign, UbTmpSort);
-                }
-            } else {
-                int64_t globalTopkUbCacheIdx = (info.s2Idx - blockS2StartIdx_) % 4;
-                Sort<float, true>(
-                    SortedBasicBlock_[innerS1Idx * BASE_TOPK * 2 + globalTopkUbCacheIdx * s2BaseSize_ * 2],
-                    reduceOutBuff, sortIndiceUbInt.template ReinterpretCast<uint32_t>(), tmpSortBuf,
-                    cuS2LenVecAlign / 32);
-                AscendC::PipeBarrier<PIPE_V>();
-                // 缓存4块512或者S2结束, 需要进行精排
-                if (globalTopkUbCacheIdx == 3 || isS2End || info.isAllLoopEnd) {
-                    LocalTensor<float> tt = SortedBasicBlock_[innerS1Idx * BASE_TOPK * 2];
-                    // 前4块直接精排覆盖到globalTopkUb_
-                    if (info.s2Idx - blockS2StartIdx_ < 4) {
-                        MrgBasicBlock(globalTopkUb_[innerS1Idx * BASE_TOPK * 2], tt,
-                                      static_cast<int64_t>(globalTopkUbCacheIdx + 1), s2BaseSize_);
-                    } else { // 后面缓存在 SortedBasicBlock_, 先精排, 再merge到globalTopkUb_
-                        if (globalTopkUbCacheIdx > 0) {
-                            MrgBasicBlock(tmpSortBuf, tt, static_cast<int64_t>(globalTopkUbCacheIdx + 1), s2BaseSize_);
-                            PipeBarrier<PIPE_V>();
-                            DataCopy(SortedBasicBlock_[innerS1Idx * BASE_TOPK * 2], tmpSortBuf,
-                                     (globalTopkUbCacheIdx + 1) * s2BaseSize_ * 2);
-                        }
-                        PipeBarrier<PIPE_V>();
-                        SparseTopK(globalTopkUb_[innerS1Idx * BASE_TOPK * 2],
-                                   SortedBasicBlock_[innerS1Idx * BASE_TOPK * 2], tmpSortBuf, BASE_TOPK,
-                                   s2BaseSize_ * (globalTopkUbCacheIdx + 1));
-                    }
-                }
-            }
-            if (constInfo_.isSparseCountOver2K) {
-                SetFlag<HardEvent::V_MTE2>(EVENTID_V_TO_MTE2_TMPUB);
-            }
+            // over-2K(host 拒绝 coarseCount≤2048)恒走 SortAll + 原生单次 MergeSort
+            // (virTopK)= 原生 lightning_indexer 生产同款。actS1Size≡1(TND 每请求单
+            // 代理行),actS1Size>4 缓存路由与非 over-2K 精排路径不可达,已删;历史上
+            // v11 双累积形态从未 NPU 验证且多 chunk 实测 fault,2026-09-16 废弃。
+            SortAll(reduceOutBuff, tmpSortBuf, cuS2LenVecAlign);
+            PipeBarrier<PIPE_V>();
+            IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK,
+                                    reduceOutBuff, cuS2LenVecAlign, tmpUb_);
+            SetFlag<HardEvent::V_MTE2>(EVENTID_V_TO_MTE2_TMPUB);
 
             PipeBarrier<PIPE_V>();
             outQueue_.FreeTensor(tmpSortBuf);
@@ -439,31 +369,6 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
             }
         } else if (cuRealAcSeq <= 0) {
             CleanInvalidOutput(info.indiceOutOffset + cuS1Idx * constInfo_.sparseCount);
-        }
-    }
-
-    // BNSD场景无效S1 输出-1
-    if (LAYOUT_T == LI_LAYOUT::BSND) {
-        // 最后一个S1的基本块, 需要 >= info.actS1Size
-        bool isS1LoopEnd = (cuBaseS1Idx + s1BaseSize_) >= info.actS1Size;
-        int32_t invalidS1Num = constInfo_.qSeqSize - info.actS1Size;
-        // blockS2StartIdx_ == 0 控制S2从开始的核去做冗余清理
-        if (invalidS1Num > 0 && isS1LoopEnd && blockS2StartIdx_ == 0) {
-            int32_t s1NumPerAiv = blockId_ % 2 == 0 ? CeilDiv(invalidS1Num, 2) : (invalidS1Num / 2);
-            int32_t s1OffsetPerAiv = info.actS1Size + (blockId_ % 2) * CeilDiv(invalidS1Num, 2);
-            for (int innerS1Idx = 0; innerS1Idx < s1NumPerAiv; innerS1Idx++) {
-                CleanInvalidOutput(info.indiceOutOffset + (s1OffsetPerAiv + innerS1Idx) * constInfo_.sparseCount);
-            }
-        }
-
-        int32_t invalidS1Num2 = info.actS1Size - info.actS2Size;
-        if (invalidS1Num2 > 0 && isS1LoopEnd && blockS2StartIdx_ == 0 && constInfo_.attenMaskFlag) {
-            int32_t s1NumPerAiv = blockId_ % 2 == 0 ? CeilDiv(invalidS1Num2, 2) : (invalidS1Num2 / 2);
-            int32_t s1OffsetPerAiv = (blockId_ % 2) * CeilDiv(invalidS1Num2, 2);
-            for (int innerS1Idx = 0; innerS1Idx < s1NumPerAiv; innerS1Idx++) {
-                CleanInvalidOutput((info.bN2Idx * constInfo_.qSeqSize + s1OffsetPerAiv + innerS1Idx) *
-                                   constInfo_.sparseCount);
-            }
         }
     }
 

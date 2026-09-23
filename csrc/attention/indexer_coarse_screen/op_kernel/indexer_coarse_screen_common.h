@@ -47,7 +47,6 @@ struct RunInfo {
 
     uint32_t actS1Size = 1;
     uint32_t actS2Size = 1;
-    uint32_t actS2SizeOrig = 1;
     uint32_t actMBaseSize;
     uint32_t actualSingleProcessSInnerSize;
     uint32_t actualSingleProcessSInnerSizeAlign;
@@ -60,34 +59,18 @@ struct RunInfo {
     bool isFirstS2InnerLoop;
     bool isLastS2InnerLoop;
     bool isAllLoopEnd = false;
-    bool isValid = false;
 };
 
 struct ConstInfo {
     // CUBE与VEC核间同步的模式
     static constexpr uint32_t FIA_SYNC_MODE2 = 2;
-    static constexpr uint32_t QLI_SYNC_MODE4 = 4;
-    static constexpr uint32_t AIV0_AIV1_OFFSET = 16;
-    static constexpr uint32_t CROSS_VC_EVENT = 0;
-    static constexpr uint32_t CROSS_CV_EVENT = 2;
     // BUFFER的字节数
     static constexpr uint32_t BUFFER_SIZE_BYTE_32B = 32;
-    static constexpr uint32_t BUFFER_SIZE_BYTE_64B = 64;
-    static constexpr uint32_t BUFFER_SIZE_BYTE_256B = 256;
-    static constexpr uint32_t BUFFER_SIZE_BYTE_512B = 512;
-    static constexpr uint32_t BUFFER_SIZE_BYTE_1K = 1024;
-    static constexpr uint32_t BUFFER_SIZE_BYTE_2K = 2048;
-    static constexpr uint32_t BUFFER_SIZE_BYTE_4K = 4096;
-    static constexpr uint32_t BUFFER_SIZE_BYTE_8K = 8192;
-    static constexpr uint32_t BUFFER_SIZE_BYTE_16K = 16384;
-    static constexpr uint32_t BUFFER_SIZE_BYTE_32K = 32768;
     // 无效索引
     static constexpr int INVALID_IDX = -1;
     // CUBE和VEC的核间同步EventID
     uint32_t syncC1V1 = 0U;
-    uint32_t syncC1V0 = 2U;
     uint32_t syncV1C1 = 0U;
-    uint32_t syncV0C1 = 1U;
 
     // 基本块大小
     uint32_t mBaseSize = 1ULL;
@@ -102,29 +85,22 @@ struct ConstInfo {
     uint64_t headDim;
     uint64_t sparseCount;             // topK选取大小(=coarseCount)
     uint64_t kSeqSize = 0ULL;         // kv最大S长度(PA 扫描上限)
-    uint64_t qSeqSize = 1ULL;         // q最大S长度(每请求 1 行 proxy)
     uint32_t kCacheBlockSize = 0;     // PA场景的block size
     uint32_t maxBlockNumPerBatch = 0; // PA场景的最大单batch block number
     LI_LAYOUT outputLayout;           // 输出的格式
     bool attenMaskFlag = false;
-    int64_t preTokens = INT64_MAX;
-    int64_t nextTokens = INT64_MAX;
-    bool returnValue = false;
 
-    // coarse_screen 专属:M1 组均值 / M2.5 窗口注入
-    uint32_t groupSize = 0;     // g(row_weights.shape[1],组内 query 数)
+    // coarse_screen 专属:M2.5 窗口注入
+    uint32_t groupSize = 0;     // g(组内 query 数)
     uint32_t windowG = 0;       // 2g-1(窗口并集最大宽度)
-    uint32_t outW = 0;          // 输出列宽(coarseCount + hasWindow*windowG)
+    uint32_t outW = 0;          // 输出列宽(coarseCount + (hasWindow!=0)*windowG)
     uint32_t hasWindow = 1;     // 原值 0/1/2:0=纯粗筛 1=窗口注入 2=DEBUG dump。
                                  // 必须保留原值(bool 会把 2 折叠成 1,debug dump 判定失效)
 
-    uint32_t actualLenQDims = 0U; // query的actualSeqLength 的维度
+    uint32_t actualLenQDims = 0U; // query的actualSeqLength 的维度(SetGlobalBuffer size hint)
     uint32_t actualLenDims = 0U;  // KV 的actualSeqLength 的维度
-    bool isAccumSeqS1 = false;    // 是否累加模式
     bool isAccumSeqS2 = false;    // 是否累加模式
     bool isSparseCountOver2K = false; //sparseCount小于等于2048为false
-    bool returnValueFlag = false;
-    bool splitMFlag = false;
 };
 
 struct SplitCoreInfo {

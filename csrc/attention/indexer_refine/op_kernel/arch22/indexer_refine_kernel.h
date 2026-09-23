@@ -44,7 +44,6 @@ struct TempLoopInfo {
     uint32_t actS1Size = 1ULL;     // 当前Batch循环处理的S1轴的实际大小
     uint32_t actS2Size = 0ULL;
     bool curActSeqLenIsZero = false;
-    bool needDealActS1LessThanS1 = false; // S1的实际长度小于shape的S1长度时，是否需要清理输出
     uint32_t actMBaseSize = 0U;    // m轴(gS1)方向实际大小
     uint32_t mBasicSizeTail = 0U;  // gS1方向循环的尾基本块大小
     uint32_t s2BasicSizeTail = 0U; // S2方向循环的尾基本块大小
@@ -80,9 +79,6 @@ public:
     IndexerRefineServiceVector<LIT> vectorService;
 
     // =================================常量区=================================
-    static constexpr uint32_t SYNC_C1_V1_FLAG = 4;
-    static constexpr uint32_t SYNC_V1_C1_FLAG = 5;
-
     static constexpr uint32_t M_BASE_SIZE = 512;
     static constexpr uint32_t S2_BASE_SIZE = 512;
     static constexpr uint32_t HEAD_DIM = 128;
@@ -136,7 +132,6 @@ protected:
     __aicore__ inline void InitActualSeqLen(__gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths);
     // ================================Split Core================================
     __aicore__ inline void SplitCore(uint32_t curCoreIdx, uint32_t &coreNum, IndexerRefineCommon::SplitCoreInfo &info);
-    __aicore__ inline uint32_t GetS2BaseBlockNumOnMask(uint32_t s1gIdx, uint32_t actS1Size, uint32_t actS2Size);
     __aicore__ inline uint32_t GetTotalBaseBlockNum();
     // ================================Process functions================================
     __aicore__ inline void ProcessMain();
@@ -162,22 +157,15 @@ __aicore__ inline void IndexerRefineKernel<LIT>::InitTilingData(const IndexerRef
     constInfo.qHeadNum = constInfo.gSize = tilingData->gSize;
     constInfo.kSeqSize = tilingData->s2Size;
     constInfo.qSeqSize = tilingData->s1Size;
-    // refine 语义:key = stage-0 gather 后的候选 key workspace(TND 布局),
-    // 无窗口掩码、无 values 输出 → attenMaskFlag/returnValue 恒 false
-    constInfo.attenMaskFlag = false;
+    // refine 语义:key = stage-0 gather 后的候选 key workspace(PA_BSND 布局,host
+    // 硬拒其余 layout);无窗口掩码、无 values 输出
     constInfo.kCacheBlockSize = tilingData->blockSize;
     constInfo.maxBlockNumPerBatch = tilingData->maxBlockNumPerBatch;
     constInfo.sparseCount = tilingData->sparseCount; // = refineCount(输出 topk 宽度)
-    constInfo.preTokens = INT64_MAX;
-    constInfo.nextTokens = INT64_MAX;
-    constInfo.returnValue = false;
 
     constInfo.outputLayout = LAYOUT_T; // 输出和输入形状一致
     if (LAYOUT_T == LI_LAYOUT::TND) {
         constInfo.isAccumSeqS1 = true;
-    }
-    if (K_LAYOUT_T == LI_LAYOUT::TND) {
-        constInfo.isAccumSeqS2 = true;
     }
 
     constInfo.kHeadNum = K_HEAD_NUM;
@@ -244,21 +232,6 @@ __aicore__ inline void IndexerRefineKernel<LIT>::GetS1S2ActualSeqLen(uint32_t bI
 }
 
 template <typename LIT>
-__aicore__ inline uint32_t IndexerRefineKernel<LIT>::GetS2BaseBlockNumOnMask(uint32_t s1gIdx, uint32_t actS1Size,
-                                                                   uint32_t actS2Size)
-{
-    if (actS2Size == 0) {
-        return 0;
-    }
-    uint32_t s1Offset = constInfo.s1BaseSize * s1gIdx;
-    int32_t validS2LenBase = static_cast<int32_t>(actS2Size) - static_cast<int32_t>(actS1Size);
-    int32_t validS2Len = s1Offset + validS2LenBase + constInfo.s1BaseSize;
-    validS2Len = Min(validS2Len, static_cast<int32_t>(actS2Size));
-    validS2Len = Max(validS2Len, 1);
-    return (validS2Len + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize;
-}
-
-template <typename LIT>
 __aicore__ inline uint32_t IndexerRefineKernel<LIT>::GetTotalBaseBlockNum()
 {
     uint32_t totalBlockNum = 0;
@@ -267,19 +240,10 @@ __aicore__ inline uint32_t IndexerRefineKernel<LIT>::GetTotalBaseBlockNum()
     for (uint32_t bIdx = 0; bIdx < constInfo.batchSize; bIdx++) {
         GetS1S2ActualSeqLen(bIdx, actS1Size, actS2Size);
         s1GBaseNum = CeilDiv(actS1Size, constInfo.s1BaseSize);
-        if (!constInfo.attenMaskFlag) {
-            s2BaseNum = constInfo.isSparseCountOver2K
-                      ? (actS2Size > 0 ? 1 : 0)
-                      : CeilDiv(actS2Size, constInfo.s2BaseSize);
-            totalBlockNum += s1GBaseNum * s2BaseNum * constInfo.kHeadNum;
-            continue;
-        }
-        for (uint32_t s1gIdx = 0; s1gIdx < s1GBaseNum; s1gIdx++) {
-            s2BaseNum = constInfo.isSparseCountOver2K
-                      ? (actS2Size > 0 ? 1 : 0)
-                      : GetS2BaseBlockNumOnMask(s1gIdx, actS1Size, actS2Size);
-            totalBlockNum += s2BaseNum * constInfo.kHeadNum;
-        }
+        s2BaseNum = constInfo.isSparseCountOver2K
+                  ? (actS2Size > 0 ? 1 : 0)
+                  : CeilDiv(actS2Size, constInfo.s2BaseSize);
+        totalBlockNum += s1GBaseNum * s2BaseNum * constInfo.kHeadNum;
     }
     return totalBlockNum;
 }
@@ -308,18 +272,7 @@ __aicore__ void inline IndexerRefineKernel<LIT>::SplitCore(uint32_t curCoreIdx,
             s1GBaseNum = CeilDiv(actS1Size, constInfo.s1BaseSize);
             s2BaseNum = CeilDiv(actS2Size, constInfo.s2BaseSize);
         }
-        if constexpr (LAYOUT_T == LI_LAYOUT::BSND) {
-            if (findLastCoreEnd && (s1GBaseNum == 0U || s2BaseNum == 0U)) {
-                info.bN2Start = bN2Idx;
-                info.gS1Start = 0;
-                info.s2Start = 0;
-                findLastCoreEnd = false;
-            }
-        }
         for (uint32_t gS1Idx = 0; gS1Idx < s1GBaseNum; gS1Idx++) {
-            if (constInfo.attenMaskFlag) {
-                s2BaseNum = GetS2BaseBlockNumOnMask(gS1Idx, actS1Size, actS2Size);
-            }
             if (findLastCoreEnd && s2BaseNum == 0U) {
                 info.bN2Start = bN2Idx;
                 info.gS1Start = gS1Idx;
@@ -373,25 +326,14 @@ template <typename LIT>
 __aicore__ inline void IndexerRefineKernel<LIT>::DealActSeqLenIsZero(uint32_t bIdx, uint32_t n2Idx, uint32_t s1Start)
 {
     if ASCEND_IS_AIV {
-        if (constInfo.outputLayout == LI_LAYOUT::TND) {
-            uint32_t tSize = actualSeqLengthsGmQ.GetValue(constInfo.batchSize - 1);
-            uint32_t tBase = bIdx == 0 ? 0 : actualSeqLengthsGmQ.GetValue(bIdx - 1);
-            uint32_t s1Count = tempLoopInfo.actS1Size;
+        uint32_t tBase = bIdx == 0 ? 0 : actualSeqLengthsGmQ.GetValue(bIdx - 1);
+        uint32_t s1Count = tempLoopInfo.actS1Size;
 
-            for (uint32_t s1Idx = s1Start; s1Idx < s1Count; s1Idx++) {
-                uint64_t indiceOutOffset =
-                    (tBase + s1Idx) * constInfo.kHeadNum * constInfo.sparseCount + // T轴、s1轴偏移
-                    n2Idx * constInfo.sparseCount;                                 // N2轴偏移
-                vectorService.CleanInvalidOutput(indiceOutOffset);
-            }
-        } else if (constInfo.outputLayout == LI_LAYOUT::BSND) {
-            for (uint32_t s1Idx = s1Start; s1Idx < constInfo.qSeqSize; s1Idx++) {
-                // B,S1,N2,K
-                uint64_t indiceOutOffset = bIdx * constInfo.qSeqSize * constInfo.kHeadNum * constInfo.sparseCount +
-                                           s1Idx * constInfo.kHeadNum * constInfo.sparseCount + // B轴、S1轴偏移
-                                           n2Idx * constInfo.sparseCount;                       // N2轴偏移
-                vectorService.CleanInvalidOutput(indiceOutOffset);
-            }
+        for (uint32_t s1Idx = s1Start; s1Idx < s1Count; s1Idx++) {
+            uint64_t indiceOutOffset =
+                (tBase + s1Idx) * constInfo.kHeadNum * constInfo.sparseCount + // T轴、s1轴偏移
+                n2Idx * constInfo.sparseCount;                                 // N2轴偏移
+            vectorService.CleanInvalidOutput(indiceOutOffset);
         }
     }
 }
@@ -481,12 +423,7 @@ __aicore__ inline void IndexerRefineKernel<LIT>::CalcS2LoopParams(uint32_t bN2Lo
     }
 
     bool isEnd = (bN2LoopIdx == splitCoreInfo.bN2End) && (gS1LoopIdx == splitCoreInfo.gS1End);
-    uint32_t s2BlockNum;
-    if (constInfo.attenMaskFlag) {
-        s2BlockNum = GetS2BaseBlockNumOnMask(gS1LoopIdx, tempLoopInfo.actS1Size, tempLoopInfo.actS2Size);
-    } else {
-        s2BlockNum = (tempLoopInfo.actS2Size + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize;
-    }
+    uint32_t s2BlockNum = (tempLoopInfo.actS2Size + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize;
     tempLoopInfo.s2LoopEnd = isEnd ? splitCoreInfo.s2End : s2BlockNum - 1;
 }
 
@@ -509,11 +446,6 @@ __aicore__ inline void IndexerRefineKernel<LIT>::CalcGS1LoopParams(uint32_t bN2L
 
     uint32_t gS1SplitNum = (tempLoopInfo.actS1Size * constInfo.gSize + constInfo.mBaseSize - 1) / constInfo.mBaseSize;
     tempLoopInfo.gS1LoopEnd = (bN2LoopIdx == splitCoreInfo.bN2End) ? splitCoreInfo.gS1End : gS1SplitNum - 1;
-    if constexpr (LAYOUT_T == LI_LAYOUT::BSND) {
-        if (tempLoopInfo.gS1LoopEnd == gS1SplitNum - 1 && constInfo.qSeqSize > tempLoopInfo.actS1Size) {
-            tempLoopInfo.needDealActS1LessThanS1 = true;
-        }
-    }
 }
 
 template <typename LIT>
@@ -544,15 +476,9 @@ __aicore__ inline void IndexerRefineKernel<LIT>::CalcRunInfo(uint32_t loop,
                            (runInfo.s2Idx == splitCoreInfo.s2End);
 
     if (runInfo.isFirstS2InnerLoop) {
-        uint64_t actualSeqQPrefixSum;
-        uint64_t actualSeqKPrefixSum;
-        if constexpr (LAYOUT_T == LI_LAYOUT::TND) {
-            actualSeqQPrefixSum = (runInfo.bIdx <= 0) ? 0 : actualSeqLengthsGmQ.GetValue(runInfo.bIdx - 1);
-            actualSeqKPrefixSum = (runInfo.bIdx <= 0) ? 0 : actualSeqLengthsGm.GetValue(runInfo.bIdx - 1);
-        } else { // BSND
-            actualSeqQPrefixSum = (runInfo.bIdx <= 0) ? 0 : runInfo.bIdx * constInfo.qSeqSize;
-            actualSeqKPrefixSum = (runInfo.bIdx <= 0) ? 0 : runInfo.bIdx * constInfo.kSeqSize;
-        }
+        // host 硬拒 TND 之外的 layout,BSND 分支已随 R1 删除
+        uint64_t actualSeqQPrefixSum = (runInfo.bIdx <= 0) ? 0 : actualSeqLengthsGmQ.GetValue(runInfo.bIdx - 1);
+        uint64_t actualSeqKPrefixSum = (runInfo.bIdx <= 0) ? 0 : actualSeqLengthsGm.GetValue(runInfo.bIdx - 1);
         uint64_t tndBIdxOffset = actualSeqQPrefixSum * constInfo.qHeadNum * constInfo.headDim;
         uint64_t tndKeyBIdxOffset = actualSeqKPrefixSum * constInfo.kHeadNum * constInfo.headDim;
         // B,S1,N1(N2,G),D
@@ -635,9 +561,6 @@ __aicore__ inline void IndexerRefineKernel<LIT>::ProcessMain()
                 ++gloop;
             }
             splitCoreInfo.s2Start = 0;
-        }
-        if (tempLoopInfo.needDealActS1LessThanS1) {
-            DealActSeqLenIsZero(tempLoopInfo.bIdx, tempLoopInfo.n2Idx, tempLoopInfo.actS1Size);
         }
         splitCoreInfo.gS1Start = 0;
     }

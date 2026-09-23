@@ -259,10 +259,6 @@ ge::graphStatus IndexerRefineInfoParser::GetAndCheckOptionalInput()
                opParamInfo_.actualSeqLengths.desc->GetDataType() != ge::DT_INT32,
                    OP_LOGE(opName_, "input actual_seq_lengths_key data type only support int32"),
                    return ge::GRAPH_FAILED);
-    OP_CHECK_IF(opParamInfo_.actualSeqLengths.tensor != nullptr &&
-                   opParamInfo_.actualSeqLengths.desc->GetDataType() != ge::DT_INT32,
-               OP_LOGE(opName_, "input actual_seq_lengths_key data type only support int32"),
-               return ge::GRAPH_FAILED);
     if (qLayout_ == DataLayout::TND) {
         OP_CHECK_IF(opParamInfo_.actualSeqLengthsQ.tensor == nullptr,
                    OP_LOGE(opName_, "when layout_query is TND, input actual_seq_lengths_query must not be null"),

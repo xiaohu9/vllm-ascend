@@ -108,19 +108,12 @@ struct ConstInfo {
     uint32_t kCacheBlockSize = 0;     // PA场景的block size
     uint32_t maxBlockNumPerBatch = 0; // PA场景的最大单batch block number
     LI_LAYOUT outputLayout;           // 输出的格式
-    bool attenMaskFlag = false;
-    int64_t preTokens = INT64_MAX;
-    int64_t nextTokens = INT64_MAX;
-    bool returnValue = false;
 
     uint32_t actualLenQDims = 0U; // query的actualSeqLength 的维度
     uint32_t actualLenDims = 0U;  // KV 的actualSeqLength 的维度
     bool isAccumSeqS1 = false;    // 是否累加模式
     bool isAccumSeqS2 = false;    // 是否累加模式
     bool isSparseCountOver2K = false; //sparseCount小于等于2048为false
-    bool isLDOpen = false;
-    bool returnValueFlag = false;
-    bool splitMFlag = false;
 };
 
 struct SplitCoreInfo {

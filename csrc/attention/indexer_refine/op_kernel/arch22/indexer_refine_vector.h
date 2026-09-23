@@ -15,7 +15,6 @@
 #ifndef INDEXER_REFINE_VECTOR_H
 #define INDEXER_REFINE_VECTOR_H
 
-#include "indexer_refine_vector.h"
 #include "kernel_operator.h"
 
 namespace IndexerRefineServiceVec {
@@ -402,21 +401,6 @@ __aicore__ inline void SparseTopK(const LocalTensor<float> &dst, const LocalTens
     AscendC::PipeBarrier<PIPE_V>();
     // 将结果复制到目标张量
     AscendC::DataCopy(dst, tmp, topk * VALUE_AND_INDEX_NUM);
-}
-
-
-__aicore__ inline void ExtractIndex(const LocalTensor<uint32_t> &idxULocal, const LocalTensor<uint32_t> &sortLocal,
-                                    int64_t extractNum)
-{
-    AscendC::GatherMaskParams gatherMaskParams;
-    gatherMaskParams.repeatTimes = Ceil(extractNum * sizeof(float) * VALUE_AND_INDEX_NUM, VEC_REPEAT_BYTES);
-    gatherMaskParams.src0BlockStride = 1;
-    gatherMaskParams.src0RepeatStride = B32_VEC_REPEAT_STRIDE;
-    gatherMaskParams.src1RepeatStride = 0;
-    uint64_t rsvdCnt = 0;    // 用于保存筛选后保留下来的元素个数
-    uint8_t src1Pattern = 2; // 固定模式2,表示筛选出奇数索引的数
-    AscendC::GatherMask(idxULocal, sortLocal, src1Pattern, false, static_cast<uint32_t>(0), gatherMaskParams, rsvdCnt);
-    AscendC::PipeBarrier<PIPE_V>();
 }
 
 

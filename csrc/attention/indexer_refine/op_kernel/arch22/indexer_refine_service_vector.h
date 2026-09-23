@@ -306,10 +306,6 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
     }
     // cuRealAcSeq: 当前基本块S1对应的AcSeq
     int32_t cuRealAcSeq = info.actS2Size;
-    if (constInfo_.attenMaskFlag) {
-        // attenMask true场景
-        cuRealAcSeq = info.actS2Size - (info.actS1Size - cuS1BeginIdxPerAiv);
-    }
     LocalTensor<float> reduceOutBuff = reduceOutBuf_.Get<float>();
     LocalTensor<float> brcBuf = brcBuf_.Get<float>();
     // refine:candidates 行 chunk 级(scattered mask / true_pos 用),按 (request, S2-chunk) 双 key
@@ -331,9 +327,6 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
     // LD输出S1方向偏移，保证2个Vector输出的内容连续
     uint32_t ldS1Offset = (blockId_ % 2 == 0) ? s1BaseSize_ / 2 - cuS1ProcNumPerAiv : 0;
     for (int innerS1Idx = 0; innerS1Idx < cuS1ProcNumPerAiv; innerS1Idx++) {
-        if (constInfo_.attenMaskFlag) {
-            cuRealAcSeq += 1;
-        }
         int32_t cuS2Len = cuBaseS2Idx + s2BaseSize_ >= cuRealAcSeq ? cuRealAcSeq - cuBaseS2Idx : s2BaseSize_;
         int32_t cuS1Idx = cuS1BeginIdxPerAiv + innerS1Idx;
         if (cuRealAcSeq > 0 && cuS2Len > 0) {
@@ -367,8 +360,6 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
                 WaitFlag<HardEvent::MTE2_V>(pingpong);
                 IndexerRefineServiceVec::DoScale(reduceCacheBuf[REDUCE_BANK_CONFLICT_NUM], dbTmpUb, weightsInUb, weightsInTUb,
                                       brcBuf, procGnum, s2BaseSize_, outerGidx);
-                // confused reduceOp in DoScale
-                // neednot use IndexerRefineServiceVec::doReduce(mmInUb, reduceOutInner, procGnum, (s2BaseSize_+8));
                 SetFlag<HardEvent::V_MTE2>(pingpong);
             }
 
@@ -471,27 +462,22 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
                     LocalTensor<float> ubScratch = tmpUb_[virTopK + 2 * cuS2LenVecAlign];
                     IndexerRefineServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2 + virTopK], virTopK / 2,
                                             ubTail, cuS2LenVecAlign, ubScratch);
-                } else if (cuS2LenVecAlign == s2BaseSize_) {
+                } else {
+                    // cuS2Len ∈ (0,512] ⇒ cuS2LenVecAlign ≡ s2BaseSize_,本分支恒走
+                    //   (:488-495 的部分块 else 归并为恒等式死支,2026-09-24 R1 删除;
+                    //    :492 的 isSparseCountOver2K 三元在其内部,恒 false 同删)。
                     // 2026-09-01 回退 v10 的 2×256 拆排, 恢复 v9 = 原生产路径(SortAll(512) +
                     //   2-list MergeSort, probe prod 同款, NPU 实证可靠)。回退原因二:
                     //   ① 前提被 v11 证伪 —— 腐蚀在 MergeSort 3-segment 分支(mrgDstNum>3072),
                     //      不在 512 粒度 chunk 排序(prod 全块用 SortAll(512) 从不败); v10 只改
                     //      了 chunk 排序层, 归并仍传 mrgDstNum=virTopK=4096 → 仍 3-segment,
                     //      故 NPU 7/9 回归(over2k+prod_wide 同源失败)。
-                    //   ② 该分支把 operator[] 临时量传非 const 左值引用(L471/475/483 的
-                    //      Sort<float,true> 4/1 参 + MergeSort mrgSrc), aarch64 原生工具链
-                    //      编译失败, 而容器 x86_64 宽松头文件放行 → 本地 BUILD_EXIT=0 无效。
+                    //   ② 该分支把 operator[] 临时量传非 const 左值引用(aarch64 原生工具链
+                    //      编译失败, 而容器 x86_64 宽松头文件放行 → 本地 BUILD_EXIT=0 无效)。
                     IndexerRefineServiceVec::SortAll(reduceOutBuff, tmpSortBuf, cuS2LenVecAlign);
                     PipeBarrier<PIPE_V>();
                     IndexerRefineServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK, reduceOutBuff,
                                             cuS2LenVecAlign, tmpSortBuf);
-                } else {
-                    IndexerRefineServiceVec::SortAll(reduceOutBuff, tmpSortBuf,
-                                          cuS2LenVecAlign); //  cuS2LenVecAlign <= s2BaseSize_, fill -inf
-                    PipeBarrier<PIPE_V>();
-                    LocalTensor<float> UbTmpSort = constInfo_.isSparseCountOver2K ? tmpUb_ : tmpSortBuf;
-                    IndexerRefineServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK, reduceOutBuff,
-                                            cuS2LenVecAlign, UbTmpSort);
                 }
             } else {
                 int64_t globalTopkUbCacheIdx = (info.s2Idx - blockS2StartIdx_) % 4;
@@ -616,31 +602,6 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessVec(const Indexer
         }
     }
 
-    // BNSD场景无效S1 输出-1
-    if (LAYOUT_T == LI_LAYOUT::BSND) {
-        // 最后一个S1的基本块, 需要 >= info.actS1Size
-        bool isS1LoopEnd = (cuBaseS1Idx + s1BaseSize_) >= info.actS1Size;
-        int32_t invalidS1Num = constInfo_.qSeqSize - info.actS1Size;
-        // blockS2StartIdx_ == 0 控制S2从开始的核去做冗余清理
-        if (invalidS1Num > 0 && isS1LoopEnd && blockS2StartIdx_ == 0) {
-            int32_t s1NumPerAiv = blockId_ % 2 == 0 ? CeilDiv(invalidS1Num, 2) : (invalidS1Num / 2);
-            int32_t s1OffsetPerAiv = info.actS1Size + (blockId_ % 2) * CeilDiv(invalidS1Num, 2);
-            for (int innerS1Idx = 0; innerS1Idx < s1NumPerAiv; innerS1Idx++) {
-                CleanInvalidOutput(info.indiceOutOffset + (s1OffsetPerAiv + innerS1Idx) * constInfo_.sparseCount);
-            }
-        }
-
-        int32_t invalidS1Num2 = info.actS1Size - info.actS2Size;
-        if (invalidS1Num2 > 0 && isS1LoopEnd && blockS2StartIdx_ == 0 && constInfo_.attenMaskFlag) {
-            int32_t s1NumPerAiv = blockId_ % 2 == 0 ? CeilDiv(invalidS1Num2, 2) : (invalidS1Num2 / 2);
-            int32_t s1OffsetPerAiv = (blockId_ % 2) * CeilDiv(invalidS1Num2, 2);
-            for (int innerS1Idx = 0; innerS1Idx < s1NumPerAiv; innerS1Idx++) {
-                CleanInvalidOutput((info.bN2Idx * constInfo_.qSeqSize + s1OffsetPerAiv + innerS1Idx) *
-                                   constInfo_.sparseCount);
-            }
-        }
-    }
-
     if (info.isLastS2InnerLoop) {
         // S2最后一个Loop后, 下一个基本块初始从0开始
         blockS2StartIdx_ = 0;
@@ -653,17 +614,11 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessLD()
     int32_t curCubeId = blockId_ / 2;
     int32_t tmpCubeId = curCubeId;
 
-    int64_t s2ActSeq;
-    int64_t s2Start;
-    int64_t s2End;
     int64_t isS2End;
-    int64_t s1Idx;
     uint32_t acc_list_num = 0;
-    int64_t bIdx = 0;
     int64_t needFd;
     int64_t wsOffset;
     int64_t wsInfoOffset = 0;
-    int64_t nextneedFd;
     int64_t valueOffset = 0;
     int64_t outOffset = 0;
 
@@ -716,7 +671,6 @@ __aicore__ inline void IndexerRefineServiceVector<LIT>::ProcessLD()
         wsInfoOffset = tmpCubeId * s1BaseSize_ * 2 * paramNum_ + innerS1Idx * 2 * paramNum_;
         needFd = vec1ParamGm.GetValue(wsInfoOffset);
         isS2End = vec1ParamGm.GetValue(wsInfoOffset + 4);
-        s1Idx = vec1ParamGm.GetValue(wsInfoOffset + 6);
         outOffset = vec1ParamGm.GetValue(wsInfoOffset + 8);
 
         while (needFd == 1) {

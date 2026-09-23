@@ -74,7 +74,6 @@ protected:
     __aicore__ inline void LoadQueryToL0a(uint64_t s1gL1Offset, uint64_t s1gL0Offset, uint64_t s1gL1RealSize,
                                           uint64_t s1gL0RealSize, const IndexerRefineCommon::RunInfo &runInfo);
     __aicore__ inline void QueryNd2Nz(uint64_t s1gL1RealSize, uint64_t s1gL1Offset, const IndexerRefineCommon::RunInfo &runInfo);
-    __aicore__ inline void KeyNd2Nz(uint64_t s2L1RealSize, uint64_t s2GmOffset, const IndexerRefineCommon::RunInfo &runInfo);
     __aicore__ inline void KeyNd2NzForPA(uint64_t s2L1RealSize, uint64_t s2GmOffset, const IndexerRefineCommon::RunInfo &runInfo);
     GlobalTensor<int32_t> blkTableGm_;
     GlobalTensor<K_T> keyGm_;
@@ -153,13 +152,10 @@ __aicore__ inline void IndexerRefineServiceCube<LIT>::ComputeMm1(const IndexerRe
         WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + keyL1BufIdx_ % KEY_BUF_NUM);
         uint64_t s2L1RealSize =
             s2GmOffset + S2_BASIC_BLOCK > s2ProcessSize ? s2ProcessSize - s2GmOffset : S2_BASIC_BLOCK;
-        if (PAGE_ATTENTION) {
-            // refine:cube 侧按 candidates+块表 直读 PA cache 散行 key
-            // (生产先例:sparse_flash_attention ComputeMm1 的 topKGm.GetValue + DataCopyPA)
-            KeyNd2NzForPA(s2L1RealSize, s2GmBaseOffset + s2GmOffset, runInfo);
-        }else {
-            KeyNd2Nz(s2L1RealSize, s2GmOffset, runInfo);
-        }
+        // refine:cube 侧按 candidates+块表 直读 PA cache 散行 key(host 硬拒非 PA_BSND,
+        // PAGE_ATTENTION 恒 true,非 PA 的 KeyNd2Nz 已随 R1 删除)
+        // (生产先例:sparse_flash_attention ComputeMm1 的 topKGm.GetValue + DataCopyPA)
+        KeyNd2NzForPA(s2L1RealSize, s2GmBaseOffset + s2GmOffset, runInfo);
 
         SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
         WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
@@ -206,42 +202,6 @@ __aicore__ inline void IndexerRefineServiceCube<LIT>::ComputeMm1(const IndexerRe
 
         SetFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + keyL1BufIdx_ % KEY_BUF_NUM);
         keyL1BufIdx_++;
-    }
-}
-
-template <typename LIT>
-__aicore__ inline void IndexerRefineServiceCube<LIT>::KeyNd2Nz(uint64_t s2L1RealSize, uint64_t s2GmOffset,
-                                                    const IndexerRefineCommon::RunInfo &runInfo)
-{
-    uint64_t s2L1Offset = 0;
-    while (s2L1Offset < s2L1RealSize) {
-        uint64_t keyGmOffset = runInfo.tensorKeyOffset + (s2GmOffset + s2L1Offset) * constInfo_.headDim;
-        // 搬运按照S2_BASIC_BLOCK_L0*D_BASIC_BLOCK_L0的方式在l1上排布, 方便后续mte1
-        // 根据s2的offset判断当前属于前一个L0分型还是后一个L0分型，暂时只支持两个分型
-        uint64_t s2Mte2Size = (s2L1RealSize <= S2_BASIC_BLOCK_L0 || s2L1Offset >= S2_BASIC_BLOCK_L0) ?
-                                  s2L1RealSize - s2L1Offset :
-                                  S2_BASIC_BLOCK_L0 - s2L1Offset;
-
-        Nd2NzParams nd2nzPara;
-        nd2nzPara.ndNum = 1;
-        nd2nzPara.nValue = s2Mte2Size; // 行数
-        nd2nzPara.dValue = constInfo_.headDim;
-        nd2nzPara.srcDValue = constInfo_.headDim;
-        nd2nzPara.dstNzC0Stride = s2L1Offset >= S2_BASIC_BLOCK_L0 ?
-                                      CeilAlign(s2L1RealSize - S2_BASIC_BLOCK_L0, (uint64_t)BLOCK_CUBE) :
-                                      (s2L1RealSize > S2_BASIC_BLOCK_L0 ?
-                                           S2_BASIC_BLOCK_L0 :
-                                           CeilAlign(s2L1RealSize, (uint64_t)BLOCK_CUBE)); // 对齐到16 单位block
-        nd2nzPara.dstNzNStride = 1;
-        nd2nzPara.srcNdMatrixStride = 0;
-        nd2nzPara.dstNzMatrixStride = 0;
-        DataCopy(keyL1_[(keyL1BufIdx_ % KEY_BUF_NUM) * KEY_BUFFER_OFFSET +
-                        (s2L1Offset >= S2_BASIC_BLOCK_L0 ?
-                             S2_BASIC_BLOCK_L0 * D_BASIC_BLOCK_L0 + (s2L1Offset - S2_BASIC_BLOCK_L0) * BLOCK_CUBE :
-                             s2L1Offset * BLOCK_CUBE)],
-                 keyGm_[keyGmOffset], nd2nzPara);
-
-        s2L1Offset += s2Mte2Size;
     }
 }
 

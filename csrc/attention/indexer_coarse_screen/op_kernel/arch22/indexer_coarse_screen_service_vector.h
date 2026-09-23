@@ -649,6 +649,24 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
             outI32.SetValue(15, static_cast<int32_t>(0xC0FFEE34));
             float v0 = dbgMm1Gm_.GetValue(0);
             outI32.SetValue(23, *reinterpret_cast<int32_t *>(&v0));
+            // v2 指纹词24..27,判"未写 / 写错 / 写串行"三类根因(S8 证据:
+            // r1 up=300<c 在窗口入口缺数学上必在的候选 → ws 在窗口前已坏):
+            //   24 = Σcand[0..validC) 标量累加(debug 路径,4096 次标量读可接受)
+            //   25 = cand[0]   26 = cand[validC-1]   27 = cand[up-1](guarded)
+            // 与 hw=0 纯粗筛 eager 参考行对拍:指纹==0xa5 毒化 → 主 pass 未写;
+            // 指纹==其他行参考 → 行基址错位(写串行);其余不符 → 写错内容。
+            int32_t rowSum = 0;
+            for (uint32_t t = 0; t < validC; t++) {
+                rowSum += dumpCand.GetValue(t);
+            }
+            outI32.SetValue(24, rowSum);
+            outI32.SetValue(25,
+                (validC > 0) ? dumpCand.GetValue(0) : static_cast<int32_t>(-12345));
+            outI32.SetValue(26,
+                (validC > 0) ? dumpCand.GetValue(validC - 1U) : static_cast<int32_t>(-12345));
+            outI32.SetValue(27,
+                (up >= 1U && up <= c) ? dumpCand.GetValue(up - 1U)
+                                      : static_cast<int32_t>(-12345));
             SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
             SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
             DataCopyPad(candidatesOutGm_[r * W], outI32, {1, static_cast<uint16_t>(28 * sizeof(int32_t)), 0, 0});

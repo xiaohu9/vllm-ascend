@@ -771,13 +771,22 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         // 管线顺序(NPU 实测修复:UB→UB DataCopy 走 MTE2 管道,与 S 管道补丁、MTE3 落盘
         // 竞态 → 补丁被覆写/行内容混杂):V 预填 -1 → V_MTE2 → MTE2 直读 GM 候选行进
         // outI32 → MTE2_V → V_S → S 补丁 → S_MTE3 + V_MTE3 → MTE3 落盘,逐段显式配对。
-        Duplicate(outI32, constInfo_.INVALID_IDX, W);
-        PipeBarrier<PIPE_V>();
-        // validC==0:跳过 ws 前缀拷贝(Duplicate 的 -1 即原语义,全零批 ws 为 0 尺寸)
+        // 2026-09-23 竞态第五例修复(S10 内容判决):坏行 = -1 预填透出
+        // (PARTIAL,-1 计数=C_diff-1,有效前缀边界随 launch 漂移)。旧序
+        // "Duplicate -1 覆盖 [0,W) 再 MTE2 装载 [0,c)" 两管道对 UB 同址写,
+        // 事件对在末核三行长队列(延伸分支:行5+零行6,7+cleanup 同 outQueue_)
+        // 下偶发失配。改为区域划分:[0,c) MTE2 独占装载,[c,W) V 独占 -1 填充
+        // —— 消除同址写,语义不变(ws 行 [validC,c) 本就为 -1 尾)。
         if (validC > 0) {
-            SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
             DataCopy(outI32, candidatesWsGm_[r * c], c);
             SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+            PipeBarrier<PIPE_V>();
+            Duplicate(outI32[c], constInfo_.INVALID_IDX, W - c);
+            PipeBarrier<PIPE_V>();
+        } else {
+            // validC==0:无 ws 装载(全零批 ws 为 0 尺寸),整行 -1 + 身份 patch
+            Duplicate(outI32, constInfo_.INVALID_IDX, W);
+            PipeBarrier<PIPE_V>();
         }
         SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
         if (nNew > 0) {

@@ -610,6 +610,13 @@ template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessInvalid()
 {
     if ASCEND_IS_AIV {
+        // 临时插桩(2026-09-24 全零批取证,定位后删除):填充覆盖范围真实值
+        if (tmpBlockIdx == 0) {
+            AscendC::PRINTF("[czdbg2] outW=%u kHeadNum=%u total=%llu\n",
+                            constInfo.outW, constInfo.kHeadNum,
+                            (uint64_t)(constInfo.batchSize * constInfo.outW
+                                       * constInfo.kHeadNum));
+        }
         uint32_t aivCoreNum = GetBlockNum() * 2; // 2 means c:v = 1:2
         uint64_t totalOutputSize =
             constInfo.batchSize * constInfo.outW * constInfo.kHeadNum;

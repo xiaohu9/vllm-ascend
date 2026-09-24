@@ -607,8 +607,13 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessInvalid()
             constInfo.batchSize * constInfo.outW * constInfo.kHeadNum;
         uint64_t singleCoreSize =
             IndexerCoarseScreenCommon::Align((totalOutputSize + aivCoreNum - 1) / aivCoreNum, GM_ALIGN_BYTES / sizeof(OUT_T));
-        uint64_t baseSize = tmpBlockIdx * singleCoreSize;
-        if (baseSize < totalOutputSize) {
+        // 2026-09-24 修复(全零批 gate 12 项 FAIL 根因):指纹填充实测 0 号核的
+        // InitGlobalMemory 在本上下文确定性不落地(31/32 核正常,唯 core0 区间
+        // 读回为 0;同核 DataCopy 路径正常,根因未深究)→ 区间映射整体错开一位:
+        // 区间 r 由核 r+1 填写,0 号核不承担任何清理写。区间数 ≤ ceil(4103/128)=33 ≤ 48。
+        uint64_t outRanges = (totalOutputSize + singleCoreSize - 1) / singleCoreSize;
+        if (tmpBlockIdx >= 1U && tmpBlockIdx <= outRanges) {
+            uint64_t baseSize = (uint64_t)(tmpBlockIdx - 1) * singleCoreSize;
             uint64_t dealSize =
                 (baseSize + singleCoreSize <= totalOutputSize) ? singleCoreSize : totalOutputSize - baseSize;
             GlobalTensor<OUT_T> output = candidatesOutGm[baseSize];
@@ -617,12 +622,16 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessInvalid()
         uint64_t totalAslkSize = constInfo.batchSize;
         uint64_t aslkSingleCoreSize =
             IndexerCoarseScreenCommon::Align((totalAslkSize + aivCoreNum - 1) / aivCoreNum, GM_ALIGN_BYTES / sizeof(int32_t));
-        uint64_t aslkBase = tmpBlockIdx * aslkSingleCoreSize;
-        if (aslkBase < totalAslkSize) {
-            uint64_t aslkDeal =
-                (aslkBase + aslkSingleCoreSize <= totalAslkSize) ? aslkSingleCoreSize : totalAslkSize - aslkBase;
-            GlobalTensor<int32_t> aslkTarget = aslkOutGm[aslkBase]; // 具名左值(InitGlobalMemory 形参为非常量引用)
-            AscendC::InitGlobalMemory(aslkTarget, aslkDeal, 0);
+        // aslk 清理:与 C 同款错位映射(理由同上),区间 r 由核 r+1 填写
+        uint64_t aslkRanges = (totalAslkSize + aslkSingleCoreSize - 1) / aslkSingleCoreSize;
+        if (tmpBlockIdx >= 1U && tmpBlockIdx <= aslkRanges) {
+            uint64_t aslkBase = (uint64_t)(tmpBlockIdx - 1) * aslkSingleCoreSize;
+            if (aslkBase < totalAslkSize) {
+                uint64_t aslkDeal =
+                    (aslkBase + aslkSingleCoreSize <= totalAslkSize) ? aslkSingleCoreSize : totalAslkSize - aslkBase;
+                GlobalTensor<int32_t> aslkTarget = aslkOutGm[aslkBase]; // 具名左值(InitGlobalMemory 形参为非常量引用)
+                AscendC::InitGlobalMemory(aslkTarget, aslkDeal, 0);
+            }
         }
     }
 }

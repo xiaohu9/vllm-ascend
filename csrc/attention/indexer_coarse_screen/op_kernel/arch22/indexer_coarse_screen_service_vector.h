@@ -458,14 +458,12 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
     //   批内含 aslk=0 行(零行走 DealActSeqLenIsZero 清理分支)时,实数行
     //   候选集非确定损坏(C_diff 2507~4043 随时序漂移,同输入紧邻两跑互差
     //   998;hasWindow=0 纯粗筛零污染 = 窗口阶段定点)。曾试本入口加
-    //   PIPE_ALL + SyncAll(写入可见性保证)——S7 复测仍污染,证明竞态不在
-    //   ws 写可见性,而在窗口阶段自身并发执行的 UB/队列复用时序
-    //   (hasWindow=2 dump 判别实验见 graph_smoke_service_shape.py S8)。
-    //   本屏障保留为深度防御(无害),生产修复 = caller 侧 clamp(min=1)
-    //   结构性消除零行走行(pivot_indexer.py decode :133 + prefill :218)。
-    AscendC::PipeBarrier<PIPE_ALL>();
-    SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
-    SyncAll();
+    // 2026-09-24 P6:入口三件套(PIPE_ALL + MTE3_MTE2 + SyncAll)移除。历史:为
+    //   "竞态第四例"所加的深度防御,S7 实验已证其对该竞态无效(真因 = SplitCore
+    //   分核 bug,2026-09-24 已根修);配对分区设计下窗口读者=同对写者,跨对无
+    //   可见性依赖,SyncAll 纯属每 launch 固定开销。全零批路径(KERN Process
+    //   usedCoreNum==0 分支)的"全部 AIV 到屏障"约束随屏障移除一并消失(各 AIV
+    //   独立进入、独立 Reset 自身 pipe,无跨核对依赖)。
     // 独立窗口缓冲(pipe->Reset 释放主 pass 缓冲,先例 = InitLDBuffers)
     pipe->Reset();
     const uint32_t c = static_cast<uint32_t>(constInfo_.sparseCount);

@@ -544,6 +544,14 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::CalcRunInfo(uint32_t loop
 template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Process()
 {
+    // 临时插桩(2026-09-24 全零批取证,定位后删除):分支入口真实值
+    if ASCEND_IS_AIV {
+        if (tmpBlockIdx == 0) {
+            AscendC::PRINTF("[czdbg] totalBlockNum=%u usedCoreNum=%u hw=%u bs=%u ald=%u\n",
+                            totalBlockNum, usedCoreNum, constInfo.hasWindow,
+                            constInfo.batchSize, constInfo.actualLenDims);
+        }
+    }
     if (usedCoreNum == 0 || totalBlockNum == 0) {
         // 全零批(所有行粗筛域空,如 prefill-PIVOT 的请求首组单独成批):窗口模式
         // 2026-09-24 起真实可达:判据 = totalBlockNum==0(SplitCore 每核独立算,

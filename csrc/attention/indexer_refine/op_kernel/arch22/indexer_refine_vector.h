@@ -19,7 +19,9 @@
 
 namespace IndexerRefineServiceVec {
 
-// 前向声明(SortAll P4 事件对在 helper 定义之前调用)
+// 前向声明(SortAll P4 事件对在 helper 定义之前调用;模板形态与 coarse 同款,
+// 调用点语法 = SetWaitFlag<HardEvent::X>(HardEvent::X))
+template <HardEvent event>
 __aicore__ inline void SetWaitFlag(HardEvent evt);
 using namespace AscendC;
 

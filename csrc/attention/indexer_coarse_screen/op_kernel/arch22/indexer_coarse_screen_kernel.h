@@ -615,7 +615,8 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessInvalid()
         // 顶枪、末胜模型下 dummy 被丢弃,两种模型下 C 必落地;48 核原始映射
         // i→区间 i,覆盖无洞。aslk 清理移除:host 侧已改 at::zeros(全零路径
         // aslk' 语义 = 0;普通路径 kernel 必然覆盖写),消除同核双写分歧。
-        AscendC::InitGlobalMemory(mm1ResGm[0], 1U, static_cast<MM1_OUT_T>(0)); // dummy(吸收首失)
+        GlobalTensor<MM1_OUT_T> dummyTarget = mm1ResGm[0]; // 具名左值(InitGlobalMemory 形参为非常量引用)
+        AscendC::InitGlobalMemory(dummyTarget, 1U, static_cast<MM1_OUT_T>(0)); // dummy(吸收首失)
         uint64_t baseSize = tmpBlockIdx * singleCoreSize;
         if (baseSize < totalOutputSize) {
             uint64_t dealSize =

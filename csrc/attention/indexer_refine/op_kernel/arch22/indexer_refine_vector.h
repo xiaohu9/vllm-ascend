@@ -243,12 +243,15 @@ __aicore__ inline void SortAll(LocalTensor<float> &src, LocalTensor<float> &tmp,
         AscendC::PipeBarrier<PIPE_V>();
     }
     if (i % CONST_TWO == 0) {
-        // 2026-08-30 修复: DataCopy(MTE2) 写 src 后必须同步到 V 通道。返回后调用方
-        //   (MergeSort 的 MrgSort)立即 V 读 src,仅 PipeBarrier<PIPE_V> 不等 MTE2 →
-        //   mid 4块反复竞态:Sort32 写 tmpSortBuf 覆盖上一轮 DataCopy 未读完的 merge 结果,
-        //   globalTopkUb_ 索引段混入 float 位模式 → col 垃圾(1221019529 实测)。
+        // 2026-09-24 P4:PIPE_ALL → 精确双向事件对(省全管道排空)。两个跨管道序:
+        //   ① V 写 tmp(MrgSort/Sort32)→ MTE2 读 tmp(DataCopy 源):V_MTE2——
+        //     原先仅靠调用侧 SV:427 PIPE_ALL 时序性掩盖的潜在竞态,此处补上显式序;
+        //   ② MTE2 写 src(DataCopy 目标)→ 返回后调用方 MergeSort 的 MrgSort V 读
+        //     src:MTE2_V(2026-08-30 修复的原序:缺失时 Sort32 写 tmpSortBuf 覆盖
+        //     上一轮未读完的 merge 结果,globalTopkUb_ 索引段混入 float 位模式)。
+        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
         AscendC::DataCopy(src, tmp, logitsNum * VALUE_AND_INDEX_NUM);
-        AscendC::PipeBarrier<PIPE_ALL>();
+        SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
     }
 }
 

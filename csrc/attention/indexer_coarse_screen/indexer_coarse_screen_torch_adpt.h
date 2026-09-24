@@ -44,7 +44,10 @@ std::tuple<at::Tensor, at::Tensor> construct_indexer_coarse_screen_output_tensor
     output_size = {req_num, out_w};
 
     at::Tensor candidates_out = at::empty(output_size, q_bar.options().dtype(at::kInt));
-    at::Tensor aslk_out = at::empty({req_num}, q_bar.options().dtype(at::kInt));
+    // at::zeros(非 empty):全零批(所有行粗筛域空)走 kernel ProcessInvalid
+    // 清理路径,该路径的 aslk 写实测不可靠(同核多发 init 部分丢失),aslk'
+    // 语义恰为 0 → host 保证;普通路径 kernel 必然覆盖写 aslk',此零初始化无感。
+    at::Tensor aslk_out = at::zeros({req_num}, q_bar.options().dtype(at::kInt));
     return std::tuple<at::Tensor, at::Tensor>(candidates_out, aslk_out);
 }
 

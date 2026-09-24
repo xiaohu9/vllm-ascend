@@ -544,14 +544,6 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::CalcRunInfo(uint32_t loop
 template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Process()
 {
-    // 临时插桩(2026-09-24 全零批取证,定位后删除):分支入口真实值
-    if ASCEND_IS_AIV {
-        if (tmpBlockIdx == 0) {
-            AscendC::PRINTF("[czdbg] totalBlockNum=%u usedCoreNum=%u hw=%u bs=%u ald=%u\n",
-                            totalBlockNum, usedCoreNum, constInfo.hasWindow,
-                            constInfo.batchSize, constInfo.actualLenDims);
-        }
-    }
     if (usedCoreNum == 0 || totalBlockNum == 0) {
         // 全零批(所有行粗筛域空,如 prefill-PIVOT 的请求首组单独成批):窗口模式
         // 2026-09-24 起真实可达:判据 = totalBlockNum==0(SplitCore 每核独立算,
@@ -610,13 +602,6 @@ template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessInvalid()
 {
     if ASCEND_IS_AIV {
-        // 临时插桩(2026-09-24 全零批取证,定位后删除):填充覆盖范围真实值
-        if (tmpBlockIdx == 0) {
-            AscendC::PRINTF("[czdbg2] outW=%u kHeadNum=%u total=%llu\n",
-                            constInfo.outW, constInfo.kHeadNum,
-                            (uint64_t)(constInfo.batchSize * constInfo.outW
-                                       * constInfo.kHeadNum));
-        }
         uint32_t aivCoreNum = GetBlockNum() * 2; // 2 means c:v = 1:2
         uint64_t totalOutputSize =
             constInfo.batchSize * constInfo.outW * constInfo.kHeadNum;
@@ -627,9 +612,7 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessInvalid()
             uint64_t dealSize =
                 (baseSize + singleCoreSize <= totalOutputSize) ? singleCoreSize : totalOutputSize - baseSize;
             GlobalTensor<OUT_T> output = candidatesOutGm[baseSize];
-            // 取证临时(2026-09-24,定位后改回 INVALID_IDX):每核指纹值 = 核号+1,
-            // 输出值分布直接揭示各核填充落点(整体 +128 偏移 vs 事后 512B 抹零)
-            AscendC::InitGlobalMemory(output, dealSize, OUT_T(tmpBlockIdx + 1));
+            AscendC::InitGlobalMemory(output, dealSize, constInfo.INVALID_IDX);
         }
         uint64_t totalAslkSize = constInfo.batchSize;
         uint64_t aslkSingleCoreSize =

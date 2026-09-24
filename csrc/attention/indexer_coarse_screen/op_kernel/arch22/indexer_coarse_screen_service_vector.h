@@ -244,12 +244,13 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
     int32_t cuS1ProcNum =
         cuS1BeginIdxPerAiv + s1BaseSize_ > info.actS1Size ? info.actS1Size % s1BaseSize_ : s1BaseSize_;
     // cuS1ProcNumPerAiv: 每个AIv的S1计算量
-    int32_t cuS1ProcNumPerAiv = blockId_ % 2 == 0 ? CeilDiv(cuS1ProcNum, 2) : (cuS1ProcNum / 2);
-    cuS1BeginIdxPerAiv += (blockId_ % 2) * CeilDiv(cuS1ProcNum, 2);
+    int32_t cuS1ProcHalf = CeilDiv(cuS1ProcNum, 2); // P3: 一行两用,免每块 2 次整除
+    int32_t cuS1ProcNumPerAiv = blockId_ % 2 == 0 ? cuS1ProcHalf : (cuS1ProcNum / 2);
+    cuS1BeginIdxPerAiv += (blockId_ % 2) * cuS1ProcHalf;
 
     // 基本块基地址偏移奇数核加一个S1地址偏移
-    weightGmOffset += (blockId_ % 2) * CeilDiv(cuS1ProcNum, 2) * kHeadNum_ * gSize_;
-    mmGmOffset += (blockId_ % 2) * CeilDiv(cuS1ProcNum, 2) * gSize_ * info.actualSingleProcessSInnerSizeAlign;
+    weightGmOffset += (blockId_ % 2) * cuS1ProcHalf * kHeadNum_ * gSize_;
+    mmGmOffset += (blockId_ % 2) * cuS1ProcHalf * gSize_ * info.actualSingleProcessSInnerSizeAlign;
 
     // cut G
     int32_t outerG = CeilDiv(gSize_, groupInner_);
@@ -414,10 +415,11 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::EmitIdentityRows(u
     // aslk' 用 aux 逐行直写(DataCopyPad 4B)。
     LocalTensor<int32_t> outI32 = winOutBuf_.Get<int32_t>();
     LocalTensor<int32_t> auxI32 = winAuxBuf_.Get<int32_t>();
+    uint32_t prevCum = 0U; // 行 0 的 cumBegin
     for (uint32_t r = 0; r < rowCount; r++) {
         uint32_t cumEnd = callerSeqLenGmQ_.GetValue(r);
-        uint32_t cumBegin = (r == 0) ? 0U : callerSeqLenGmQ_.GetValue(r - 1);
-        uint32_t own = cumEnd - cumBegin;
+        uint32_t own = cumEnd - prevCum; // 2026-09-24 P3: cumBegin≡上行 cumEnd,滚动缓存省每行 1 次标量 GM 读
+        prevCum = cumEnd;
         const uint32_t W = constInfo_.outW;
         Duplicate(outI32, constInfo_.INVALID_IDX, W);
         PipeBarrier<PIPE_V>();
@@ -489,6 +491,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         LocalTensor<int32_t> dumpCand = winCandBuf_.Get<int32_t>();
         LocalTensor<int32_t> posI32 = winPosBuf_.Get<int32_t>();
         LocalTensor<int32_t> mskI32 = winMskBuf_.Get<int32_t>();
+        uint32_t prevCum = (rBegin == 0) ? 0U : callerSeqLenGmQ_.GetValue(rBegin - 1);
         for (uint32_t r = rBegin; r < rEnd; r++) {
             DataCopy(dumpCand, candidatesWsGm_[r * c], c);
             PipeBarrier<PIPE_MTE2>();
@@ -496,8 +499,8 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
             uint32_t up = aslkGm_.GetValue(r);
             uint32_t validC = IndexerCoarseScreenCommon::Min(up, c);
             uint32_t cumEnd = callerSeqLenGmQ_.GetValue(r);
-            uint32_t cumBegin = (r == 0) ? 0U : callerSeqLenGmQ_.GetValue(r - 1);
-            uint32_t own = cumEnd - cumBegin;
+            uint32_t own = cumEnd - prevCum; // P3: cumBegin≡上行 cumEnd
+            prevCum = cumEnd;
             int32_t winStart = static_cast<int32_t>(up) - static_cast<int32_t>(constInfo_.groupSize - 1);
             int32_t winEnd = static_cast<int32_t>(up) + static_cast<int32_t>(own);
             for (uint32_t j = 0; j < 7; j++) {
@@ -586,11 +589,12 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
         return;
     }
+    uint32_t prevCum = (rBegin == 0) ? 0U : callerSeqLenGmQ_.GetValue(rBegin - 1);
     for (uint32_t r = rBegin; r < rEnd; r++) {
         uint32_t upper = aslkGm_.GetValue(r);
         uint32_t cumEnd = callerSeqLenGmQ_.GetValue(r);
-        uint32_t cumBegin = (r == 0) ? 0U : callerSeqLenGmQ_.GetValue(r - 1);
-        uint32_t own = cumEnd - cumBegin;
+        uint32_t own = cumEnd - prevCum; // P3: cumBegin≡上行 cumEnd,滚动缓存省每行 1 次标量 GM 读
+        prevCum = cumEnd;
         uint32_t validC = IndexerCoarseScreenCommon::Min(upper, c);
         // 2026-09-21 补:validC==0 行的 MTE3(V Identity 写)与本行/下一行
         // MTE2 装载的跨管道序,由下方分支内 MTE2_V/V_S 的既有配对保证;
@@ -655,18 +659,17 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
                     Add(mskI32, mskI32, mskI32[now * cols], now * cols);
                     PipeBarrier<PIPE_V>();
                 }
-                // 二级:cols → 8 元素(偏移 n*4 ≥ 32B)
+                // 二级:cols → 1(P2 2026-09-24:向量内折叠到底,标量侧只读 1 元素,
+                // 省 7 次 S 管道 GetValue;整数加法可交换,diffSum 数值恒等。
+                // 偏移 n*4 ≥ 32B 对齐性与一级同款)
                 uint32_t n2 = cols;
-                while (n2 > 8) {
+                while (n2 > 1) {
                     n2 >>= 1;
                     Add(mskI32, mskI32, mskI32[n2], n2);
                     PipeBarrier<PIPE_V>();
                 }
                 SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
-                int32_t diffSum = 0;
-                for (int t = 0; t < 8; t++) {
-                    diffSum += mskI32.GetValue(t);
-                }
+                int32_t diffSum = mskI32.GetValue(0);
                 // diffSum = 不等于 pos 的候选个数;present ⇔ 存在相等 ⇔ diffSum < validC(纯整比)
                 if (diffSum < static_cast<int32_t>(validC)) {
                     continue; // present:窗口位置已在候选行

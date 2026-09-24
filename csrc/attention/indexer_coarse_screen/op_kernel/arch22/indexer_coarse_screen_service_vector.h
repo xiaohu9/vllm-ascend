@@ -478,7 +478,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
     pipe->InitBuffer(winOutBuf_, W * sizeof(int32_t));
     pipe->InitBuffer(winAuxBuf_, (64 + (rEnd - rBegin)) * sizeof(int32_t));
 
-    LocalTensor<int32_t> candI32 = winCandBuf_.Get<int32_t>();
+    // winCandBuf_ 仅 dump 分支使用(P1 双读合并后 dedup 直接消费 outI32)
     LocalTensor<int32_t> posI32 = winPosBuf_.Get<int32_t>();
     LocalTensor<int32_t> mskI32 = winMskBuf_.Get<int32_t>();
     LocalTensor<int32_t> outI32 = winOutBuf_.Get<int32_t>();
@@ -605,13 +605,15 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
             continue;
         }
         // 2026-09-17 竞态终修(A3 判决实证):dedup 首个 Sub(V) 可越过未完成的
-        // MTE2 拷贝读 candI32 —— winStart 位置被判"缺席"追加重复(A3 的 61 即证)。
+        // MTE2 拷贝读候选行 —— winStart 位置被判"缺席"追加重复(A3 的 61 即证)。
         // PipeBarrier<PIPE_MTE2> 只排 MTE2 内部;跨管道 MTE2→V 必须事件同步
         // (M1/复刻链同款先例:复刻链因先做 MTE2_S 等待而全对,真实链缺此事件)。
         // validC==0(粗筛域空,如 prefill 首组)无去重,candI32 无人消费;且全零批
         // 的 workspace 为 0 尺寸,读之挂起 —— 装载与等待一并跳过(2026-09-21)。
+        // 2026-09-24 P1 双读合并:装载目标直接用 outI32[0,c)(组装段复用,免第二次
+        // 16KB GM 读);区域划分语义不变 —— [0,c) 仍 MTE2 独占写,dedup 只读。
         if (validC > 0) {
-            DataCopy(candI32, candidatesWsGm_[r * c], c);
+            DataCopy(outI32, candidatesWsGm_[r * c], c);
             SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
         }
 
@@ -644,7 +646,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
                 PipeBarrier<PIPE_V>();
                 Duplicate(posI32, pos, validC);
                 PipeBarrier<PIPE_V>();
-                Sub(mskI32, candI32, posI32, validC);
+                Sub(mskI32, outI32, posI32, validC); // P1: 候选行 = outI32[0,c)(双读合并)
                 PipeBarrier<PIPE_V>();
                 Mins(mskI32, mskI32, static_cast<int32_t>(1), validC);
                 PipeBarrier<PIPE_V>();
@@ -690,8 +692,8 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         // 下偶发失配。改为区域划分:[0,c) MTE2 独占装载,[c,W) V 独占 -1 填充
         // —— 消除同址写,语义不变(ws 行 [validC,c) 本就为 -1 尾)。
         if (validC > 0) {
-            DataCopy(outI32, candidatesWsGm_[r * c], c);
-            SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+            // P1 双读合并:[0,c) 已在 dedup 阶段 MTE2 装载并经 MTE2_V 事件对
+            // dedup 消费,V 同管道在后续 —— 此处只补 [c,W) 的 -1 填充。
             PipeBarrier<PIPE_V>();
             Duplicate(outI32[c], constInfo_.INVALID_IDX, W - c);
             PipeBarrier<PIPE_V>();

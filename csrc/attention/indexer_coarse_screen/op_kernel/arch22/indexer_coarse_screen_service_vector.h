@@ -666,17 +666,20 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
                     Add(mskI32, mskI32, mskI32[now * cols], now * cols);
                     PipeBarrier<PIPE_V>();
                 }
-                // 二级:cols → 1(P2 2026-09-24:向量内折叠到底,标量侧只读 1 元素,
-                // 省 7 次 S 管道 GetValue;整数加法可交换,diffSum 数值恒等。
-                // 偏移 n*4 ≥ 32B 对齐性与一级同款)
+                // 二级:cols → 8 元素(偏移 n*4 ≥ 32B)。P2 的"折叠到 1"曾引入
+                // 16/8/4B 偏移的 Add —— NPU 实测 0x800 VEC 非对齐异常嫌疑,
+                // 回退 8 元素形态(2026-09-24);标量侧 8 次 GetValue 保留。
                 uint32_t n2 = cols;
-                while (n2 > 1) {
+                while (n2 > 8) {
                     n2 >>= 1;
                     Add(mskI32, mskI32, mskI32[n2], n2);
                     PipeBarrier<PIPE_V>();
                 }
                 SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
-                int32_t diffSum = mskI32.GetValue(0);
+                int32_t diffSum = 0;
+                for (int t = 0; t < 8; t++) {
+                    diffSum += mskI32.GetValue(t);
+                }
                 // diffSum = 不等于 pos 的候选个数;present ⇔ 存在相等 ⇔ diffSum < validC(纯整比)
                 if (diffSum < static_cast<int32_t>(validC)) {
                     continue; // present:窗口位置已在候选行

@@ -18,6 +18,9 @@
 #include "kernel_operator.h"
 
 namespace IndexerRefineServiceVec {
+
+// 前向声明(SortAll P4 事件对在 helper 定义之前调用)
+__aicore__ inline void SetWaitFlag(HardEvent evt);
 using namespace AscendC;
 
 constexpr int32_t NEG_INF = 0xFF800000;

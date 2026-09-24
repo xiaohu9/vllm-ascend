@@ -627,7 +627,9 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessInvalid()
             uint64_t dealSize =
                 (baseSize + singleCoreSize <= totalOutputSize) ? singleCoreSize : totalOutputSize - baseSize;
             GlobalTensor<OUT_T> output = candidatesOutGm[baseSize];
-            AscendC::InitGlobalMemory(output, dealSize, constInfo.INVALID_IDX);
+            // 取证临时(2026-09-24,定位后改回 INVALID_IDX):-7 区分"填充落地"
+            // 与"回收内容恰好含 -1"——输出若见 -7 = 填充生效,残留 0 = 有后续写者
+            AscendC::InitGlobalMemory(output, dealSize, OUT_T(-7));
         }
         uint64_t totalAslkSize = constInfo.batchSize;
         uint64_t aslkSingleCoreSize =

@@ -130,6 +130,11 @@ protected:
     uint32_t tmpBlockIdx = 0U;
     uint32_t aiCoreIdx = 0U;
     uint32_t usedCoreNum = 0U;
+    // 整批总块数(SplitCore 每核独立遍历全部行计算,各核天然同值)。
+    // 0 = 整批无块(所有行粗筛域空):host 无法预知(upper 是 device 张量,禁 D2H
+    // 同步),tiling 的 usedCoreNum 恒 ≥1 → 全零批判据只能在 kernel 侧算。
+    // 2026-09-24 修复:整批无块时原版输出整批无人写(回收垃圾,refine 连锁吃垃圾)。
+    uint32_t totalBlockNum = 0U;
 
     IndexerCoarseScreenCommon::ConstInfo constInfo{};
     TempLoopInfo tempLoopInfo{};
@@ -275,7 +280,8 @@ __aicore__ void inline IndexerCoarseScreenKernel<LIT>::SplitCore(uint32_t curCor
                                                          uint32_t &coreNum, IndexerCoarseScreenCommon::SplitCoreInfo &info)
 {
     // 计算每个核最少处理的块数, 剩余的部分前面的核每个核多处理一块
-    uint32_t totalBlockNum = GetTotalBaseBlockNum();
+    // (写入成员:全零批判据供 Process 使用,各核独立计算结果一致)
+    totalBlockNum = GetTotalBaseBlockNum();
     uint32_t minBlockPerCore = totalBlockNum / coreNum;
     uint32_t deal1MoreBlockCoreNum = totalBlockNum % coreNum;
     uint32_t coreIdx = 0;
@@ -538,8 +544,11 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::CalcRunInfo(uint32_t loop
 template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Process()
 {
-    if (usedCoreNum == 0) {
+    if (usedCoreNum == 0 || totalBlockNum == 0) {
         // 全零批(所有行粗筛域空,如 prefill-PIVOT 的请求首组单独成批):窗口模式
+        // 2026-09-24 起真实可达:判据 = totalBlockNum==0(SplitCore 每核独立算,
+        // 同值同步分支,全 AIV 仍同时到屏障,无死锁);usedCoreNum==0 为 host 侧
+        // 防御(host tiling 恒置 ≥1,保留)。修复前此场景输出整批无人写(回收垃圾)。
         // 仍须发恒等语义行(池空,own tokens [0, upper+own) 全进精筛域)—— 主 pass
         // 未运行,ws 无 DealActSeqLenIsZero 的 -1 预填,各 AIV 协作补填后由 0 号核
         // 走已验证的 ProcessWindow(validC==0 分支:免去重,own 全追加)。

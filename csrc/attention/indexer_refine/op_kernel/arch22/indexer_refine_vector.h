@@ -299,11 +299,12 @@ __aicore__ inline void MergeSort(const LocalTensor<float> &mrgDst, int32_t mrgDs
 
         AscendC::MrgSort<float>(tmpTensor, srcList, params);
         AscendC::PipeBarrier<PIPE_V>();
+        // 2026-09-24 P4:PIPE_ALL → 双向事件对(V 写 tmpTensor → MTE2 读 = V_MTE2;
+        // MTE2 写 mrgDst → 下一块 MergeSort 的 MrgSort V 读 = MTE2_V。原注释:
+        // 仅 PIPE_V 不等 MTE2 → 读到旧/半写数据 → 索引段混入 float 位模式)。
+        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
         AscendC::DataCopy(mrgDst, tmpTensor, mrgDstNum * VALUE_AND_INDEX_NUM);
-        // 2026-08-30 修复: DataCopy(MTE2) 写 mrgDst 后必须等 MTE2 完成,下一块 MergeSort 的
-        //   MrgSort(V) 立即读 mrgDst(globalTopkUb_)。仅 PIPE_V 不等 MTE2 → 读到旧/半写数据
-        //   → 索引段混入 float 位模式(col 垃圾)。同 SortAll 修复。
-        AscendC::PipeBarrier<PIPE_ALL>();
+        SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
     } else {
         int64_t unitElements = 1024;
         int64_t segNum = mrgDstNum / unitElements;
@@ -329,9 +330,10 @@ __aicore__ inline void MergeSort(const LocalTensor<float> &mrgDst, int32_t mrgDs
 
         AscendC::MrgSort<float>(tmpTensor, srcList, params);
         AscendC::PipeBarrier<PIPE_V>();
+        // 2026-09-24 P4: 同分支1 — 双向事件对替换 PIPE_ALL(同上)。
+        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
         AscendC::DataCopy(mrgDst, tmpTensor, mrgDstNum * VALUE_AND_INDEX_NUM);
-        // 2026-08-30 修复: 同分支1 — DataCopy 后必须 PIPE_ALL,下一块 MrgSort(V) 读 mrgDst 才安全。
-        AscendC::PipeBarrier<PIPE_ALL>();
+        SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
     }
 }
 

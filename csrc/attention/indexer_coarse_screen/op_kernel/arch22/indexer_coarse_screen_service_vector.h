@@ -464,6 +464,13 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
     //   可见性依赖,SyncAll 纯属每 launch 固定开销。全零批路径(KERN Process
     //   usedCoreNum==0 分支)的"全部 AIV 到屏障"约束随屏障移除一并消失(各 AIV
     //   独立进入、独立 Reset 自身 pipe,无跨核对依赖)。
+    // 2026-09-28 回滚1(d7002bac 部分恢复): 入口三件套恢复——生产 burst/gsm8k
+    //   在 P6 移除该屏障后随机 AICORE fault(VEC 参数非法, IndexerRefine AIV 尾部),
+    //   10:27 SVEC 窗口行循环优化改变了循环结构, 12:46 的"对该竞态无效"结论不再
+    //   覆盖新形态; 恢复为深度防御。
+    AscendC::PipeBarrier<PIPE_ALL>();
+    SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
+    SyncAll();
     // 独立窗口缓冲(pipe->Reset 释放主 pass 缓冲,先例 = InitLDBuffers)
     pipe->Reset();
     const uint32_t c = static_cast<uint32_t>(constInfo_.sparseCount);

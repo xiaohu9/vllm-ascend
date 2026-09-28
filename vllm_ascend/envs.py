@@ -132,7 +132,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (0xa5a5a5a5) -> replay AICORE fault lottery. RELAXED lets the copies
     # execute, removing the lottery. "global" restores upstream behavior.
     "VLLM_ASCEND_ACLGRAPH_CAPTURE_ERROR_MODE": lambda: os.getenv(
-        "VLLM_ASCEND_ACLGRAPH_CAPTURE_ERROR_MODE", "relaxed"),
+        "VLLM_ASCEND_ACLGRAPH_CAPTURE_ERROR_MODE", "global"),
 }
 
 # end-env-vars-definition

@@ -613,8 +613,10 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessInvalid()
         // 跟地址无关)。防护 = 每核先向 workspace(mm1 段,全零路径不使用)打
         // 一发 dummy init 吸收失效,再写本核真正的 C 区间 —— 首失模型下 dummy
         // 顶枪、末胜模型下 dummy 被丢弃,两种模型下 C 必落地;48 核原始映射
-        // i→区间 i,覆盖无洞。aslk 清理移除:host 侧已改 at::zeros(全零路径
-        // aslk' 语义 = 0;普通路径 kernel 必然覆盖写),消除同核双写分歧。
+        // i→区间 i,覆盖无洞。
+        // aslk 清理(2026-09-28 改标量 SetValue):host at::zeros 在生产 GLOBAL
+        // 捕获态触发 EE1016 同步拷贝(整网 AIME 崩溃主嫌)已回退;标量写不走
+        // InitGlobalMemory 槽位,无同核多发丢失问题。死路径,R ≤ 数千,性能无谓。
         GlobalTensor<MM1_OUT_T> dummyTarget = mm1ResGm[0]; // 具名左值(InitGlobalMemory 形参为非常量引用)
         AscendC::InitGlobalMemory(dummyTarget, 1U, static_cast<MM1_OUT_T>(0)); // dummy(吸收首失)
         uint64_t baseSize = tmpBlockIdx * singleCoreSize;
@@ -623,6 +625,11 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessInvalid()
                 (baseSize + singleCoreSize <= totalOutputSize) ? singleCoreSize : totalOutputSize - baseSize;
             GlobalTensor<OUT_T> output = candidatesOutGm[baseSize];
             AscendC::InitGlobalMemory(output, dealSize, constInfo.INVALID_IDX);
+        }
+        if (tmpBlockIdx == 0) {
+            for (uint32_t i = 0; i < constInfo.batchSize; i++) {
+                aslkOutGm.SetValue(i, 0);
+            }
         }
     }
 }

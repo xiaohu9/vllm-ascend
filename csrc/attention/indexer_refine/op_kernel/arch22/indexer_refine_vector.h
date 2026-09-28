@@ -248,13 +248,11 @@ __aicore__ inline void SortAll(LocalTensor<float> &src, LocalTensor<float> &tmp,
         AscendC::PipeBarrier<PIPE_V>();
     }
     if (i % CONST_TWO == 0) {
-        // 2026-09-24 P4:PIPE_ALL → 精确双向事件对(省全管道排空)。两个跨管道序:
-        //   ① V 写 tmp(MrgSort/Sort32)→ MTE2 读 tmp(DataCopy 源):V_MTE2——
-        //     原先仅靠调用侧 SV:427 PIPE_ALL 时序性掩盖的潜在竞态,此处补上显式序;
-        //   ② MTE2 写 src(DataCopy 目标)→ 返回后调用方 MergeSort 的 MrgSort V 读
-        //     src:MTE2_V(2026-08-30 修复的原序:缺失时 Sort32 写 tmpSortBuf 覆盖
-        //     上一轮未读完的 merge 结果,globalTopkUb_ 索引段混入 float 位模式)。
-        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+        // 2026-09-28 回退 P4 前半(整网 gsm8k VEC fault 嫌疑):V_MTE2 窄事件对
+        // 不等上一轮 CopyOut 在途的 MTE3(生产连续 CopyOut 流量下与 MTE2 写
+        // mrgDst/tmp 撞 UB,时序相关,gate 时序侥幸不触发)→ 恢复保守 PIPE_ALL;
+        // 保留后向 MTE2_V(2026-08-30 修复的原序)。
+        AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::DataCopy(src, tmp, logitsNum * VALUE_AND_INDEX_NUM);
         SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
     }
@@ -299,10 +297,8 @@ __aicore__ inline void MergeSort(const LocalTensor<float> &mrgDst, int32_t mrgDs
 
         AscendC::MrgSort<float>(tmpTensor, srcList, params);
         AscendC::PipeBarrier<PIPE_V>();
-        // 2026-09-24 P4:PIPE_ALL → 双向事件对(V 写 tmpTensor → MTE2 读 = V_MTE2;
-        // MTE2 写 mrgDst → 下一块 MergeSort 的 MrgSort V 读 = MTE2_V。原注释:
-        // 仅 PIPE_V 不等 MTE2 → 读到旧/半写数据 → 索引段混入 float 位模式)。
-        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+        // 2026-09-28 回退 P4 前半(同上):恢复保守 PIPE_ALL,保留 MTE2_V。
+        AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::DataCopy(mrgDst, tmpTensor, mrgDstNum * VALUE_AND_INDEX_NUM);
         SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
     } else {
@@ -330,8 +326,8 @@ __aicore__ inline void MergeSort(const LocalTensor<float> &mrgDst, int32_t mrgDs
 
         AscendC::MrgSort<float>(tmpTensor, srcList, params);
         AscendC::PipeBarrier<PIPE_V>();
-        // 2026-09-24 P4: 同分支1 — 双向事件对替换 PIPE_ALL(同上)。
-        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+        // 2026-09-28 回退 P4 前半(同上):恢复保守 PIPE_ALL,保留 MTE2_V。
+        AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::DataCopy(mrgDst, tmpTensor, mrgDstNum * VALUE_AND_INDEX_NUM);
         SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
     }

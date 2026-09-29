@@ -110,16 +110,8 @@ class PivotIndexer:
 
         # Coarse: group mean proxy -> top-4096 over [0, seq_lens-g) + the
         # local-window union injection (window = [aslk-(g-1), aslk+own)).
-        # 2026-09-29 fold: 头轴在进 op 前收缩 — q_eff = Σ_h w̄_h·q̄_h
-        # (w̄=组均值权重, q̄=组均值 q), score 变为单次 K=128 点积, 代数恒等且
-        # 消除 32/64 头 bf16 逐头打分噪声(fold 后对 fp32 oracle 召回 0.999@64K,
-        # 优于 H=64 口径 0.576 与原生 LI)。op 侧 gSize=n1/n2=1 自动生效:
-        # cube mm1 工作量与 GM 流量降 |H| 倍。w=1 使 DoScale/DoReduce 成为精确空转。
-        q_mean = q_dq.view(K, g, H, Dh).mean(dim=1)
-        w_mean = weights[:D].view(K, g, H).mean(dim=1)
-        q_bar = torch.bmm(w_mean.float().unsqueeze(1),
-                          q_mean.float()).to(q_dq.dtype)      # [K,1,Dh]
-        w_bar = w_mean.new_ones(K, 1, dtype=q_dq.dtype)        # [K,1] 同原型 dtype
+        q_bar = q_dq.view(K, g, H, Dh).mean(dim=1)
+        w_bar = weights[:D].view(K, g, H).mean(dim=1)
         C, aslk_op = torch.ops._C_ascend.npu_indexer_coarse_screen(
             q_bar,
             w_bar,

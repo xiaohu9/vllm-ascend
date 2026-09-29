@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
-import inspect
 import weakref
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -20,8 +19,6 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.platforms import current_platform
-
-from vllm_ascend import envs as ascend_envs
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
@@ -117,27 +114,6 @@ class ACLGraphWrapper:
         if cudagraph_options is None:
             cudagraph_options = CUDAGraphOptions()
         self.aclgraph_options = cudagraph_options
-
-        # 2026-09-28 整网崩溃根修旁路:GLOBAL 捕获态下同步 memcpy 被 EE1016
-        # 拒绝(每被拒一条,对应 kernel launch 的 args/tiling 保持 0xa5a5a5a5
-        # 未初始化),回放时该图桶首次执行即 AICORE fault(at::zeros 实测案例,
-        # 见 memory global-capture-ee1016-crash)。RELAXED 使这些拷贝合法执行。
-        # torch_npu 版本不支持 capture_error_mode 参数时回退 GLOBAL 并告警。
-        self._capture_error_mode = \
-            ascend_envs.VLLM_ASCEND_ACLGRAPH_CAPTURE_ERROR_MODE
-        try:
-            graph_params = inspect.signature(
-                torch.npu.graph.__init__).parameters
-            supports_mode = "capture_error_mode" in graph_params
-        except (TypeError, ValueError):
-            supports_mode = False
-        if self._capture_error_mode != "global" and not supports_mode:
-            logger.warning(
-                "VLLM_ASCEND_ACLGRAPH_CAPTURE_ERROR_MODE=%s requested but "
-                "torch.npu.graph does not support capture_error_mode; "
-                "falling back to GLOBAL (EE1016 capture-rejected sync "
-                "memcpys will keep occurring).", self._capture_error_mode)
-            self._capture_error_mode = "global"
         # the entries for different batch descriptors that we need to capture
         # aclgraphs for.
         self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
@@ -213,11 +189,7 @@ class ACLGraphWrapper:
                 get_offloader().sync_prev_onload()
                 forward_context.capturing = True
                 try:
-                    graph_kwargs = {"pool": self.graph_pool}
-                    if self._capture_error_mode != "global":
-                        graph_kwargs["capture_error_mode"] = \
-                            self._capture_error_mode
-                    with torch.npu.graph(aclgraph, **graph_kwargs):
+                    with torch.npu.graph(aclgraph, pool=self.graph_pool):
                         # `output` is managed by pytorch's aclgraph pool
                         output = self.runnable(*args, **kwargs)
                         # Join offloader's copy stream after forward to avoid

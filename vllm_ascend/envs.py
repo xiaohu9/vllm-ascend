@@ -126,13 +126,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Positional group size for prefill-PIVOT (paper default 4). Number of
     # groups per request = ceil(q_r / g); a request's last group may be smaller.
     "VLLM_ASCEND_PIVOT_PREFILL_GROUP": lambda: int(os.getenv("VLLM_ASCEND_PIVOT_PREFILL_GROUP", "4")),
-    # Capture error mode for aclgraph (torch.npu.graph capture_error_mode).
-    # GLOBAL(0) rejects synchronous memcpy during capture (EE1016); each
-    # rejection leaves the corresponding kernel-launch args uninitialized
-    # (0xa5a5a5a5) -> replay AICORE fault lottery. RELAXED lets the copies
-    # execute, removing the lottery. "global" restores upstream behavior.
-    "VLLM_ASCEND_ACLGRAPH_CAPTURE_ERROR_MODE": lambda: os.getenv(
-        "VLLM_ASCEND_ACLGRAPH_CAPTURE_ERROR_MODE", "global"),
 }
 
 # end-env-vars-definition

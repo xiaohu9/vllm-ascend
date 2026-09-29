@@ -118,6 +118,9 @@ private:
     // para for vector
     int32_t groupInner_ = 0;
     int64_t blockS2StartIdx_ = 0;
+    // pair-merge v2: 延迟奇数块存 reduceOutBuf_ 保留段 [2V,4V)(零新增 UB),
+    // 偶数块 MrgSort(A,B)→tmp 后一次归并进 acc(top-k 关联律, 输出不变)
+    bool pairFilled_[8] = {false};
     int32_t gSize_ = 0;
     int32_t kHeadNum_ = 0;
     int32_t s1BaseSize_ = 0;
@@ -260,8 +263,10 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
         // globalTopkUb_ value,index=-inf,-1
         InitSortOutBuf(globalTopkUb_, CeilDiv(s1BaseSize_, 2) * virTopK * 2);
         blockS2StartIdx_ = 0;
+        for (int i = 0; i < 8; i++) { pairFilled_[i] = false; }
     } else if (info.loop == 0) {
         blockS2StartIdx_ = info.s2Idx;
+        for (int i = 0; i < 8; i++) { pairFilled_[i] = false; }
     }
     // cuRealAcSeq: 当前基本块S1对应的AcSeq(粗筛域上界 upper[r],PA 布局恒绝对值;
     // attenMaskFlag 硬编码 false,掩码改写分支已随死代码删除)
@@ -336,13 +341,40 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
             // v11 双累积形态从未 NPU 验证且多 chunk 实测 fault,2026-09-16 废弃。
             SortAll(reduceOutBuff, tmpSortBuf, cuS2LenVecAlign);
             PipeBarrier<PIPE_V>();
-            IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK,
-                                    reduceOutBuff, cuS2LenVecAlign, tmpUb_);
+            // pair-merge v2: 奇数块延迟入保留段 [2V,4V); 偶数块 MrgSort(A,B)→tmp
+            // 后一次归并进 acc —— 每对省一次 4096 宽归并 + 32KB 拷回
+            if (!pairFilled_[innerS1Idx]) {
+                AscendC::DataCopy(reduceOutBuff[s2BaseSize_ * 2], reduceOutBuff,
+                                  cuS2LenVecAlign * 2);
+                PipeBarrier<PIPE_V>();
+                pairFilled_[innerS1Idx] = true;
+            } else {
+                AscendC::MrgSort4Info params;
+                params.elementLengths[0] = cuS2LenVecAlign;
+                params.elementLengths[1] = s2BaseSize_;
+                params.ifExhaustedSuspension = false;
+                params.validBit = 0b0011;
+                params.repeatTimes = 1;
+                AscendC::MrgSortSrcList<float> srcList;
+                srcList.src1 = reduceOutBuff;
+                srcList.src2 = reduceOutBuff[s2BaseSize_ * 2];
+                AscendC::MrgSort<float>(tmpSortBuf, srcList, params);
+                PipeBarrier<PIPE_V>();
+                IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK,
+                                        tmpSortBuf, s2BaseSize_ * 2, tmpUb_);
+                pairFilled_[innerS1Idx] = false;
+            }
             SetFlag<HardEvent::V_MTE2>(EVENTID_V_TO_MTE2_TMPUB);
 
             PipeBarrier<PIPE_V>();
             outQueue_.FreeTensor(tmpSortBuf);
 
+            if (isS2End && pairFilled_[innerS1Idx]) {
+                LocalTensor<float> deferred = reduceOutBuff[s2BaseSize_ * 2];
+                IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK,
+                                        deferred, s2BaseSize_, tmpUb_);
+                pairFilled_[innerS1Idx] = false;
+            }
             bool needCopyOutGm = blockS2StartIdx_ == 0 && isS2End;
 
             if (needCopyOutGm) {

@@ -344,8 +344,14 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
             // pair-merge v2: 奇数块延迟入保留段 [2V,4V); 偶数块 MrgSort(A,B)→tmp
             // 后一次归并进 acc —— 每对省一次 4096 宽归并 + 32KB 拷回
             if (!pairFilled_[innerS1Idx]) {
+                // 双向事件(ID2 此点空闲): 源 [0,2V) 为 V 产出须先落定;
+                // 拷回(MTE2)完成才可被 V(MrgSort4) 读 —— 缺此对即 VEC 竞态
+                AscendC::SetFlag<HardEvent::V_MTE2>(2);
+                AscendC::WaitFlag<HardEvent::V_MTE2>(2);
                 AscendC::DataCopy(reduceOutBuff[s2BaseSize_ * 2], reduceOutBuff,
                                   cuS2LenVecAlign * 2);
+                AscendC::SetFlag<HardEvent::MTE2_V>(2);
+                AscendC::WaitFlag<HardEvent::MTE2_V>(2);
                 PipeBarrier<PIPE_V>();
                 pairFilled_[innerS1Idx] = true;
             } else {

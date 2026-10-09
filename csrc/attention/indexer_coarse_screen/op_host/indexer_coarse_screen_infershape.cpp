@@ -46,6 +46,8 @@ static ge::graphStatus InferShapeIndexerCoarseScreen(gert::InferShapeContext *co
     OP_CHECK_NULL_WITH_CONTEXT(context, hasWindow);
     const int64_t *gSize = attrs->GetInt(2); // ATTR_GROUP_SIZE_INDEX(第 3 个 attr)
     OP_CHECK_NULL_WITH_CONTEXT(context, gSize);
+    const int64_t *proxyMode = attrs->GetInt(3); // ATTR_PROXY_MODE_INDEX(第 4 个 attr)
+    OP_CHECK_NULL_WITH_CONTEXT(context, proxyMode);
     OP_CHECK_IF((*gSize <= 0) || (*gSize > 16),
                OP_LOGE(context, "group_size must be in (0, 16], but now is %ld.", *gSize),
                return ge::GRAPH_FAILED);
@@ -54,8 +56,14 @@ static ge::graphStatus InferShapeIndexerCoarseScreen(gert::InferShapeContext *co
                OP_LOGE(context, "Layout TND, q_bar dims (%zu) must be 3!", qBarShape->GetDimNum()),
                return ge::GRAPH_FAILED);
     const int64_t reqNum = actualSeqQShape->GetDim(0);
-    OP_CHECK_IF(qBarShape->GetDim(0) != reqNum,
+    // proxy_mode=0:q_bar dim0 == R(代理行契约);proxy_mode=1(M1a):query 为 raw
+    // [N,H,D],dim0 = 总行数 N = cum[-1] != R,仅要求覆盖全部代理行(N >= R)
+    OP_CHECK_IF((*proxyMode == 0) && (qBarShape->GetDim(0) != reqNum),
                OP_LOGE(context, "q_bar dim0 (%ld) must equal actual_seq_lengths_query dim0 (%ld).",
+                       qBarShape->GetDim(0), reqNum),
+               return ge::GRAPH_FAILED);
+    OP_CHECK_IF((*proxyMode != 0) && (qBarShape->GetDim(0) < reqNum),
+               OP_LOGE(context, "raw query dim0 (%ld) must cover actual_seq_lengths_query dim0 (%ld).",
                        qBarShape->GetDim(0), reqNum),
                return ge::GRAPH_FAILED);
 

@@ -62,6 +62,9 @@ ge::graphStatus IndexerCoarseScreenInfoParser::CheckRequiredAttrExistence() cons
     OP_CHECK_IF(opParamInfo_.hasWindow == nullptr, OP_LOGE(opName_, "attr has_window is nullptr"),
                return ge::GRAPH_FAILED);
 
+    OP_CHECK_IF(opParamInfo_.proxyMode == nullptr, OP_LOGE(opName_, "attr proxy_mode is nullptr"),
+               return ge::GRAPH_FAILED);
+
     return ge::GRAPH_SUCCESS;
 }
 
@@ -147,6 +150,7 @@ ge::graphStatus IndexerCoarseScreenInfoParser::GetAndCheckAttrParaInfo()
     opParamInfo_.coarseCount = attrs->GetAttrPointer<int32_t>(ATTR_COARSE_COUNT_INDEX);
     opParamInfo_.hasWindow = attrs->GetAttrPointer<int32_t>(ATTR_HAS_WINDOW_INDEX);
     opParamInfo_.groupSizeAttr = attrs->GetAttrPointer<int32_t>(ATTR_GROUP_SIZE_INDEX);
+    opParamInfo_.proxyMode = attrs->GetAttrPointer<int32_t>(ATTR_PROXY_MODE_INDEX);
     if (opParamInfo_.coarseCount != nullptr) {
         OP_LOGI(context_->GetNodeName(), "coarse count is:%d", *opParamInfo_.coarseCount);
     }
@@ -168,6 +172,11 @@ ge::graphStatus IndexerCoarseScreenInfoParser::GetAndCheckAttrParaInfo()
                return ge::GRAPH_FAILED);
     OP_CHECK_IF((*opParamInfo_.groupSizeAttr <= 0) || (*opParamInfo_.groupSizeAttr > static_cast<int32_t>(GROUP_SIZE_LIMIT)),
                OP_LOGE(opName_, "input attr group_size must be in (0, 16]."),
+               return ge::GRAPH_FAILED);
+    // proxy_mode:0 = q̄/w̄ caller 预算(兼容/probe A/B);1 = raw query/weights +
+    // kernel AIV 预阶段组均值(M1a,fp32 同序 = torch mean 逐位一致,probe_m1a 实证)
+    OP_CHECK_IF((*opParamInfo_.proxyMode < 0) || (*opParamInfo_.proxyMode > 1),
+               OP_LOGE(opName_, "input attr proxy_mode must be 0 or 1."),
                return ge::GRAPH_FAILED);
 
     return ge::GRAPH_SUCCESS;
@@ -438,6 +447,7 @@ void IndexerCoarseScreenInfoParser::GenerateInfo(IndexerCoarseScreenTilingInfo &
 
     liInfo.pageAttentionFlag = true; // key 恒 PA_BSND
     liInfo.sparseCount = *opParamInfo_.coarseCount;
+    liInfo.proxyMode = static_cast<uint32_t>(*opParamInfo_.proxyMode);
 
     liInfo.inputQLayout = DataLayout::TND;
     liInfo.inputKLayout = DataLayout::BnBsND;
@@ -511,6 +521,13 @@ ge::graphStatus IndexerCoarseScreenTiling::DoTiling(IndexerCoarseScreenTilingInf
     if (tilingInfo->hasWindow) {
         workspaceSize += align512(reqNum * tilingInfo->sparseCount * I32_ELEM_SIZE);            // candidatesWs
     }
+    // M1a(proxy_mode=1):AIV 预阶段产出 q̄[R,H,128]/w̄[R,H](bf16/fp16 同 2B)写
+    // workspace,主 pass query/weights 消费点整链改绑(与 kernel Init 布局严格对齐)
+    if (tilingInfo->proxyMode) {
+        constexpr uint64_t Q_ELEM_SIZE = 2;
+        workspaceSize += align512(reqNum * tilingInfo->gSize * HEAD_DIM_LIMIT * Q_ELEM_SIZE);   // qBarWs
+        workspaceSize += align512(reqNum * tilingInfo->gSize * Q_ELEM_SIZE);                    // wBarWs
+    }
     size_t *workSpaces = context_->GetWorkspaceSizes(1);
     workSpaces[0] = static_cast<size_t>(workspaceSize);
 
@@ -526,6 +543,7 @@ ge::graphStatus IndexerCoarseScreenTiling::DoTiling(IndexerCoarseScreenTilingInf
     tilingData_.set_windowG(tilingInfo->windowG);
     tilingData_.set_outW(tilingInfo->outW);
     tilingData_.set_hasWindow(tilingInfo->hasWindow);
+    tilingData_.set_proxyMode(tilingInfo->proxyMode);
     tilingData_.SaveToBuffer(context_->GetRawTilingData()->GetData(), context_->GetRawTilingData()->GetCapacity());
     context_->GetRawTilingData()->SetDataSize(tilingData_.GetDataSize());
 

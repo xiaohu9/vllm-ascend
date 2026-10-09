@@ -106,15 +106,14 @@ class PivotIndexer:
             return None
 
         q_dq = q_li[:D]  # raw BF16 [D, H, Dh]
-        H, Dh = q_dq.shape[1], q_dq.shape[2]
 
         # Coarse: group mean proxy -> top-4096 over [0, seq_lens-g) + the
         # local-window union injection (window = [aslk-(g-1), aslk+own)).
-        q_bar = q_dq.view(K, g, H, Dh).mean(dim=1)
-        w_bar = weights[:D].view(K, g, H).mean(dim=1)
+        # M1a: 组均值在 coarse kernel 的 AIV 预阶段计算(fp32 同序 = torch
+        # mean(dim=1) 逐位一致,probe_m1a A/B 实证),caller 不再下发 2 个 Mean。
         C, aslk_op = torch.ops._C_ascend.npu_indexer_coarse_screen(
-            q_bar,
-            w_bar,
+            q_dq,
+            weights[:D],
             kv_cache[2],
             actual_seq_lengths_query=cum[:K].to(torch.int32),
             # Graph replay pads seq_lens rows [num_reqs, K) with 0
@@ -135,6 +134,7 @@ class PivotIndexer:
             coarse_count=_COARSE_BUDGET,
             has_window=1,
             group_size=g,
+            proxy_mode=1,
         )
 
         # Refine: per-query scores over C, top-2048. The op emits KV
@@ -146,7 +146,7 @@ class PivotIndexer:
             weights[:D],
             C,
             actual_seq_lengths_query=cum[:K].to(torch.int32),
-            actual_seq_lengths_key=aslk_op.to(torch.int32),
+            actual_seq_lengths_key=aslk_op,
             block_table=attn_metadata.block_table[:K],
             layout_query="TND",
             layout_key="PA_BSND",
@@ -181,11 +181,9 @@ class PivotIndexer:
             return None
         D = prefill_tail_start
 
-        # Per-layer mean proxy (q/weights differ per layer, so this cannot be
-        # hoisted to metadata): index_add_ takes a 1-D index -- no shape
-        # expansion, unlike scatter_add_ (whose expanded index OOMed on large
-        # tails). Numerically the same accumulation as the validated
-        # scatter_add path.
+        # M1a: the per-layer mean proxy moved into the coarse kernel's AIV
+        # pre-stage (variable own from the aslq cumsum diffs; fp32 sequential
+        # accumulation = torch index_add_+div, bit-identical per probe_m1a).
         # SLICE TO THE ACTUAL TAIL, not to end-of-file: q_li rows =
         # num_input_tokens >= num_actual_tokens (graph input padding -- the
         # npugraph_ex piecewise path hit 129(geo) vs 144(q_li[D:]) rows,
@@ -195,15 +193,10 @@ class PivotIndexer:
         # _apply_output_guards re-pads the result to the native row count.
         q_dq = q_li[D:D + geo.N_tail]
         w_t = weights[D:D + geo.N_tail]
-        H, Dh = q_dq.shape[1], q_dq.shape[2]
-        q_bar = q_dq.new_zeros(geo.P, H, Dh) \
-            .index_add_(0, geo.group_ids, q_dq) / geo.group_sizes.view(-1, 1, 1)
-        w_bar = w_t.new_zeros(geo.P, H) \
-            .index_add_(0, geo.group_ids, w_t) / geo.group_sizes.view(-1, 1)
 
         C, aslk_op = torch.ops._C_ascend.npu_indexer_coarse_screen(
-            q_bar,
-            w_bar,
+            q_dq,
+            w_t,
             kv_cache[2],
             actual_seq_lengths_query=geo.aslq_refine.to(torch.int32),
             # Floor 1, same as the decode path: a fresh request's FIRST-chunk
@@ -220,11 +213,12 @@ class PivotIndexer:
             coarse_count=_COARSE_BUDGET,
             has_window=1,
             group_size=geo.g,
+            proxy_mode=1,
         )
         topk_pre = torch.ops._C_ascend.npu_indexer_refine(
             q_dq, kv_cache[2], w_t, C,
             actual_seq_lengths_query=geo.aslq_refine.to(torch.int32),
-            actual_seq_lengths_key=aslk_op.to(torch.int32),
+            actual_seq_lengths_key=aslk_op,
             block_table=geo.group_bt,
             layout_query="TND", layout_key="PA_BSND",
             sparse_count=_REFINE_BUDGET,

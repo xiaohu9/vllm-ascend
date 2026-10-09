@@ -326,7 +326,7 @@ std::tuple<at::Tensor, at::Tensor> npu_indexer_coarse_screen_meta(
     const c10::optional<at::Tensor> &actual_seq_lengths_query,
     const c10::optional<at::Tensor> &actual_seq_lengths_key,
     const at::Tensor &block_table, int64_t coarse_count, int64_t has_window,
-    int64_t group_size)
+    int64_t group_size, int64_t proxy_mode)
 {
     // npu tensor max size
     constexpr int64_t SIZE = 8;
@@ -342,8 +342,12 @@ std::tuple<at::Tensor, at::Tensor> npu_indexer_coarse_screen_meta(
                                        "than 0, but shape[", i, "] is ", q_bar.size(i));
     }
     TORCH_CHECK(coarse_count > 0, "coarse count should be greater than 0, but now is ", coarse_count);
-    // 固定 TND q_bar + PA_BSND key:候选 [R, W'],W' = coarse + (has_window ? 2g-1 : 0)
-    const int64_t req_num = q_bar.size(DIM_0);
+    // 固定 TND + PA_BSND key:候选 [R, W'],W' = coarse + (has_window ? 2g-1 : 0)。
+    // R 取 aslq 长度(M1a:proxy_mode=1 时 query dim0 = 总 raw 行 N != R;
+    // mode 0 下两源由 infershape check 保证等值)
+    TORCH_CHECK(actual_seq_lengths_query.has_value(),
+                "actual_seq_lengths_query is required for coarse screen.");
+    const int64_t req_num = actual_seq_lengths_query.value().size(DIM_0);
     int64_t out_w = coarse_count;
     if (has_window != 0) {
         out_w = coarse_count + 2 * group_size - 1;

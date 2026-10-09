@@ -21,8 +21,10 @@ class IndexerCoarseScreen : public OpDef {
 public:
     explicit IndexerCoarseScreen(const char *name) : OpDef(name)
     {
-        // 2026-09-17 M1 出核:组均值由 caller 侧算好传入(原 query/weights/row_weights
-        // 三输入的内核内 M1 是仓内孤立的 AIV写→AIC读 模式,910B 上 SyncAll 不可靠)
+        // 2026-09-17 M1 出核:组均值改 caller 侧算好传入(注:出核注记"910B 上
+        // SyncAll 不可靠"已被现行树推翻 —— ProcessWindow 入口 SyncAll(全员参与
+        // 纪律)生产验证多轮)。2026-10-08 M1a:proxy_mode=1 恢复内核内组均值
+        // (b2fe4a23 ProcessGroupMean 骨架),proxy_mode=0 保持 caller 直绑。
         this->Input("q_bar")
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16, ge::DT_FLOAT16})
@@ -67,6 +69,8 @@ public:
         this->Attr("has_window").AttrType(OPTIONAL).Int(1);      // 1:输出阶段并集注入局部窗口(生产)
         this->Attr("group_size").AttrType(OPTIONAL).Int(4);      // g:组内 query 数(窗口宽 2g-1;
                                                                  // decode=MTP g,prefill=PREFILL_GROUP)
+        this->Attr("proxy_mode").AttrType(OPTIONAL).Int(0);      // 0:q_bar/w_bar caller 预算(兼容/
+                                                                 // probe A/B);1:raw 输入 + AIV 预阶段组均值(M1a)
         OpAICoreConfig aicore_config;
         aicore_config.DynamicCompileStaticFlag(true)
             .DynamicFormatFlag(true)

@@ -71,6 +71,7 @@ struct ConstInfo {
     // CUBE和VEC的核间同步EventID
     uint32_t syncC1V1 = 0U;
     uint32_t syncV1C1 = 0U;
+    uint32_t syncV2V = 1U;    // M1a: 预阶段全局屏障(参战 AIV 各置一次,AIC 等满才进块循环)
 
     // 基本块大小
     uint32_t mBaseSize = 1ULL;
@@ -96,6 +97,8 @@ struct ConstInfo {
     uint32_t outW = 0;          // 输出列宽(coarseCount + (hasWindow!=0)*windowG)
     uint32_t hasWindow = 1;     // 原值 0/1/2:0=纯粗筛 1=窗口注入 2=DEBUG dump。
                                  // 必须保留原值(bool 会把 2 折叠成 1,debug dump 判定失效)
+    uint32_t proxyMode = 0;     // 0:q̄/w̄ caller 直绑(兼容/probe A/B);1:raw query/weights
+                                // + AIV 预阶段组均值(M1a),主 pass 消费 workspace q̄/w̄
 
     uint32_t actualLenQDims = 0U; // query的actualSeqLength 的维度(SetGlobalBuffer size hint)
     uint32_t actualLenDims = 0U;  // KV 的actualSeqLength 的维度

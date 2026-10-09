@@ -57,6 +57,7 @@ constexpr uint32_t ASLK_OUT_INDEX = 1;
 constexpr uint32_t ATTR_COARSE_COUNT_INDEX = 0;
 constexpr uint32_t ATTR_HAS_WINDOW_INDEX = 1;
 constexpr uint32_t ATTR_GROUP_SIZE_INDEX = 2;
+constexpr uint32_t ATTR_PROXY_MODE_INDEX = 3;
 // Dim Index
 constexpr uint32_t DIM_IDX_ONE = 1;
 constexpr uint32_t DIM_IDX_TWO = 2;
@@ -91,6 +92,7 @@ TILING_DATA_FIELD_DEF(uint32_t, groupSize)
 TILING_DATA_FIELD_DEF(uint32_t, windowG)
 TILING_DATA_FIELD_DEF(uint32_t, outW)
 TILING_DATA_FIELD_DEF(uint32_t, hasWindow)
+TILING_DATA_FIELD_DEF(uint32_t, proxyMode)
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(IndexerCoarseScreen, IndexerCoarseScreenTilingData)
 
@@ -111,6 +113,7 @@ struct LiParaInfo {
     const int32_t *coarseCount = nullptr;
     const int32_t *hasWindow = nullptr;
     const int32_t *groupSizeAttr = nullptr;
+    const int32_t *proxyMode = nullptr;
 };
 
 // -----------算子Tiling入参信息类---------------
@@ -134,6 +137,7 @@ public:
     uint32_t windowG = 0;     // 2g-1
     uint32_t outW = 0;        // 输出列宽
     uint32_t hasWindow = 1;
+    uint32_t proxyMode = 0;   // 0:q̄/w̄ caller 预算 1:raw + kernel AIV 预阶段组均值(M1a)
     // DType
     ge::DataType inputQType = ge::DT_FLOAT16;
     ge::DataType inputKType = ge::DT_FLOAT16;

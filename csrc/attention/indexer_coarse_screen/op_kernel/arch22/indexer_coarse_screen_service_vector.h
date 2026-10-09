@@ -77,6 +77,10 @@ public:
                                                   GlobalTensor<int32_t> dbgMm1);
     __aicore__ inline void ProcessWindow(TPipe *pipe, uint32_t rBegin, uint32_t rEnd);
     __aicore__ inline void EmitIdentityRows(uint32_t rowCount);
+    // ---- M1a 组均值预阶段(proxy_mode=1;骨架 = b2fe4a23 ProcessGroupMean)----
+    __aicore__ inline void InitProxyGlobalTensor(__gm__ uint8_t *rawQuery, __gm__ uint8_t *rawWeights,
+                                                 GlobalTensor<Q_T> qBarOut, GlobalTensor<Q_T> wBarOut);
+    __aicore__ inline void ProcessGroupMean(uint32_t rBegin, uint32_t rEnd, bool isEmptyRange);
 
 protected:
     GlobalTensor<MM1_OUT_T> mm1ResGm;
@@ -89,6 +93,11 @@ protected:
     GlobalTensor<int32_t> candidatesWsGm_; // 窗口模式主 pass 候选中转 [R,sparseCount]
     GlobalTensor<int32_t> candidatesOutGm_; // 输出 candidates [R,outW]
     GlobalTensor<int32_t> aslkOutGm_;    // 输出 aslk' [R]
+    // M1a 预阶段:raw 输入(caller 原样) + q̄/w̄ 写出目标(mode1 = workspace 段)
+    GlobalTensor<Q_T> rawQueryGm_;
+    GlobalTensor<Q_T> rawWeightsGm_;
+    GlobalTensor<Q_T> qBarOutGm_;
+    GlobalTensor<Q_T> wBarOutGm_;
     // =================================常量区=================================
 
 private:
@@ -433,12 +442,151 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::InitCoarseGlobalTe
 }
 
 
-// --------------------------M1 组均值代理(AIV 全局预阶段)--------------------------
-// q_bar[r] = Σ_{i<own_r} rw[r,i]·query[cum_{r-1}+i] / Σ_{i<own_r} rw[r,i](fp32 累加,一次舍入 bf16)
-// w_bar[r] 同式(caller weights);row_weights 全 1 时 = torch 均匀组均值 mean(1)。
-// proxyCum[r] = r+1(主 pass TND s1 累计,每请求 1 行 proxy)。
-// 收尾:PipeBarrier<MTE3>(本核 flush) + SyncAll(全 AIV 屏障)→ 所有 AIV 的 M1 写全局可见;
-// ProcessMain 随后预置 syncV1C1×2,AIC 首个 matmul 的 CrossCoreWaitFlag 由此放行(§4.11 模式)。
+// --------------------------M1a 组均值代理(AIV 全局预阶段,proxyMode=1)--------------------------
+// q_bar[r,h,:] = (Σ_{i<own_r} query[cum_{r-1}+i,h,:]) / own_r —— fp32 顺序累加 +
+// Div + 一次 CAST_RINT bf16,与 torch view(K,g,H,*).mean(dim=1) 同序同型
+// (probe_m1a A/B 逐位实证)。骨架照抄 b2fe4a23 ProcessGroupMean(NPU 验证版),
+// 三处简化:无 row_weights(均匀均值)、无 proxyCum(现行 prefix 硬编码 bIdx)、
+// 写目标 = workspace qBarWs/wBarWs(Init 按 mode 绑定)。
+// 行分区:全部 AIV 均分 R 行(全员一致进入/到达屏障);own==0 行跳过(无 mm1
+// 消费,DealActSeqLenIsZero 行安全)。收尾 PipeBarrier<MTE3>(本核 flush)+
+// SyncAll(全 AIV 屏障)→ 所有 AIV 的 q̄/w̄ 写全局可见;ProcessMain 随后预置
+// syncV1C1×2(MTE3 管道),AIC 首个 matmul 的 CrossCoreWaitFlag 由此放行。
+template <typename LIT>
+__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::InitProxyGlobalTensor(
+    __gm__ uint8_t *rawQuery, __gm__ uint8_t *rawWeights,
+    GlobalTensor<Q_T> qBarOut, GlobalTensor<Q_T> wBarOut)
+{
+    rawQueryGm_.SetGlobalBuffer((__gm__ Q_T *)rawQuery);
+    rawWeightsGm_.SetGlobalBuffer((__gm__ Q_T *)rawWeights);
+    qBarOutGm_ = qBarOut;
+    wBarOutGm_ = wBarOut;
+}
+
+template <typename LIT>
+__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessGroupMean(uint32_t rBegin, uint32_t rEnd,
+                                                                               bool isEmptyRange)
+{
+    // 行分区 = 本 pair AIC 的 SplitCore 精确请求区间(main pass 消费域);行由
+    // 本 pair 偶 AIV 独占计算(见下行单写者注记)。空区间(无块 pair)零写入零同步。
+    if (!constInfo_.proxyMode || isEmptyRange) {
+        return; // mode 0:q̄/w̄ caller 直绑;空 pair:无消费无写出
+    }
+    // 行级单写者配对(2026-10-09 NPU 定案):奇 AIV 跳过预阶段 —— 行 p 由
+    // pair p 的偶 AIV 独占计算与写出。双 AIV 冗余同址 MTE3 store 会并发互踩
+    // (词级撕裂,候选值混入 raw 行/0);单写者同时把预阶段工作量减半。
+    if (GetBlockIdx() % 2 == 1) {
+        return;
+    }
+
+    // pair 内两 AIV 重复计算同一区间(写值相同,并发同值写无撕裂):配合
+    // per-pair flag id,本对 AIC 消费的每条贷记都由本对 AIV 在全部行写毕后
+    // 置位 —— 无早读。twin 同址写在不同构建实测稳定(撕裂根因是全局贷记)。
+    const uint32_t qRowSize = static_cast<uint32_t>(constInfo_.headDim * constInfo_.gSize); // g*Dh(q̄ 行宽;kernel qHeadNum≡gSize)
+    const uint32_t hSize = static_cast<uint32_t>(constInfo_.gSize); // g(w̄ 行宽)
+    // rEnd 已为半开(调用点 +1)
+    const uint32_t rEndEff = IndexerCoarseScreenCommon::Min(rEnd,
+        static_cast<uint32_t>(constInfo_.batchSize));
+    if (rBegin < rEnd) {
+        // UB 借道(运行于主 pass 首个 ProcessVec 之前,缓冲皆空闲;不触 indexBuf_/
+        // sortOutBuf_ —— InitBuffers 的 ArithProgression/InitSortOutBuf 状态必须存活)。
+        // tmpBuf_ 共 20KB:rowQ 双缓冲 bf16 [0,8KB)/[8KB,16KB),rowF32 槽深
+        // CHUNK=1024 float 置 tmpUb_[qRowSize](字节 [16KB,20KB))—— 恰满不越界。
+        // 2026-10-09 定案:旧 rowF32 = tmpUb_[2*qRowSize](字节 [32KB,48KB))越界
+        // 12KB 踩毁 sortOutBuf_,是预阶段确定性全错的根因(非同步竞态)。
+        constexpr uint32_t CHUNK = 1024U; // rowF32 槽深(float);q̄ 行按此分段
+        LocalTensor<Q_T> rowQ0 = tmpUb_.template ReinterpretCast<Q_T>();
+        LocalTensor<Q_T> rowQ1 = tmpUb_.template ReinterpretCast<Q_T>()[qRowSize];
+        LocalTensor<float> rowF32 = tmpUb_[qRowSize];
+        LocalTensor<float> accW = brcBuf_.Get<float>();
+        uint32_t prevCum = (rBegin == 0) ? 0U : static_cast<uint32_t>(callerSeqLenGmQ_.GetValue(rBegin - 1));
+        for (uint32_t r = rBegin; r < rEnd; r++) {
+            uint32_t cumEnd = static_cast<uint32_t>(callerSeqLenGmQ_.GetValue(r));
+            uint32_t own = cumEnd - prevCum; // P3: cumBegin≡上行 cumEnd,滚动缓存
+            prevCum = cumEnd;
+            if (own == 0) {
+                continue; // 空请求行:无 mm1 消费,q̄/w̄ 不写
+            }
+            uint32_t cumBegin = cumEnd - own;
+            LocalTensor<float> acc = outQueue_.AllocTensor<float>();
+            // q̄:fp32 顺序累加 own 行 → Div(own) → 一次 bf16 舍入(torch mean 同序)。
+            // [fix5 基线回滚 2026-10-09]队列化重构(TQue 载入 + outQueue_ store)
+            // 与 PipeBarrier 化两版均确定性全错(probe 计数恒等),唯一 ALL-PASS
+            // 基线 = SetWaitFlag 全套护栏 + rowQ0 直 store;性能优化须以此为
+            // 基线逐项重做并单独验证(SetWaitFlag ~130µs/次待解)。
+            Duplicate(acc, 0.0f, qRowSize);
+            PipeBarrier<PIPE_V>();
+            for (uint32_t i = 0; i < own; i++) {
+                // RAW:copy 后 MTE2 排空才放行 V 读;WAR:i≥2 复用同 buffer,
+                // 复写前等上上轮 V 读完(own≥3 才暴露)
+                if (i >= 2) {
+                    SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+                }
+                LocalTensor<Q_T> rowQ = (i % 2 == 0) ? rowQ0 : rowQ1;
+                DataCopy(rowQ, rawQueryGm_[(cumBegin + i) * qRowSize], qRowSize);
+                SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+                // 逐元素 Cast/Add 按 CHUNK 分段(rowF32 槽深限制),不改位型
+                for (uint32_t c = 0; c < qRowSize / CHUNK; c++) {
+                    Cast(rowF32, rowQ[c * CHUNK], RoundMode::CAST_NONE, CHUNK);
+                    PipeBarrier<PIPE_V>();
+                    Add(acc[c * CHUNK], acc[c * CHUNK], rowF32, CHUNK);
+                    PipeBarrier<PIPE_V>();
+                }
+            }
+            for (uint32_t c = 0; c < qRowSize / CHUNK; c++) {
+                Duplicate(rowF32, static_cast<float>(static_cast<int32_t>(own)), CHUNK);
+                PipeBarrier<PIPE_V>();
+                Div(acc[c * CHUNK], acc[c * CHUNK], rowF32, CHUNK);
+                PipeBarrier<PIPE_V>();
+            }
+            Cast(rowQ0, acc, RoundMode::CAST_RINT, qRowSize);
+            PipeBarrier<PIPE_V>();
+            // V 写 rowQ0 → MTE3 读 rowQ0:V→MTE3 事件保序(缺此 store 读到 stale)
+            SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+            DataCopy(qBarOutGm_[r * qRowSize], rowQ0, qRowSize);
+            // q̄ store(MTE3 读 rowQ0)与 w̄ 首轮 DataCopy(MTE2 写 rowQ0)跨段 WAR
+            SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
+            // w̄:同一组行对 weights [N,H] 同式
+            Duplicate(accW, 0.0f, hSize);
+            PipeBarrier<PIPE_V>();
+            for (uint32_t i = 0; i < own; i++) {
+                // 同 q̄ 循环:i≥2 复用同 buffer,复写前等上上轮 V 读完
+                if (i >= 2) {
+                    SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+                }
+                LocalTensor<Q_T> rowQ = (i % 2 == 0) ? rowQ0 : rowQ1;
+                // w̄ 有效宽 hSize×2B=8B(<32B 下限):借真实行距 H×2B=64B,读 32
+                // 元素(64B)只用前 hSize 个 —— 界内有保证(raw w 尾行 8(N-1)+64 ≤ 64N)
+                DataCopy(rowQ, rawWeightsGm_[(cumBegin + i) * hSize], 32);
+                SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+                Cast(rowF32, rowQ, RoundMode::CAST_NONE, hSize);
+                PipeBarrier<PIPE_V>();
+                Add(accW, accW, rowF32, hSize);
+                PipeBarrier<PIPE_V>();
+            }
+            Duplicate(rowF32, static_cast<float>(static_cast<int32_t>(own)), hSize);
+            PipeBarrier<PIPE_V>();
+            Div(accW, accW, rowF32, hSize);
+            PipeBarrier<PIPE_V>();
+            Cast(rowQ0, accW, RoundMode::CAST_RINT, hSize);
+            PipeBarrier<PIPE_V>();
+            // 同上:V 写 rowQ0 → MTE3 读,先排空 V
+            SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+            // 8B store 走 DataCopyPad
+            DataCopyPad(wBarOutGm_[r * hSize], rowQ0,
+                        {1, static_cast<uint16_t>(hSize * sizeof(Q_T)), 0, 0});
+            // WAR 防护:本行对 rowQ 的 MTE3 读与下一行 MTE2 复写、V 读与下轮
+            // MTE2 复写之间必须全序
+            SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
+            SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+            outQueue_.FreeTensor(acc);
+        }
+    }
+    // 收尾仅本核 MTE3 排空;跨核可见性由 per-pair 种子 flag 背书(本核全部
+    // GM 写先于置位,同核同管道程序序)
+    PipeBarrier<PIPE_MTE3>();
+}
+
 
 // --------------------------M2.5 窗口注入(AIV 全局后阶段,hasWindow 门控)--------------------------
 // 每请求一行:win = [aslk-(g-1), aslk+aslq差分) 与候选行求差集,新增位置按升序 append 到有效前缀后,

@@ -182,6 +182,7 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::InitTilingData(const Inde
     constInfo.windowG = tilingData->windowG;
     constInfo.outW = tilingData->outW;
     constInfo.hasWindow = tilingData->hasWindow; // 原值(0/1/2)直传,bool 折叠会废掉 debug dump
+    constInfo.proxyMode = tilingData->proxyMode;
 
     constInfo.outputLayout = LAYOUT_T; // 输出和输入形状一致
     if (K_LAYOUT_T == LI_LAYOUT::TND) {
@@ -392,6 +393,7 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Init(__gm__ uint8_t *qBar
 
     InitTilingData(tiling);
     InitActualSeqLen(actualSeqLengthsQ, actualSeqLengths);
+    // 注:MODE2 flag id 空间极小(per-pair 分 id 实测无效),维持全 pair 共 id
 
     // 计算分核
     SplitCore(aiCoreIdx, usedCoreNum, splitCoreInfo);
@@ -408,14 +410,25 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Init(__gm__ uint8_t *qBar
     auto alignGm = [](uint64_t bytes) -> uint64_t {
         return (bytes + GM_ALIGN_BYTES - 1) / GM_ALIGN_BYTES * GM_ALIGN_BYTES;
     };
-    // M1 出核(2026-09-17):q_bar/w_bar 为 caller 输入,直绑(原生 AIC 读 caller
-    // 输入模式);workspace 只剩 mm1 + candidatesWs(窗口中转)。proxyCum 删除
-    // (prefix 已硬编码 bIdx),qBar/wBar 相关 M1 位视图随 M1 一并移除。
-    qBarGm.SetGlobalBuffer((__gm__ Q_T *)qBar);
-    wBarGm.SetGlobalBuffer((__gm__ Q_T *)wBar);
+    // 2026-09-17 M1 出核:q_bar/w_bar caller 直绑。2026-10-08 M1a:proxy_mode=1
+    // 时 query/weights 入参为 raw [N,H,Dh]/[N,H],AIV 预阶段组均值写 workspace
+    // qBarWs/wBarWs(与 host tiling 同序:追加在 candidatesWs 之后),主 pass 的
+    // 消费点(qBarGm/wBarGm 及其下游 cube queryGm_/vector weightsGm)整链改绑。
     if (constInfo.hasWindow) {
         candidatesWsGm.SetGlobalBuffer((__gm__ int32_t *)(workspace + offset));
         offset += alignGm(constInfo.batchSize * constInfo.sparseCount * sizeof(int32_t));
+    }
+    __gm__ uint8_t *wBarEff = wBar; // DoScale 的 W_T 视图基址(mode1 = wBarWs 段)
+    if (constInfo.proxyMode) {
+        qBarGm.SetGlobalBuffer((__gm__ Q_T *)(workspace + offset));
+        offset += alignGm(constInfo.batchSize * constInfo.qHeadNum * constInfo.headDim * sizeof(Q_T));
+        wBarGm.SetGlobalBuffer((__gm__ Q_T *)(workspace + offset));
+        wBarEff = workspace + offset;
+        offset += alignGm(constInfo.batchSize * constInfo.qHeadNum * sizeof(Q_T));
+    } else {
+        // mode 0(兼容/probe A/B):caller 预算 q̄/w̄ 直绑,原路径逐位保持
+        qBarGm.SetGlobalBuffer((__gm__ Q_T *)qBar);
+        wBarGm.SetGlobalBuffer((__gm__ Q_T *)wBar);
     }
 
     candidatesOutGm.SetGlobalBuffer((__gm__ int32_t *)candidatesOut);
@@ -428,11 +441,16 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Init(__gm__ uint8_t *qBar
         dbgMm1.SetGlobalBuffer((__gm__ int32_t *)workspace);
         vectorService.InitCoarseGlobalTensor(callerSeqLenGmQ, actualSeqLengthsGm, candidatesWsGm,
                                              candidatesOutGm, aslkOutGm, dbgMm1);
+        // M1a 预阶段视图:raw = caller 输入原样(mode1 才消费);q̄/w̄ 写出目标 =
+        // 上面的 mode 选择结果(mode1 = workspace 段,与主 pass 读完全一致)
+        vectorService.InitProxyGlobalTensor(qBar, wBar, qBarGm, wBarGm);
         // 主 pass 直写目标:窗口模式先落 workspace(行距 sparseCount),否则直写输出(行距 outW=coarseCount)
         GlobalTensor<int32_t> mainPassOut = constInfo.hasWindow ? candidatesWsGm : candidatesOutGm;
-        // 主 pass weights = w_bar(caller 输入);W_T 视图(DT_W_FLAG=true 时为 float)
+        // 主 pass weights = w̄(必须跟随 wBarGm 的 mode 绑定:mode1 = workspace
+        // 段,mode0 = caller 输入)。曾误绑 raw wBar —— mode1 下 DoScale 读到
+        // raw 行而非 w̄,分数全错(2026-10-08 probe_m1a 判决)。
         GlobalTensor<W_T> wBarW;
-        wBarW.SetGlobalBuffer((__gm__ W_T *)wBar);
+        wBarW.SetGlobalBuffer((__gm__ W_T *)wBarEff);
         vectorService.InitVec1GlobalTensor(mm1ResGm, wBarW, mainPassOut);
     } else {
         matmulService.InitParams(constInfo);
@@ -544,6 +562,16 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::CalcRunInfo(uint32_t loop
 template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Process()
 {
+    if ASCEND_IS_AIV {
+        // M1a 组均值预阶段(proxyMode 门控,mode0 首行 return):行按 pair 分区,
+        // 行由 pair 偶 AIV 独占计算(单写者,防同址并发写互踩),写毕置 MTE3
+        // 管道种子 flag 背书 —— 不用 SyncAll:SyncAll 不保证 AIC 侧 GM 可见性
+        // (def.cpp 2026-09-17 出核注记,NPU 实测竞态复证)。
+        // bN2End 为闭区间,转半开 [bN2Start, bN2End+1) —— 曾按半开直传导致
+        // 单行 pair(最常见)bN2Start==bN2End,预阶段整体死代码(零分总根源)
+        vectorService.ProcessGroupMean(splitCoreInfo.bN2Start, splitCoreInfo.bN2End + 1U,
+                                       splitCoreInfo.isEmptyRange);
+    }
     if (usedCoreNum == 0 || totalBlockNum == 0) {
         // 全零批(所有行粗筛域空,如 prefill-PIVOT 的请求首组单独成批):窗口模式
         // 2026-09-24 起真实可达:判据 = totalBlockNum==0(SplitCore 每核独立算,
@@ -649,6 +677,16 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessMain()
         // 相对 AIC 首轮读取存在窗口(NPU 实测 rows≥1 间歇坏、row 0 恒好);
         // MTE3 语义种子保证 flag 置位时 qBar 已在 GM。
         vectorService.AllocEventID();
+        // M1a 预阶段全局屏障:各 AIV 写自有标记槽后轮询全员到齐,期间不放行
+        // 种子置位。种子信用全局可互换(MODE2 flag id 空间极小,分 id 实测无效
+        // 且 id=1 无序语义 —— AIC 侧时序快慢会改变结果 = 竞态铁证),唯有
+        // "每个信用都全量背书"能封死 AIC 早读未落地 q̄/w̄(±v 零均值组首分数
+        // 1.07e9 = workspace 残留的确定性签名,2026-10-09 NPU 实证)。
+        if (constInfo.proxyMode) {
+            // DIAG-B vectorService.PreStageBarrier(); // 仅 mode1:预阶段写才需全量背书
+        }
+        // 种子 flag 必须 pair 内两 AIV 各置一次(AIC wait 等两核到齐,缺一即挂死
+        // —— 507014 实证)。屏障背书后,种子只承担块循环的流水配速。
         CrossCoreSetFlag<IndexerCoarseScreenCommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(constInfo.syncV1C1);
         CrossCoreSetFlag<IndexerCoarseScreenCommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(constInfo.syncV1C1);
     } else {

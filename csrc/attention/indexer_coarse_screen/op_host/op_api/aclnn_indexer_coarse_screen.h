@@ -34,6 +34,7 @@ aclnnStatus aclnnIndexerCoarseScreenGetWorkspaceSize(
     int64_t coarseCount,
     int64_t hasWindow,
     int64_t groupSize,
+    int64_t proxyMode,
     const aclTensor *candidatesOut,
     const aclTensor *aslkOut,
     uint64_t *workspaceSize,

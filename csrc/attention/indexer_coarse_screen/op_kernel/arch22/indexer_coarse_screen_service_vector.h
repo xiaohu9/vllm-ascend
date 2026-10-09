@@ -64,7 +64,8 @@ public:
     __aicore__ inline void InitParams(const struct IndexerCoarseScreenCommon::ConstInfo &constInfo,
                                       const IndexerCoarseScreenTilingData *__restrict tilingData);
     __aicore__ inline void InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<W_T> weightsGm,
-                                                GlobalTensor<int32_t> indiceOutGm);  // mm1 视图经 set 注入
+                                                GlobalTensor<int32_t> indiceOutGm, GlobalTensor<float> partialTopkGm);
+    __aicore__ inline void FlushDeferredMerges(); // M3:SyncAll 后延迟行归并+CopyOut
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
@@ -127,6 +128,15 @@ private:
     // para for vector
     int32_t groupInner_ = 0;
     int64_t blockS2StartIdx_ = 0;
+    GlobalTensor<float> partialTopkGm_; // M3:跨核 fragment partial
+    bool fragIsHead_ = false;           // M3:本核 fragment 是否行头片段(s2Idx>0 起)
+    // M3:延迟归并记录(fragmented 行每核 ≤2:tail+head 各至多一条)
+    bool deferValid_[2] = {false, false};
+    uint32_t deferCStart_[2] = {0U, 0U};
+    uint32_t deferS1Begin_[2] = {0U, 0U};
+    uint32_t deferS1Num_[2] = {0U, 0U};
+    uint64_t deferIndiceOff_[2] = {0U, 0U};
+    uint32_t deferSeq_[2] = {0U, 0U};
     // pair-merge v2: 延迟奇数块存 reduceOutBuf_ 保留段 [2V,4V)(零新增 UB),
     // 偶数块 MrgSort(A,B)→tmp 后一次归并进 acc(top-k 关联律, 输出不变)
     bool pairFilled_[8] = {false};
@@ -203,11 +213,67 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::InitParams(const s
 template <typename LIT>
 __aicore__ inline void
 IndexerCoarseScreenServiceVector<LIT>::InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm,
-                                    GlobalTensor<W_T> weightsGm, GlobalTensor<int32_t> indiceOutGm)
+                        GlobalTensor<W_T> weightsGm, GlobalTensor<int32_t> indiceOutGm,
+                        GlobalTensor<float> partialTopkGm)
 {
     this->mm1ResGm = mm1ResGm;
     this->weightsGm = weightsGm;
     this->indiceOutGm = indiceOutGm;
+    this->partialTopkGm_ = partialTopkGm;
+}
+
+// M3:SyncAll 后的延迟行归并(行尾 fragment 所在核 = 属主)。
+// 槽 = (pairIdx*2 + seq);本核 tail 片段槽 seq=fragIsHead_?1:0,其余核:
+// cstart=行首所在核 → seq 0,其余(行头片段)→ 1。
+template <typename LIT>
+__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::FlushDeferredMerges()
+{
+    constexpr uint32_t SLOT = 8U * 4096U * 2U; // 8 innerS1 × 4096×2 fp32
+    for (uint32_t r = 0; r < 2U; r++) {
+        if (!deferValid_[r]) {
+            continue;
+        }
+        int64_t offset = (constInfo_.sparseCount <= SPARSE_COUNT_4K) ? virTopK : constInfo_.sparseCount / 2;
+        int64_t copyLen = (constInfo_.sparseCount <= SPARSE_COUNT_4K)
+                        ? constInfo_.sparseCount
+                        : constInfo_.sparseCount / 2;
+        int64_t copyNum = (constInfo_.sparseCount <= SPARSE_COUNT_4K) ? 1 : 2;
+        for (uint32_t innerS1Idx = 0; innerS1Idx < deferS1Num_[r]; innerS1Idx++) {
+            // 复位运行 topk 区,装本核 tail 片段槽,再折入各核头片段槽
+            InitSortOutBuf(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK * 2);
+            PipeBarrier<PIPE_V>();
+            uint64_t own = (static_cast<uint64_t>(blockId_ >> 1) * 2U + deferSeq_[r]) * SLOT;
+            DataCopy(globalTopkUb_[innerS1Idx * virTopK * 2],
+                     partialTopkGm_[own + innerS1Idx * 4096U * 2U], 4096U * 2U);
+            SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+            PipeBarrier<PIPE_V>();
+            for (uint32_t pc = deferCStart_[r]; pc < static_cast<uint32_t>(blockId_ >> 1); pc++) {
+                uint64_t pslot = (static_cast<uint64_t>(pc) * 2U + 1U) * SLOT;
+                LocalTensor<float> pbuf = outQueue_.AllocTensor<float>();
+                DataCopy(pbuf, partialTopkGm_[pslot + innerS1Idx * 4096U * 2U], 4096U * 2U);
+                SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+                IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK,
+                                                         pbuf, 4096U * 2U, tmpUb_);
+                PipeBarrier<PIPE_V>();
+                outQueue_.FreeTensor(pbuf);
+            }
+            for (int64_t i = 0; i < copyNum; i++) {
+                LocalTensor<float> outValueUb = outQueue_.AllocTensor<float>();
+                LocalTensor<uint32_t> outIdxUb = outValueUb[offset].template ReinterpretCast<uint32_t>();
+                Extract(outValueUb, outIdxUb,
+                        globalTopkUb_[innerS1Idx * virTopK * 2 + 2 * i * offset], offset / 32);
+                LocalTensor<int32_t> idxULocal1 = outValueUb[offset].template ReinterpretCast<int32_t>();
+                outQueue_.EnQue<float>(outValueUb);
+                outValueUb = outQueue_.DeQue<float>();
+                IndexerCoarseScreenServiceVec::CopyOut(
+                    indiceOutGm[deferIndiceOff_[r] + (deferS1Begin_[r] + innerS1Idx) *
+                                constInfo_.sparseCount + i * offset],
+                    idxULocal1, copyLen);
+                outQueue_.FreeTensor(outValueUb);
+            }
+        }
+        deferValid_[r] = false;
+    }
 }
 
 template <typename LIT>
@@ -273,9 +339,11 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
         InitSortOutBuf(globalTopkUb_, CeilDiv(s1BaseSize_, 2) * virTopK * 2);
         blockS2StartIdx_ = 0;
         for (int i = 0; i < 8; i++) { pairFilled_[i] = false; }
+        fragIsHead_ = false; // M3:行首在本核 → tail/whole 片段
     } else if (info.loop == 0) {
         blockS2StartIdx_ = info.s2Idx;
         for (int i = 0; i < 8; i++) { pairFilled_[i] = false; }
+        fragIsHead_ = info.s2Idx != 0; // M3:核范围起于行中 → head 片段
     }
     // cuRealAcSeq: 当前基本块S1对应的AcSeq(粗筛域上界 upper[r],PA 布局恒绝对值;
     // attenMaskFlag 硬编码 false,掩码改写分支已随死代码删除)
@@ -384,13 +452,47 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
             PipeBarrier<PIPE_V>();
             outQueue_.FreeTensor(tmpSortBuf);
 
-            if (isS2End && pairFilled_[innerS1Idx]) {
+            bool fragEnd = info.isLastS2InnerLoop;
+            if (fragEnd && pairFilled_[innerS1Idx]) {
                 LocalTensor<float> deferred = reduceOutBuff[s2BaseSize_ * 2];
                 IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK,
                                         deferred, s2BaseSize_, tmpUb_);
                 pairFilled_[innerS1Idx] = false;
             }
-            bool needCopyOutGm = blockS2StartIdx_ == 0 && isS2End;
+            if (fragEnd) {
+                // M3:fragment 收尾 —— 运行 top-4096 写本 pair 槽(head=1/tail=0);
+                // 行尾且为 head 片段 → 跨核 fragmented 行,记录延迟归并(SyncAll 后)
+                constexpr uint32_t SLOT = 8U * 4096U * 2U;
+                uint32_t seq = fragIsHead_ ? 1U : 0U;
+                uint64_t pslot = (static_cast<uint64_t>(blockId_ >> 1) * 2U + seq) * SLOT;
+                DataCopy(partialTopkGm_[pslot + innerS1Idx * 4096U * 2U],
+                         globalTopkUb_[innerS1Idx * virTopK * 2], 4096U * 2U);
+                if (isS2End && fragIsHead_ && innerS1Idx == 0) {
+                    // cstart 反向步进:unitStart(c)=c*cap+min(c,deal1More) ≤ uStart
+                    uint32_t pairIdx = static_cast<uint32_t>(blockId_ >> 1);
+                    uint64_t uEnd = static_cast<uint64_t>(info.unitStartSelf) +
+                        static_cast<uint64_t>(info.s2Idx - static_cast<uint32_t>(blockS2StartIdx_) + 1U);
+                    uint32_t unitsInRow = (info.actS2Size + s2BaseSize_ - 1) / s2BaseSize_;
+                    uint64_t uStart = uEnd - unitsInRow;
+                    uint32_t cstart = pairIdx;
+                    while (cstart > 0) {
+                        uint32_t pc = cstart - 1;
+                        uint64_t us = static_cast<uint64_t>(pc) * info.unitCap +
+                            (pc < info.deal1More ? pc : info.deal1More);
+                        if (us > uStart) { cstart = pc; } else { break; }
+                    }
+                    uint32_t slot = deferValid_[0] ? 1U : 0U;
+                    if (!deferValid_[1] || !deferValid_[0]) {
+                        deferValid_[slot] = true;
+                        deferCStart_[slot] = cstart;
+                        deferS1Begin_[slot] = static_cast<uint32_t>(cuS1BeginIdxPerAiv);
+                        deferS1Num_[slot] = static_cast<uint32_t>(cuS1ProcNumPerAiv);
+                        deferIndiceOff_[slot] = static_cast<uint64_t>(info.indiceOutOffset);
+                        deferSeq_[slot] = seq;
+                    }
+                }
+            }
+            bool needCopyOutGm = blockS2StartIdx_ == 0 && isS2End && !fragIsHead_;
 
             if (needCopyOutGm) {
                 // 生产形态 CopyOut: Extract 分离 globalTopkUb_ 的 (value,index) 交错对,经 outQueue_

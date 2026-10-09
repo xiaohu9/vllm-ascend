@@ -123,7 +123,8 @@ protected:
     GlobalTensor<int32_t> aslkOutGm;    // 输出 aslk' [R]
 
     // workspace
-    GlobalTensor<MM1_OUT_T> mm1ResGm;  // 存放S
+    GlobalTensor<MM1_OUT_T> mm1ResGm;
+    GlobalTensor<float> partialTopkGm; // M3:跨核 fragment partial(经 service 使用)  // 存放S
 
     // ================================类成员变量====================================
     // aic、aiv核信息
@@ -135,6 +136,9 @@ protected:
     // 同步),tiling 的 usedCoreNum 恒 ≥1 → 全零批判据只能在 kernel 侧算。
     // 2026-09-24 修复:整批无块时原版输出整批无人写(回收垃圾,refine 连锁吃垃圾)。
     uint32_t totalBlockNum = 0U;
+    // M3:全局块流切分参数(SplitCore 填,CalcRunInfo 下发)
+    uint32_t splitCap_ = 0U;
+    uint32_t splitDeal1More_ = 0U;
 
     IndexerCoarseScreenCommon::ConstInfo constInfo{};
     TempLoopInfo tempLoopInfo{};
@@ -289,6 +293,8 @@ __aicore__ void inline IndexerCoarseScreenKernel<LIT>::SplitCore(uint32_t curCor
     uint32_t lastGS1RemainBlockCnt = 0;
     uint32_t coreDealBlockCnt = coreIdx < deal1MoreBlockCoreNum ? minBlockPerCore + 1 : minBlockPerCore;
     coreNum = minBlockPerCore == 0 ? deal1MoreBlockCoreNum : coreNum;
+    splitCap_ = minBlockPerCore;
+    splitDeal1More_ = deal1MoreBlockCoreNum;
 
     bool findLastCoreEnd = true;
     uint32_t actS1Size, actS2Size;
@@ -307,7 +313,8 @@ __aicore__ void inline IndexerCoarseScreenKernel<LIT>::SplitCore(uint32_t curCor
                 info.s2Start = 0;
                 findLastCoreEnd = false;
             }
-            s2Loop = constInfo.isSparseCountOver2K ? (actS2Size > 0 ? 1 : 0) : s2BaseNum;
+            // M3:over-2K 亦按 s2 子块入全局流(旧=每行 1 单元 → 行内串行台阶)
+            s2Loop = s2BaseNum;
             for (uint32_t s2Idx = 0; s2Idx < s2Loop;) {
                 if (findLastCoreEnd) {
                     info.bN2Start = bN2Idx;
@@ -319,9 +326,7 @@ __aicore__ void inline IndexerCoarseScreenKernel<LIT>::SplitCore(uint32_t curCor
                 if (lastGS1RemainBlockCnt + s2RemainBaseNum >= coreDealBlockCnt) {
                     info.bN2End = bN2Idx;
                     info.gS1End = gS1Idx;
-                    info.s2End = constInfo.isSparseCountOver2K
-                               ? s2BaseNum - 1
-                               : s2Idx + coreDealBlockCnt - lastGS1RemainBlockCnt - 1;
+                    info.s2End = s2Idx + coreDealBlockCnt - lastGS1RemainBlockCnt - 1;
 
                     if (coreIdx == curCoreIdx) {
                         info.isEmptyRange = false; // 拥有任务段的核
@@ -342,6 +347,7 @@ __aicore__ void inline IndexerCoarseScreenKernel<LIT>::SplitCore(uint32_t curCor
                     coreDealBlockCnt = coreIdx < deal1MoreBlockCoreNum ? minBlockPerCore + 1 : minBlockPerCore;
                 } else {
                     lastGS1RemainBlockCnt += s2RemainBaseNum;
+                    s2Idx++; // M3:子块化后常规推进(旧 over-2K 依赖原地重迭代+break)
                     if (constInfo.isSparseCountOver2K) {
                         // 2026-09-24 末行丢失根修(NPU PRINTF 判决):over-2K 下
                         // s2Loop≡1 且本循环在非切分路径不自增 s2Idx —— 不 break
@@ -438,6 +444,9 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Init(__gm__ uint8_t *qBar
         vectorService.InitParams(constInfo, tiling);
         // M1 出核:窗口阶段仅需 caller aslq/aslk/候选中转/输出(组均值由 caller 传)
         GlobalTensor<int32_t> dbgMm1;
+        // M3:partial topk 槽(48 = 24 pair × 2 seq;槽 = 8 innerS1 × 4096×2 fp32)
+        partialTopkGm.SetGlobalBuffer((__gm__ float *)(workspace + offset));
+        offset += alignGm(48ULL * 8U * constInfo.sparseCount * 2U * sizeof(float));
         dbgMm1.SetGlobalBuffer((__gm__ int32_t *)workspace);
         vectorService.InitCoarseGlobalTensor(callerSeqLenGmQ, actualSeqLengthsGm, candidatesWsGm,
                                              candidatesOutGm, aslkOutGm, dbgMm1);
@@ -451,7 +460,7 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Init(__gm__ uint8_t *qBar
         // raw 行而非 w̄,分数全错(2026-10-08 probe_m1a 判决)。
         GlobalTensor<W_T> wBarW;
         wBarW.SetGlobalBuffer((__gm__ W_T *)wBarEff);
-        vectorService.InitVec1GlobalTensor(mm1ResGm, wBarW, mainPassOut);
+        vectorService.InitVec1GlobalTensor(mm1ResGm, wBarW, mainPassOut, partialTopkGm);
     } else {
         matmulService.InitParams(constInfo);
         // 主 pass query = q_bar(M1 输出);key = 原始 PA cache(块表直读)
@@ -529,6 +538,10 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::CalcRunInfo(uint32_t loop
     runInfo.actualSingleProcessSInnerSizeAlign =
         IndexerCoarseScreenCommon::Align((uint32_t)runInfo.actualSingleProcessSInnerSize, IndexerCoarseScreenCommon::ConstInfo::BUFFER_SIZE_BYTE_32B);
 
+    runInfo.unitStartSelf = static_cast<uint32_t>(aiCoreIdx) * splitCap_ +
+        (static_cast<uint32_t>(aiCoreIdx) < splitDeal1More_ ? static_cast<uint32_t>(aiCoreIdx) : splitDeal1More_);
+    runInfo.unitCap = splitCap_;
+    runInfo.deal1More = splitDeal1More_;
     runInfo.isFirstS2InnerLoop = s2LoopIdx == splitCoreInfo.s2Start;
     runInfo.isLastS2InnerLoop = s2LoopIdx == tempLoopInfo.s2LoopEnd;
     runInfo.isAllLoopEnd = (runInfo.bN2Idx == splitCoreInfo.bN2End) && (runInfo.gS1Idx == splitCoreInfo.gS1End) &&
@@ -665,8 +678,11 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessInvalid()
 template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessMain()
 {
-    if (aiCoreIdx >= usedCoreNum) {
-        // 无任务核直接返回(同 lightning_indexer:任务检查最先,无任务核不参与任何同步)
+    if ASCEND_IS_AIV {
+        // M3:AIV 不提前返回 —— fragment partial 的 SyncAll 要求全员 AIV 到齐。
+    } else if (aiCoreIdx >= usedCoreNum) {
+        // 无任务 AIC 直接返回(同 lightning_indexer)。M3:AIV 不在此早退 ——
+        // fragment partial 的 SyncAll 要求全员 AIV 到齐(硬件屏障,少一即挂)。
         return;
     }
 
@@ -714,6 +730,10 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessMain()
     }
 
     if ASCEND_IS_AIV {
+        // M3:fragment partial 全局可见屏障(空范围核亦到齐,同窗口路径纪律;
+        // usedCoreNum 域内全体 AIV 一致进入,域外核不参与——两侧判据一致无死锁)
+        SyncAll();
+        vectorService.FlushDeferredMerges();
         vectorService.FreeEventID();
     } else {
         matmulService.FreeEventID();

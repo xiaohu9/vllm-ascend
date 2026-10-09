@@ -51,6 +51,11 @@ struct RunInfo {
     uint32_t actualSingleProcessSInnerSize;
     uint32_t actualSingleProcessSInnerSizeAlign;
 
+    // M3:全局块流切分参数(服务侧反推 cstart/seq 用)
+    uint32_t unitStartSelf = 0;
+    uint32_t unitCap = 0;
+    uint32_t deal1More = 0;
+
     uint64_t tensorQueryOffset;
     uint64_t tensorKeyOffset;
     uint64_t tensorWeightsOffset;
@@ -69,9 +74,11 @@ struct ConstInfo {
     // 无效索引
     static constexpr int INVALID_IDX = -1;
     // CUBE和VEC的核间同步EventID
-    uint32_t syncC1V1 = 0U;
-    uint32_t syncV1C1 = 0U;
-    uint32_t syncV2V = 1U;    // M1a: 预阶段全局屏障(参战 AIV 各置一次,AIC 等满才进块循环)
+    // M3:flagId 挪出 0/1(507015 定位:主循环遗留信用 + SyncAll 内部 flag 同 id 冲突;
+    // 8/9 = kv_quant 生产同硅实证值)
+    uint32_t syncC1V1 = 8U;
+    uint32_t syncV1C1 = 9U;
+    uint32_t syncV2V = 10U;   // M1a: 预阶段全局屏障(参战 AIV 各置一次,AIC 等满才进块循环)
 
     // 基本块大小
     uint32_t mBaseSize = 1ULL;

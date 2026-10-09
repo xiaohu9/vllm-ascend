@@ -528,6 +528,8 @@ ge::graphStatus IndexerCoarseScreenTiling::DoTiling(IndexerCoarseScreenTilingInf
         workspaceSize += align512(reqNum * tilingInfo->gSize * HEAD_DIM_LIMIT * Q_ELEM_SIZE);   // qBarWs
         workspaceSize += align512(reqNum * tilingInfo->gSize * Q_ELEM_SIZE);                    // wBarWs
     }
+    // M3:partial topk 槽(48 = 24 pair × 2 seq × 8 innerS1 × 4096×2 fp32)
+    workspaceSize += align512(48ULL * 8U * 4096U * 2U * sizeof(float));
     size_t *workSpaces = context_->GetWorkspaceSizes(1);
     workSpaces[0] = static_cast<size_t>(workspaceSize);
 

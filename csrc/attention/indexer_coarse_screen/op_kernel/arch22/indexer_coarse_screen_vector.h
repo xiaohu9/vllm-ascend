@@ -328,6 +328,36 @@ __aicore__ inline void MergeSort(const LocalTensor<float> &mrgDst, int32_t mrgDs
 }
 
 
+/**
+  M3F2:双 4096 对已排序序列合并 —— MrgSort elementLengths 单位 8B(对数)、
+  取值范围 [0,4095],4096 对整段非法;acc 与 slot 各拆两半 = 4×2048 单次归并
+  (全段合法),tmp 得全序后拷回 acc。tmp: 16384 floats(8192 对)。
+ */
+__aicore__ inline void FoldMerge4(const LocalTensor<float> &acc, LocalTensor<float> &slot,
+                                  LocalTensor<float> &tmpTensor)
+{
+    AscendC::MrgSort4Info params;
+    params.elementLengths[0] = 2048;
+    params.elementLengths[1] = 2048;
+    params.elementLengths[2] = 2048;
+    params.elementLengths[3] = 2048;
+    params.ifExhaustedSuspension = false;
+    params.validBit = 0b1111;
+    params.repeatTimes = 1;
+
+    AscendC::MrgSortSrcList<float> srcList;
+    srcList.src1 = acc[0];
+    srcList.src2 = acc[4096];
+    srcList.src3 = slot[0];
+    srcList.src4 = slot[4096];
+
+    AscendC::MrgSort<float>(tmpTensor, srcList, params);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::DataCopy(acc, tmpTensor, 4096U * VALUE_AND_INDEX_NUM);
+    AscendC::PipeBarrier<PIPE_V>();
+}
+
+
 template <HardEvent event>
 __aicore__ inline void SetWaitFlag(HardEvent evt)
 {

@@ -331,3 +331,14 @@ UB 布局五处隐含 512 假设,非单点可修;收益上限 ~2x 但工程风�
   则 ≤64K 全场景反超 LI,一刀双雕,且不碰 s2 联动;
 2. refine 低 R 核空转(R<24 时调度满核)。
 回退点:5bd314b0 代码态(BASELINE_GREEN)。
+## s2=1024 消融矩阵(2026-10-10 深夜三,groupInner_=16 真相)
+分段 stub 消融:E1 块体全 stub 仍炸;E2 +mm1 stub 仍炸;E3 win0 仍炸
+→ 故障在 常驻路径(InitBuffers/SplitCore/脚手架)。
+**发现 groupInner_=16 硬编码**(InitParams"按UB空间强制16"):s2=1024 时
+tmpBuf_=(16*1024+1024)*8=136KB、outQueue reduceCacheSize≈64KB → AIV TPipe
+合计≈289KB>248KB 确凿超限;512 时 175KB 侥幸安全(全部前期现象闭环)。
+groupInner_=8(197KB)后仍炸 → 还有第二个超限源未消:
+  剩余嫌疑(下轮顺序):①AIV TPipe 累计重算(含 win 相关 TBuf,精确列全);
+  ②cube 侧 S2_BASIC_BLOCK 常量来源(若 =s2BaseSize 派生则 L1/L0 也超);
+  ③TPipe 上限实测:构造半尺寸 InitBuffer 看 507015 是否消失。
+路线判定:DEBUG 轮不计放弃(纪律修订),s2=1024 保持活跃,直到有实测性能数据。

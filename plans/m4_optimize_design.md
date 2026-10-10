@@ -350,3 +350,18 @@ TPipe 容量理论动摇(160KB 仅比正常 512 态 131KB 高 30KB,若上限真�
 说明 16→4 后故障已移位回块内(DoScale/SortAll 的 groupInner 关联尺寸)。
 工具链:sanitizer --kernel-name 完整跑不截断;dump pc 反查。
 回退点:65e491c5(GREEN)。
+
+
+## s2=1024 消融矩阵终版(2026-10-10 深夜五,groupInner_=4 干净态)
+E1b 块体 if(false) 全关 = PASS;E5(CopyIn/DoScale/DoReduce 关,sort/merge/CopyOut 活)=炸;
+E6(+SortAll 关)=炸;E7(+pair-merge/CopyOut/fragEnd 关,仅剩 AllocTensor/PipeBarrier/
+SetFlag(V_MTE2,MTE2_V)/WaitFlag(TMPUB)/InitSortOutBuf 脚手架)=仍炸。
+关键纠错:E4c 之前两次测的是旧 .o(SYNCED 恒 22:40:48)——根因=DoScale/CopyIn 两行调用
+只注释首行致编译失败静默回退 + gen 目录缓存旧源(rebuild 必须删 gen/indexer_coarse_screen*
+整个目录,只删 *.done 不够,H28 强化)。E4c(新 .o)炸=载入链有嫌疑的结论作废。
+强线索:E1b(全关)与 E7(仅剩平凡脚手架)之间的 delta 只有
+{AllocTensor/FreeTensor x2, PipeBarrier, SetFlag(MTE2_V,pp)/WaitFlag(MTE2_V,pp),
+ SetFlag(V_MTE2,pp), WaitFlag(TMPUB), reduceOutInner 切片, mmUbStride 标量}
+—— 下轮 E8 = E7 基础上再 if(false) 外层条件(=E1b 带陈旧 stubs),逐步复活片段二分;
+或直接怀疑 SetFlag(MTE2_V,pp) 的 pp 信用序列在 1024 态与 mm1 时序的交互。
+工具纪律:每次 build 后核对 SYNCED 时间戳必须刷新;gen 目录取整目录删。

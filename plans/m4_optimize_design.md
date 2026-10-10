@@ -414,3 +414,19 @@ SetFlag/WaitFlag(V_MTE2,0); FreeTensor)—— 读垃圾 UB 但指令参数合法
 预算:按新纪律,s2=1024 以两次上下文压缩为界(预期收益 ~2x 属大,可继续);
 到界未通则复盘挂起,转固定路径 ~90-105µs 消融方向(M5-3 定界刀)。
 回退点:ba39c9f6(GREEN)。
+
+
+## s2=1024 故障点锁定(2026-10-10 深夜九):CopyIn 本体(DataCopyPad)
+E12(真实 CopyIn+DoScale+DoReduce 活,sort/merge 关,gi=4)= FAULT;
+E13(仅 CopyIn 活,DoScale/DoReduce 关)= FAULT → **故障 = CopyIn 的 DataCopyPad**。
+CopyIn(vector.h:42)参数审查:blockCount=groupInner(4)、blockLen=s2Inner*4(4096B)、
+dstStride=mmUbStride(32B 块单位)、weights 副本 blockLen=groupInner*2=8B。
+疑点(下轮):①DataCopyPad blockLen/dstStride 在 1024 态的合法界(blockLen 4096B 与
+_ubStride=0 组合 vs 512 态 2048B);②mm1ResGm 源侧:AIC 写 tile 16x1024 与 CopyIn
+读取的 offsets 交互(host tiling S2_BASE_SIZE=512 常量 vs kernel 1024 —— 宿主常量
+只影响 workspace 尺寸,但确认 actualSingleProcessSInnerSizeAlign 的宿主来源!);
+③weights 8B blockLen 的最小粒度。
+修法候选:A. 拆 CopyIn 为 2 次 512(DataCopyPad 两次,绕开 1024 单发);
+B. 对齐宿主/kernel 的 S2 常量后重验。
+预算:按新纪律已到两次压缩边界,本轮结束若 A/B 未通则复盘挂起,转固定路径消融。
+回退点:5bca3007(GREEN)。

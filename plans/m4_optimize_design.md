@@ -293,3 +293,15 @@ reduceOutBuf_ 20KB 均在预算内),是 SortAll/DoScale/CopyIn 链存在 s2=512 
      改用 mssanitizer --kernel-name=IndexerCoarseScreen 定位(注意其报告里
      ReduceMean 的 VECTOR_MASK 告警是 caller torch op 的已知噪音,非我算子)。
   下轮:①对 b) 把 MergeSort 拆两段或 elementLengths 减半验证;②sanitizer 精确定位。
+
+## s2=1024 根因定案(2026-10-10):MergeSort elementLengths 单位错配(元素数 vs 对数)
+MergeSort(vector.h:277)>3072 分支:elementLengths[3] = mrgSrcNum,而 MrgSort 的
+elementLengths 单位 = 对(8B;SortAll 内 src2 偏移 = 2*mrgElements 证实为对)。
+调用方传 mrgSrcNum = s2BaseSize_*2 = **元素数** → 虚胖 2 倍:
+  s2=512:队列3=1024 对=8KB 读,32KB outQueue_ 兜住不炸(但本就多读了一半垃圾,
+    靠 -inf 沉底侥幸正确);
+  s2=1024:队列3=2048 对=16KB 读 + tmpTensor=merge 全序输出(4096+2048 对=24KB)
+    撞 outQueue_ 32KB 边界 + MrgSort 单 repeat 输出上限 → VEC 参数非法 507015。
+修法(下轮一刀):MergeSort 两分支的 elementLengths 统一改对数 ——
+  que3 = mrgSrcNum/2(元素数→对数),if 分支同;或调用方改传 s2BaseSize_(对数)。
+  改后阶梯+probe 全绿 → 热身 sweep → 达标(256K-R4 ≤200)→ 里程碑 commit。

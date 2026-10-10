@@ -271,9 +271,12 @@ __aicore__ inline uint32_t IndexerCoarseScreenKernel<LIT>::GetTotalBaseBlockNum(
     for (uint32_t bIdx = 0; bIdx < constInfo.batchSize; bIdx++) {
         GetS1S2ActualSeqLen(bIdx, actS1Size, actS2Size);
         s1GBaseNum = CeilDiv(actS1Size, constInfo.s1BaseSize);
-        s2BaseNum = constInfo.isSparseCountOver2K
-                  ? (actS2Size > 0 ? 1 : 0)
-                  : CeilDiv(actS2Size, constInfo.s2BaseSize);
+        // M3U:总块数与执行粒度一致 —— 旧 over-2K 记账每行 1 块(s2Loop≡1 时代),
+        // fine-split 下执行侧 s2Loop=s2BaseNum,记账不改则 totalBlockNum 少算
+        // s2BaseNum 倍:minBlockPerCore=0 → usedCoreNum 被改写为行数,每核 1 块
+        // 却经非末 tile 的 s2LoopEnd=s2BlockNum-1 展开成整行(末核再叠尾零调整
+        // 跨行全扫)→ 3x 冗余 507014 / L2K 档 4x 慢。
+        s2BaseNum = (actS2Size > 0) ? CeilDiv(actS2Size, constInfo.s2BaseSize) : 0;
         totalBlockNum += s1GBaseNum * s2BaseNum * constInfo.kHeadNum;
     }
     return totalBlockNum;
@@ -323,6 +326,20 @@ __aicore__ void inline IndexerCoarseScreenKernel<LIT>::SplitCore(uint32_t curCor
                     findLastCoreEnd = false;
                 }
                 uint32_t s2RemainBaseNum = s2Loop - s2Idx;
+                if (coreDealBlockCnt == 0U && lastGS1RemainBlockCnt == 0U) {
+                    // M3R-A:零预算核(blocks < 核数,粒度化后 minBlockPerCore=0)
+                    // 干净置空 —— 旧逻辑误走赋值分支,s2End = s2Idx-1 uint 下溢,
+                    // curCoreIdx 命中时 s2LoopEnd=0xFFFFFFFF 野读 507015。
+                    if (coreIdx == curCoreIdx) {
+                        info.isEmptyRange = true;
+                        return;
+                    }
+                    coreIdx++;
+                    findLastCoreEnd = true;
+                    coreDealBlockCnt =
+                        coreIdx < deal1MoreBlockCoreNum ? minBlockPerCore + 1 : minBlockPerCore;
+                    continue;
+                }
                 if (lastGS1RemainBlockCnt + s2RemainBaseNum >= coreDealBlockCnt) {
                     info.bN2End = bN2Idx;
                     info.gS1End = gS1Idx;
@@ -346,17 +363,11 @@ __aicore__ void inline IndexerCoarseScreenKernel<LIT>::SplitCore(uint32_t curCor
                     lastGS1RemainBlockCnt = 0;
                     coreDealBlockCnt = coreIdx < deal1MoreBlockCoreNum ? minBlockPerCore + 1 : minBlockPerCore;
                 } else {
-                    lastGS1RemainBlockCnt += s2RemainBaseNum;
-                    s2Idx++; // M3:子块化后常规推进(旧 over-2K 依赖原地重迭代+break)
-                    if (constInfo.isSparseCountOver2K) {
-                        // 2026-09-24 末行丢失根修(NPU PRINTF 判决):over-2K 下
-                        // s2Loop≡1 且本循环在非切分路径不自增 s2Idx —— 不 break
-                        // 则同一行原地重迭代把整核预算吸干,每核恰得 1 行,R>核数
-                        // 时尾部行全部沦为遗留,extension 以 s2End=0(为尾零行设计)
-                        // 补接 → 末行只扫 1 块,isS2End 永假,CopyOut 永不执行。
-                        // break 后按行推进,Σ预算=Σ行 精确覆盖,extension 不再触发。
-                        break;
-                    }
+                    // M3R-B:预算未满,逐 unit 记账(s2Loop≡1 时代余量恒 1,
+                    // += s2Remain 与 += 1 等价;粒度化后必须按单位累计,否则
+                    // lastGS1 平方超累计 → s2End 负下溢)
+                    lastGS1RemainBlockCnt += 1U;
+                    s2Idx++;
                 }
             }
         }
@@ -446,7 +457,7 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Init(__gm__ uint8_t *qBar
         GlobalTensor<int32_t> dbgMm1;
         // M3:partial topk 槽(48 = 24 pair × 2 seq;槽 = 8 innerS1 × 4096×2 fp32)
         partialTopkGm.SetGlobalBuffer((__gm__ float *)(workspace + offset));
-        offset += alignGm(48ULL * 8U * constInfo.sparseCount * 2U * sizeof(float));
+        offset += alignGm(48ULL * (constInfo.batchSize * constInfo.kHeadNum * 4096U * 2U + 16U) * sizeof(float));
         dbgMm1.SetGlobalBuffer((__gm__ int32_t *)workspace);
         vectorService.InitCoarseGlobalTensor(callerSeqLenGmQ, actualSeqLengthsGm, candidatesWsGm,
                                              candidatesOutGm, aslkOutGm, dbgMm1);
@@ -630,12 +641,19 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::Process()
         if (tmpBlockIdx % 2 == 1) {
             wBegin = wEnd; // 奇 AIV(对的第 2 个)不承担窗口读写
         }
-        vectorService.ProcessWindow(pipe, wBegin, wEnd);
+        // M3I:Flush 移到窗口前 —— marker-poll 自带跨核可见性,不依赖窗口内
+        // SyncAll;且窗口内部 pipe->Reset() 会作废全部 UB 句柄,Flush 的
+        // outQueue_/tmpUb_ 在其后分配即踩非法地址(MTE invalid address 实证)。
+        // M3F2:fold 重启用 —— 炸机根因 = MrgSort elementLengths 段长越界
+        // (官方约束 [0,4095],8B 单位;旧体传 8192 对单段),非时序脆弱。
+        // FoldMerge4(4×2048)修复后重启用跨核折叠。
+        vectorService.FlushDeferredMerges();
+        // M3F3:窗口行集 = 行位图(读者=写者同核);[0,batchSize) 全域扫描 + 位图过滤
+        vectorService.ProcessWindow(pipe, 0U, constInfo.batchSize, true);
         // 空请求行补写放 ProcessWindow 之后:其内部 pipe->Reset()+InitBuffer
         // 已初始化 winOut/winAux,EmitIdentityRows 直接复用(零 ws 依赖)。
-        if (constInfo.hasWindow == 1U && tmpBlockIdx == 0 && wBegin > 0) {
-            vectorService.EmitIdentityRows(wBegin); // [0, wBegin) = 被跳过的空请求行
-        }
+        // M3F9:空域行(upper==0)已由 dedup 的 validC==0 恒等分支冗余覆盖,
+        // EmitIdentityRows 整条路径删除(M3F8 位图私有性缺陷:他核行不可见)
     }
 }
 
@@ -678,13 +696,9 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessInvalid()
 template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessMain()
 {
-    if ASCEND_IS_AIV {
-        // M3:AIV 不提前返回 —— fragment partial 的 SyncAll 要求全员 AIV 到齐。
-    } else if (aiCoreIdx >= usedCoreNum) {
-        // 无任务 AIC 直接返回(同 lightning_indexer)。M3:AIV 不在此早退 ——
-        // fragment partial 的 SyncAll 要求全员 AIV 到齐(硬件屏障,少一即挂)。
-        return;
-    }
+    // M3:usedCoreNum 是行基核数,R 小于 pair 数时早退会杀死已分到子块的 pair 的
+    // AIC(其 AIV 将永等 C1V1 信用 → 挂死)。空范围由 isEmptyRange 自然跳过;
+    // 空 pair AIC 的末尾 drain 有 4 颗种子信用可消费,不挂。
 
     if ASCEND_IS_AIV {
         // M1 已出核(q_bar/w_bar 为 caller 输入);此处预置 syncV1C1×2 种子 flag。
@@ -693,6 +707,9 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessMain()
         // 相对 AIC 首轮读取存在窗口(NPU 实测 rows≥1 间歇坏、row 0 恒好);
         // MTE3 语义种子保证 flag 置位时 qBar 已在 GM。
         vectorService.AllocEventID();
+        if ASCEND_IS_AIV {
+            vectorService.ZeroMyMagics(); // M3B:清零本 AIV magic 块(防陈旧命中)
+        }
         // M1a 预阶段全局屏障:各 AIV 写自有标记槽后轮询全员到齐,期间不放行
         // 种子置位。种子信用全局可互换(MODE2 flag id 空间极小,分 id 实测无效
         // 且 id=1 无序语义 —— AIC 侧时序快慢会改变结果 = 竞态铁证),唯有
@@ -732,8 +749,8 @@ __aicore__ inline void IndexerCoarseScreenKernel<LIT>::ProcessMain()
     if ASCEND_IS_AIV {
         // M3:fragment partial 全局可见屏障(空范围核亦到齐,同窗口路径纪律;
         // usedCoreNum 域内全体 AIV 一致进入,域外核不参与——两侧判据一致无死锁)
-        SyncAll();
-        vectorService.FlushDeferredMerges();
+        // M3:延迟归并移至 ProcessWindow 的 SyncAll 之后(彼时乒乓已静止,
+        // CCU 安全;主循环后直接 SyncAll 会撞乒乓尾巴 → 507015,实测三连)
         vectorService.FreeEventID();
     } else {
         matmulService.FreeEventID();

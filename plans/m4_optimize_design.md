@@ -403,3 +403,14 @@ SetFlag/WaitFlag(V_MTE2,0); FreeTensor)—— 读垃圾 UB 但指令参数合法
 删 gen 整目录)→ 阶梯+probe 7/7 → sweep → 256K-R4 ≤240µs → AIME 随门 → 里程碑 commit。
 当前树:E9+E10 态(已知 PASS 配置,s2=1024+gi=4+if(false)+alloc+flags,未 commit)。
 回退点:ba39c9f6(GREEN)。
+
+
+## E11 编译失败记录(2026-10-10 深夜八)
+注入的 DoScale 内联 ReinterpretCast 版本模板推导失败(no matching function)。
+下轮修正:注入时**原样照抄原调用 8 行**(含 `if constexpr (!IsSameType<W_T,float>::value)`
+的 weightsInTUb 偏移分支与独立声明行),只改宿主上下文;或直接在 E10 态把
+`if (false && ...)` 的 false 去掉并只保留 CopyIn/DoScale 活、SortAll 后段用 E7 guard 关
+(等价但全用真实代码,免模板手写)。
+预算:按新纪律,s2=1024 以两次上下文压缩为界(预期收益 ~2x 属大,可继续);
+到界未通则复盘挂起,转固定路径 ~90-105µs 消融方向(M5-3 定界刀)。
+回退点:ba39c9f6(GREEN)。

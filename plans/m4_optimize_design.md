@@ -321,3 +321,13 @@ s2=1024:Σ=6144 对=48KB → 溢出 16KB,踩坏相邻 TBuf → VEC 参数非法 
 B. MrgSort 前把 src 预剪枝(块最大值 < acc 第 4096 名则跳过合并——兼得算法收益);
 C. 拆两次 MrgSort(dst 三分 vs src 两半,中转缓冲)。A 最小,B 兼性能,C 最稳。
 简报达标线:256K-R4 coarse ≤240µs;失败退 5bd314b0(GREEN)。
+## FIX-A 证伪(2026-10-10):outQueue_ 扩至 48KB(覆盖 MergeSort 全量输出)后 s2=1024 仍全炸
+→ tmpTensor 溢出理论同样不成立(或非唯一根因)。s2=1024 命题两轮零收益,按硬纪律换路线:
+**s2BaseSize 路线挂起**,复盘:该常数牵动 SortAll/MergeSort/mm1 tile/CopyIn 跨距/
+UB 布局五处隐含 512 假设,非单点可修;收益上限 ~2x 但工程风险与五处联动审计成本高。
+下一活跃命题(按简报完成队列重排):
+1. **固定路径 ~90-105µs 消融**(coarse 105/refine 87 共同地板,~3x LI)——M5-3 定界刀
+  (replay K=1 vs K=10 + InitBuffers/SplitCore/种子收尾逐段 stub),若压到 ~40µs
+  则 ≤64K 全场景反超 LI,一刀双雕,且不碰 s2 联动;
+2. refine 低 R 核空转(R<24 时调度满核)。
+回退点:5bd314b0 代码态(BASELINE_GREEN)。

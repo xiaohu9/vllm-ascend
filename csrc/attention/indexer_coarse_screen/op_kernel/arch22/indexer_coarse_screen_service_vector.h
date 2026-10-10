@@ -66,11 +66,6 @@ public:
     __aicore__ inline void InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<W_T> weightsGm,
                                                 GlobalTensor<int32_t> indiceOutGm, GlobalTensor<float> partialTopkGm);
     __aicore__ inline void FlushDeferredMerges(); // M3:SyncAll 后延迟行归并+CopyOut
-    __aicore__ inline void ZeroMyMagics(); // M3C:启动前清零本 AIV magic 块(防陈旧命中)
-    __aicore__ inline void PublishMyMagic(); // M3C:Flush 入口发布(宣告本核 partial 全落地)
-    __aicore__ inline void PollPartialMagic(uint32_t pc, uint32_t seq); // M3C:轮询目标核 line 尾 magic
-    __aicore__ inline uint64_t PartialLineBase(uint32_t pairIdx, uint32_t seq) const;
-    __aicore__ inline uint64_t PartialMagicBase(uint32_t pairIdx, uint32_t seq) const;
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
@@ -81,7 +76,8 @@ public:
                                                   GlobalTensor<int32_t> candidatesOutGm,
                                                   GlobalTensor<int32_t> aslkOutGm,
                                                   GlobalTensor<int32_t> dbgMm1);
-    __aicore__ inline void ProcessWindow(TPipe *pipe, uint32_t rBegin, uint32_t rEnd, bool useMask = false);
+    __aicore__ inline void ProcessWindow(TPipe *pipe, uint32_t rBegin, uint32_t rEnd);
+    __aicore__ inline void EmitIdentityRows(uint32_t rowCount);
     // ---- M1a 组均值预阶段(proxy_mode=1;骨架 = b2fe4a23 ProcessGroupMean)----
     __aicore__ inline void InitProxyGlobalTensor(__gm__ uint8_t *rawQuery, __gm__ uint8_t *rawWeights,
                                                  GlobalTensor<Q_T> qBarOut, GlobalTensor<Q_T> wBarOut);
@@ -135,17 +131,12 @@ private:
     GlobalTensor<float> partialTopkGm_; // M3:跨核 fragment partial
     bool fragIsHead_ = false;           // M3:本核 fragment 是否行头片段(s2Idx>0 起)
     // M3:延迟归并记录(fragmented 行每核 ≤2:tail+head 各至多一条)
-    uint32_t rowCap_ = 0U; // M3C:槽行维 = batchSize*kHeadNum(每请求一槽,免 tile 间复用)
-    bool deferValid_[4] = {false, false, false, false};
-    // M3F10:4096 行容量(R=512 门禁 + 生产 prefill 千级 P);越界写踩坏相邻成员致 507015
-    uint32_t winRowMask_[128] = {0U}; // 本核写过的行(完整行+fold行),窗口读者=写者
-    uint32_t deferCStart_[4] = {0U, 0U, 0U, 0U};
-    uint32_t deferS1Begin_[4] = {0U, 0U, 0U, 0U};
-    uint32_t deferS1Num_[4] = {0U, 0U, 0U, 0U};
-    uint64_t deferIndiceOff_[4] = {0U, 0U, 0U, 0U};
-    uint32_t deferSeq_[4] = {0U, 0U, 0U, 0U};
-    uint32_t deferFoldFrom_[4] = {0U, 0U, 0U, 0U}; // M3C:head 槽折叠起点 = cstart+1
-    uint32_t deferRowBase_[4] = {0U, 0U, 0U, 0U}; // M3C:槽行基 = indiceOutOffset/sparseCount
+    bool deferValid_[2] = {false, false};
+    uint32_t deferCStart_[2] = {0U, 0U};
+    uint32_t deferS1Begin_[2] = {0U, 0U};
+    uint32_t deferS1Num_[2] = {0U, 0U};
+    uint64_t deferIndiceOff_[2] = {0U, 0U};
+    uint32_t deferSeq_[2] = {0U, 0U};
     // pair-merge v2: 延迟奇数块存 reduceOutBuf_ 保留段 [2V,4V)(零新增 UB),
     // 偶数块 MrgSort(A,B)→tmp 后一次归并进 acc(top-k 关联律, 输出不变)
     bool pairFilled_[8] = {false};
@@ -217,7 +208,6 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::InitParams(const s
     groupInner_ = 16;
 
     blockId_ = GetBlockIdx();
-    rowCap_ = static_cast<uint32_t>(constInfo.batchSize * constInfo.kHeadNum); // M3C
 }
 
 template <typename LIT>
@@ -235,94 +225,11 @@ IndexerCoarseScreenServiceVector<LIT>::InitVec1GlobalTensor(GlobalTensor<MM1_OUT
 // M3:SyncAll 后的延迟行归并(行尾 fragment 所在核 = 属主)。
 // 槽 = (pairIdx*2 + seq);本核 tail 片段槽 seq=fragIsHead_?1:0,其余核:
 // cstart=行首所在核 → seq 0,其余(行头片段)→ 1。
-// M3C:槽几何 —— line = (pairIdx*2+seq);每 line = rowCap_ 行 × 8192 fp32 + 16 magic 尾
-template <typename LIT>
-__aicore__ inline uint64_t IndexerCoarseScreenServiceVector<LIT>::PartialLineBase(
-    uint32_t pairIdx, uint32_t seq) const
-{
-    return (static_cast<uint64_t>(pairIdx) * 2U + seq) * (static_cast<uint64_t>(rowCap_) * 8192U + 16U);
-}
-
-template <typename LIT>
-__aicore__ inline uint64_t IndexerCoarseScreenServiceVector<LIT>::PartialMagicBase(
-    uint32_t pairIdx, uint32_t seq) const
-{
-    return PartialLineBase(pairIdx, seq) + static_cast<uint64_t>(rowCap_) * 8192U;
-}
-
-// M3C:启动前清零本 AIV 的 magic 32B 块(seq=1 line 尾) —— 防 launch 间陈旧命中
-template <typename LIT>
-__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ZeroMyMagics()
-{
-    LocalTensor<float> z = outQueue_.AllocTensor<float>();
-    Duplicate(z, 0.0f, 8U);
-    PipeBarrier<PIPE_V>();
-    SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-    // M3D:seq=0/1 两条 line 都要清 —— 属主会 poll 行首核的 seq=0 magic
-    for (uint32_t seq = 0; seq < 2U; seq++) {
-        uint64_t base = PartialMagicBase(static_cast<uint32_t>(blockId_ >> 1), seq)
-                      + ((blockId_ & 1U) ? 8U : 0U);
-        DataCopy(partialTopkGm_[base], z, 8U);
-    }
-    SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
-    outQueue_.FreeTensor(z);
-    PipeBarrier<PIPE_ALL>();
-}
-
-// M3C:发布本 AIV magic —— 本核全部 partial 写完后(Flush 入口)调用,
-// 同核 MTE3 FIFO 保证数据先于 magic 落地
-template <typename LIT>
-__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::PublishMyMagic()
-{
-    constexpr uint32_t MAGIC = 0x5A5A00FFU;
-    LocalTensor<float> m = outQueue_.AllocTensor<float>();
-    Duplicate(m.ReinterpretCast<int32_t>(), static_cast<int32_t>(MAGIC), 8U);
-    PipeBarrier<PIPE_V>();
-    SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-    for (uint32_t seq = 0; seq < 2U; seq++) { // M3D:两条 line 都发布
-        uint64_t base = PartialMagicBase(static_cast<uint32_t>(blockId_ >> 1), seq)
-                      + ((blockId_ & 1U) ? 8U : 0U);
-        DataCopy(partialTopkGm_[base], m, 8U);
-    }
-    SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
-    outQueue_.FreeTensor(m);
-    PipeBarrier<PIPE_ALL>();
-}
-
-// M3C:spin-poll 目标核 line 尾两个 magic 块(偶+奇 AIV,64B 一读);带上限 fail-open
-template <typename LIT>
-__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::PollPartialMagic(uint32_t pc, uint32_t seq)
-{
-    constexpr uint32_t MAGIC = 0x5A5A00FFU;
-    uint64_t base = PartialMagicBase(pc, seq);
-    bool ready = false;
-    for (uint32_t spin = 0; spin < 8000000U && !ready; spin++) {
-        // M3W:事件旗标是单信用信号量,不可作自旋旗(第二轮 WaitFlag 永等挂死);
-        // PIPE_ALL 屏障无信用语义,作 tmpUb_ 复用护栏
-        PipeBarrier<PIPE_ALL>();
-        DataCopy(tmpUb_, partialTopkGm_[base], 16U);
-        SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
-        ready = tmpUb_.ReinterpretCast<int32_t>().GetValue(0) == static_cast<int32_t>(MAGIC)
-             && tmpUb_.ReinterpretCast<int32_t>().GetValue(8) == static_cast<int32_t>(MAGIC);
-    }
-    PipeBarrier<PIPE_ALL>();
-}
-
 template <typename LIT>
 __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::FlushDeferredMerges()
 {
-    // M3F2 折叠 v2:入口发布自身 magic(宣告本核 partial 全落地),等齐贡献核后折叠。
-    // 原语 = FoldMerge4(4×2048 单次归并,段长合法);槽间 PIPE_ALL(M3Z3)。
-    // defer 槽 0..3 全遍历;贡献槽 = 行首核 seq0 + (行首核,本核) 区间各核 seq1。
-    // M3F2C:同核 MTE3→MTE2 事件同步 —— 本核槽写入(主 pass MTE3)必须先于
-    // 本核槽读取(Flush MTE2)落地;PipeBarrier 不等跨管道完成(2026-09-17 同款)。
-    SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
-    // M3F4:全核屏障 —— 消灭 magic 陈旧竞态(poller 在慢核清零前读到 N-1 残留
-    // magic → 过早折叠撕裂槽)。屏障后全部主 pass(含各自 ZeroMyMagics)已完成,
-    // PublishMyMagic 后任何 poll 必见本 launch magic。参与集 = 全部 AIV(同窗口)。
-    SyncAll();
-    PublishMyMagic();
-    for (uint32_t r = 0; r < 4U; r++) {
+    constexpr uint32_t SLOT = 8U * 4096U * 2U; // 8 innerS1 × 4096×2 fp32
+    for (uint32_t r = 0; r < 2U; r++) {
         if (!deferValid_[r]) {
             continue;
         }
@@ -331,40 +238,23 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::FlushDeferredMerge
                         ? constInfo_.sparseCount
                         : constInfo_.sparseCount / 2;
         int64_t copyNum = (constInfo_.sparseCount <= SPARSE_COUNT_4K) ? 1 : 2;
-        // M3C:先等齐 —— 行首核 tail 槽(seq=0)+ head 贡献核(seq=1),再折叠
-        PollPartialMagic(deferCStart_[r], 0U);
-        for (uint32_t pc = deferFoldFrom_[r]; pc < static_cast<uint32_t>(blockId_ >> 1); pc++) {
-            PollPartialMagic(pc, 1U);
-        }
         for (uint32_t innerS1Idx = 0; innerS1Idx < deferS1Num_[r]; innerS1Idx++) {
-            // M3F3:分裂行 ws 写者 = 本核(fold) → 记入窗口行位图
-            uint32_t wrD = deferRowBase_[r] + innerS1Idx * static_cast<uint32_t>(constInfo_.kHeadNum);
-            if (wrD < 4096U) { winRowMask_[wrD >> 5] |= (1U << (wrD & 31U)); }
-            // 复位运行 topk 区,装本核行槽
+            // 复位运行 topk 区,装本核 tail 片段槽,再折入各核头片段槽
             InitSortOutBuf(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK * 2);
-            // M3F7:V 预填排空后才可 MTE2 载入覆写 acc(窗口组装路径同款事件对;
-            // 缺此对 = MTE2 与 -1 预填同址竞态 → 部分 -1 行逐 launch 漂移)
-            SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
             PipeBarrier<PIPE_V>();
-            uint64_t slotRow = static_cast<uint64_t>(deferRowBase_[r])
-                             + static_cast<uint64_t>(innerS1Idx) * constInfo_.kHeadNum;
-            uint64_t own = PartialLineBase(static_cast<uint32_t>(blockId_ >> 1), deferSeq_[r])
-                         + slotRow * 8192U;
+            uint64_t own = (static_cast<uint64_t>(blockId_ >> 1) * 2U + deferSeq_[r]) * SLOT;
             DataCopy(globalTopkUb_[innerS1Idx * virTopK * 2],
-                     partialTopkGm_[own], 4096U * 2U);
+                     partialTopkGm_[own + innerS1Idx * 4096U * 2U], 4096U * 2U);
             SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
             PipeBarrier<PIPE_V>();
             for (uint32_t pc = deferCStart_[r]; pc < static_cast<uint32_t>(blockId_ >> 1); pc++) {
-                uint32_t pseq = (pc == deferCStart_[r]) ? 0U : 1U;
-                uint64_t pslot = PartialLineBase(pc, pseq) + slotRow * 8192U;
+                uint64_t pslot = (static_cast<uint64_t>(pc) * 2U + 1U) * SLOT;
                 LocalTensor<float> pbuf = outQueue_.AllocTensor<float>();
-                PipeBarrier<PIPE_ALL>(); // M3Z3:上一轮归并/Extract 落定后再启 MTE2
-                DataCopy(pbuf, partialTopkGm_[pslot], 4096U * 2U);
+                DataCopy(pbuf, partialTopkGm_[pslot + innerS1Idx * 4096U * 2U], 4096U * 2U);
                 SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+                IndexerCoarseScreenServiceVec::MergeSort(globalTopkUb_[innerS1Idx * virTopK * 2], virTopK,
+                                                         pbuf, 4096U * 2U, tmpUb_);
                 PipeBarrier<PIPE_V>();
-                IndexerCoarseScreenServiceVec::FoldMerge4(globalTopkUb_[innerS1Idx * virTopK * 2],
-                                                          pbuf, tmpUb_);
-                PipeBarrier<PIPE_ALL>();
                 outQueue_.FreeTensor(pbuf);
             }
             for (int64_t i = 0; i < copyNum; i++) {
@@ -572,24 +462,12 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
             if (fragEnd) {
                 // M3:fragment 收尾 —— 运行 top-4096 写本 pair 槽(head=1/tail=0);
                 // 行尾且为 head 片段 → 跨核 fragmented 行,记录延迟归并(SyncAll 后)
-                // M3C:槽 per-请求行(line = pair*2+seq;行 = indiceOutOffset/sparseCount),
-                // 消除 tile(请求)间槽复用 → 一次 Flush 折叠即正确
-                // M3F5B:槽写(MTE3 读 acc)前等 V 合并落定 ——
-                // V_MTE3 = 窗口循环尾同款生产事件对;F2D 失败疑因 MTE2_MTE3 陌生对
-                SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-                PipeBarrier<PIPE_ALL>();
+                constexpr uint32_t SLOT = 8U * 4096U * 2U;
                 uint32_t seq = fragIsHead_ ? 1U : 0U;
-                uint64_t wslotRow = static_cast<uint64_t>(info.indiceOutOffset / constInfo_.sparseCount)
-                                  + static_cast<uint64_t>(innerS1Idx) * constInfo_.kHeadNum;
-                uint64_t pslot = PartialLineBase(static_cast<uint32_t>(blockId_ >> 1), seq)
-                               + wslotRow * 8192U;
-                // M3F6R:直写恢复(F7 读侧 V_MTE2 为真根因修复;队列协议系误诊产物)
-                DataCopy(partialTopkGm_[pslot],
+                uint64_t pslot = (static_cast<uint64_t>(blockId_ >> 1) * 2U + seq) * SLOT;
+                DataCopy(partialTopkGm_[pslot + innerS1Idx * 4096U * 2U],
                          globalTopkUb_[innerS1Idx * virTopK * 2], 4096U * 2U);
-                // M3F5:槽写(MTE3 读 acc)排空后下一 tile 才可覆写 acc
-                SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
-                SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
-                if (isS2End && fragIsHead_) { // M3C:按行记录(每 tile 恒 1 行)
+                if (isS2End && fragIsHead_ && innerS1Idx == 0) {
                     // cstart 反向步进:unitStart(c)=c*cap+min(c,deal1More) ≤ uStart
                     uint32_t pairIdx = static_cast<uint32_t>(blockId_ >> 1);
                     uint64_t uEnd = static_cast<uint64_t>(info.unitStartSelf) +
@@ -601,19 +479,12 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
                         uint32_t pc = cstart - 1;
                         uint64_t us = static_cast<uint64_t>(pc) * info.unitCap +
                             (pc < info.deal1More ? pc : info.deal1More);
-                        cstart = pc; // M3I:pc 恒入候选;us<=uStart 即 pc=行首核
-                        if (us <= uStart) { break; }
+                        if (us > uStart) { cstart = pc; } else { break; }
                     }
-                    uint32_t slot = 4U;
-                    for (uint32_t e = 0; e < 4U; e++) {
-                        if (!deferValid_[e]) { slot = e; break; }
-                    }
-                    if (slot < 4U) { // M3C:容量 4(R≤96);溢出行退化为单核结果
+                    uint32_t slot = deferValid_[0] ? 1U : 0U;
+                    if (!deferValid_[1] || !deferValid_[0]) {
                         deferValid_[slot] = true;
                         deferCStart_[slot] = cstart;
-                        deferFoldFrom_[slot] = cstart + 1U; // 行首核走 seq=0 槽,head 槽从下一核起
-                        deferRowBase_[slot] = static_cast<uint32_t>(
-                            info.indiceOutOffset / constInfo_.sparseCount);
                         deferS1Begin_[slot] = static_cast<uint32_t>(cuS1BeginIdxPerAiv);
                         deferS1Num_[slot] = static_cast<uint32_t>(cuS1ProcNumPerAiv);
                         deferIndiceOff_[slot] = static_cast<uint64_t>(info.indiceOutOffset);
@@ -622,11 +493,8 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
                 }
             }
             bool needCopyOutGm = blockS2StartIdx_ == 0 && isS2End && !fragIsHead_;
+
             if (needCopyOutGm) {
-                // M3F3:完整行 ws 写者 = 本核 → 记入窗口行位图
-                uint32_t wr = static_cast<uint32_t>(info.indiceOutOffset / constInfo_.sparseCount)
-                            + static_cast<uint32_t>(innerS1Idx) * constInfo_.kHeadNum;
-                if (wr < 4096U) { winRowMask_[wr >> 5] |= (1U << (wr & 31U)); }
                 // 生产形态 CopyOut: Extract 分离 globalTopkUb_ 的 (value,index) 交错对,经 outQueue_
                 //   EnQue/DeQue 缓冲后拷贝 idx 到输出。coarse_screen 无 value 输出,只拷贝索引。
                 //   索引即 0-based 逻辑 key 位置(S2 扫描域 = 连续前缀),无候选列号间接层。
@@ -827,7 +695,42 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessGroupMean(u
 // 尾部 -1 补齐到 outW(与 torch _inject_local_window 逐位一致:有效数 = min(upper,c),topk 行内
 // -1 恒在尾部);aslk'[r] = validC + nNew。hasWindow=0 时主 pass 已直写输出,仅算 aslk'=min(upper,c)。
 template <typename LIT>
-__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPipe *pipe, uint32_t rBegin, uint32_t rEnd, bool useMask)
+__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::EmitIdentityRows(uint32_t rowCount)
+{
+    // 空请求行(upper==0)的恒等直写:池域为空,候选行 = [0, own)。
+    // 纯 S 管道标量 + 一次 DataCopyPad;不读 ws(主 pass 从未写这些行)、
+    // 不进 ProcessWindow(避免与配对分区的 SyncAll 参与集混淆)。
+    // aslk' 用 aux 逐行直写(DataCopyPad 4B)。
+    LocalTensor<int32_t> outI32 = winOutBuf_.Get<int32_t>();
+    LocalTensor<int32_t> auxI32 = winAuxBuf_.Get<int32_t>();
+    uint32_t prevCum = 0U; // 行 0 的 cumBegin
+    for (uint32_t r = 0; r < rowCount; r++) {
+        uint32_t cumEnd = callerSeqLenGmQ_.GetValue(r);
+        uint32_t own = cumEnd - prevCum; // 2026-09-24 P3: cumBegin≡上行 cumEnd,滚动缓存省每行 1 次标量 GM 读
+        prevCum = cumEnd;
+        const uint32_t W = constInfo_.outW;
+        Duplicate(outI32, constInfo_.INVALID_IDX, W);
+        PipeBarrier<PIPE_V>();
+        SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+        for (uint32_t k = 0; k < own && k < W; k++) {
+            outI32.SetValue(k, static_cast<int32_t>(k));
+        }
+        SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+        SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+        DataCopyPad(candidatesOutGm_[r * W], outI32,
+                    {1, static_cast<uint16_t>(W * sizeof(int32_t)), 0, 0});
+        auxI32.SetValue(0, static_cast<int32_t>(own));
+        SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+        DataCopyPad(aslkOutGm_[r], auxI32, {1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0});
+        // 行间 outI32 复用护栏:事件类方案实测全不可靠(坑 #45),空行路径低频,
+        // 直接 PIPE_ALL 排空(含 MTE3)—— 下一行 V 重填绝对安全。
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+    SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
+}
+
+template <typename LIT>
+__aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPipe *pipe, uint32_t rBegin, uint32_t rEnd)
 {
     // 行范围由 kernel 传入(= 同对 AIC 的 SplitCore 精确请求范围,偶 AIV 承担):
     // 行 r 的候选行由主 pass 的 AIV 2r CopyOut(MTE3)写出 —— 本分区让 AIV 2r 同时
@@ -890,8 +793,6 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         LocalTensor<int32_t> mskI32 = winMskBuf_.Get<int32_t>();
         uint32_t prevCum = (rBegin == 0) ? 0U : callerSeqLenGmQ_.GetValue(rBegin - 1);
         for (uint32_t r = rBegin; r < rEnd; r++) {
-            if (useMask && !(winRowMask_[r >> 5] & (1U << (r & 31U))) && aslkGm_.GetValue(r) != 0U) { continue; }
-            if (useMask) { prevCum = (r == 0) ? 0U : callerSeqLenGmQ_.GetValue(r - 1); }
             DataCopy(dumpCand, candidatesWsGm_[r * c], c);
             PipeBarrier<PIPE_MTE2>();
             SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
@@ -991,10 +892,6 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
     uint32_t prevCum = (rBegin == 0) ? 0U : callerSeqLenGmQ_.GetValue(rBegin - 1);
     for (uint32_t r = rBegin; r < rEnd; r++) {
         uint32_t upper = aslkGm_.GetValue(r);
-        // M3F9:无写者行仅零域行(upper==0)进入 dedup —— validC==0 恒等分支
-        // (全零批同款),偶 AIV 冗余写同内容竞态无害;非零域行必有唯一写者核
-        if (useMask && !(winRowMask_[r >> 5] & (1U << (r & 31U))) && upper != 0U) { continue; }
-        if (useMask) { prevCum = (r == 0) ? 0U : callerSeqLenGmQ_.GetValue(r - 1); }
         uint32_t cumEnd = callerSeqLenGmQ_.GetValue(r);
         uint32_t own = cumEnd - prevCum; // P3: cumBegin≡上行 cumEnd,滚动缓存省每行 1 次标量 GM 读
         prevCum = cumEnd;
@@ -1004,13 +901,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         // 此处不再有其他裸写。
         if (!constInfo_.hasWindow) {
             // 纯粗筛模式:主 pass 已直写输出(行距 = outW = coarseCount),仅算 aslk'
-            if (useMask) {
-                auxI32.SetValue(64, static_cast<int32_t>(validC));
-                SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
-                DataCopyPad(aslkOutGm_[r], auxI32[64], {1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0});
-            } else {
-                auxI32.SetValue(64 + (r - rBegin), static_cast<int32_t>(validC));
-            }
+            auxI32.SetValue(64 + (r - rBegin), static_cast<int32_t>(validC));
             continue;
         }
         // 2026-09-17 竞态终修(A3 判决实证):dedup 首个 Sub(V) 可越过未完成的
@@ -1120,13 +1011,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
         SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
         DataCopyPad(candidatesOutGm_[r * W], outI32, {1, static_cast<uint16_t>(W * sizeof(int32_t)), 0, 0});
-        if (useMask) {
-            auxI32.SetValue(64, static_cast<int32_t>(validC + nNew));
-            SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
-            DataCopyPad(aslkOutGm_[r], auxI32[64], {1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0});
-        } else {
-            auxI32.SetValue(64 + (r - rBegin), static_cast<int32_t>(validC + nNew));
-        }
+        auxI32.SetValue(64 + (r - rBegin), static_cast<int32_t>(validC + nNew));
         // 2026-09-24 竞态第六例根修(R≥25 多行核 NONDET 全量判决 + tail 延伸核行5
         // 污染统一解释):行间复用 outI32 缺 MTE3 排空 —— 本行 DataCopyPad(MTE3
         // 读 outI32)未落地时,下一行 validC>0 走 MTE2 装载覆写 [0,c)、validC==0
@@ -1140,7 +1025,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessWindow(TPip
         SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
         SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
     }
-    if (!useMask && rEnd > rBegin) {
+    if (rEnd > rBegin) {
         SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
         DataCopyPad(aslkOutGm_[rBegin], auxI32[64],
                     {1, static_cast<uint16_t>((rEnd - rBegin) * sizeof(int32_t)), 0, 0});

@@ -1,0 +1,6 @@
+g,status,coarse_us,refine_us,C_range,det
+1,PASS,148.1,113.8,"[11,65535]",det=True
+2,PASS,150.8,114.8,"[4,65535]",det=True
+4,PASS,153.9,122.5,"[-1,65535]",det=True
+8,PASS,161.0,138.0,"[-1,65535]",det=True
+16,PASS,180.5,154.6,"[-1,65535]",det=True

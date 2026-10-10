@@ -473,3 +473,12 @@ probe 全部种子恰好精确)。门限状态:probe 7/7 位级过;AIME 门待�
 ## 教训(工具纪律追加)
 两行调用注释必须两行同处理(3 次踩坑);gen 目录取整目录删;每次 build 核对
 SYNCED 时间戳;多文件实验一律 python 补丁+marker 计数,禁多层 sed。
+
+
+## M6 后续门状态(2026-10-11 凌晨收口)
+- probe_m1a 7/7 位级过 ✓;阶梯 6 点过 ✓;sweep 全形状完成 ✓;M6 commit 478534c3 已推 GitHub。
+- CASES 门阻塞:plans/probe.py(语义金标,plumbing_probe/CASES/build_case/
+  golden_torch_full/judge 五件套)为 .82 未跟踪文件,随 .82 丢失,从未入 git。
+  重建路径:按 test.py 的 API 依赖面(194-215 行)重写语义金标模块(数小时)。
+- AIME 门阻塞:.202 无权重(/data 不挤占),权重仅在 .206;待权重迁移或回 .206 跑。
+- 下杠杆:64K 档仍落后 LI(0.79-0.88x)——固定路径地板消融(M5-3),或提高剪枝率。

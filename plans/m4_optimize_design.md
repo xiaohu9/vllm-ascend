@@ -274,3 +274,11 @@ F2 TMPUB wait 移 Consume 自序;F3 merge scratch 本块 region 化)。
 两遍 topk 剪枝),非流水侧。
 附:÷2 判定(pre-M3 3dac860c vs M3,热身,卡4):256K-R16 1362.8→506.5(0.37x)、
 256K-R32 2701.9→959.4(0.36x)大形状达成;2K 档回退~35%(M3 固定开销,挂账)。
+
+## 下一杠杆第一刀实验(2026-10-10 深夜):s2BaseSize 512→1024 = 507015,挂起待审计
+动机:块数减半 → sort/merge 轮次减半(算法侧削减归并量,M4 系收口后的正路)。
+结果:全形状(含 R8_L512)507015 aicore exception —— 非 UB 容量问题(tmpBuf_ 40KB/
+reduceOutBuf_ 20KB 均在预算内),是 SortAll/DoScale/CopyIn 链存在 s2=512 隐含假设
+(段长/对齐/tile 形状)。已回退 1862c00a 并重建确认 BASELINE_GREEN。
+下周期入口:审计 SortAll(cuS2LenVecAlign=1024)的 MrgSort 段参数、mm1 tile
+16x1024 的 AIC 路径、mmUbStride 负值风险;逐段 printf 定位后改。

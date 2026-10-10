@@ -365,3 +365,25 @@ SetFlag(V_MTE2,MTE2_V)/WaitFlag(TMPUB)/InitSortOutBuf 脚手架)=仍炸。
 —— 下轮 E8 = E7 基础上再 if(false) 外层条件(=E1b 带陈旧 stubs),逐步复活片段二分;
 或直接怀疑 SetFlag(MTE2_V,pp) 的 pp 信用序列在 1024 态与 mm1 时序的交互。
 工具纪律:每次 build 后核对 SYNCED 时间戳必须刷新;gen 目录取整目录删。
+
+
+## s2=1024 真相表(2026-10-10 深夜六,E8 定案,groupInner_=4 干净态全部有效构建)
+- E1b 块体 if(false) 全关 = PASS
+- E8 CopyIn/DoScale/DoReduce/SortAll stub(merge/Extract/CopyOut 活)= FAULT
+- E7 +merge/Extract/CopyOut/fragEnd 全关(仅剩 AllocTensor/FreeTensor、PipeBarrier、
+  SetFlag(MTE2_V,pp)/WaitFlag(MTE2_V,pp)/SetFlag(V_MTE2,pp)、WaitFlag(TMPUB)、
+  reduceOutInner 切片、mmUbStride 标量)= FAULT
+- E8 + win0 = FAULT(窗口段在干净态二次排除)
+结论:故障存在于 E1b 与 E7 的 delta 集合——全部是"平凡"脚手架片段,最可疑:
+  1) SetFlag(MTE2_V,pp)/WaitFlag(MTE2_V,pp)/SetFlag(V_MTE2,pp) 信用序列与
+     AIC mm1(16x1024)的时序交互(pp 恒 0@outerG=1,信用往返宽度和 512 态相同,
+     但 MTE2 队列深度/PC 读写宽度变了);
+  2) reduceCacheBuf=AllocTensor(33KB)——DoScale 关闭后虽无人写,但 TQue 本身无害;
+  3) outQueue_/reduceOutBuf_ 的 TPipe 总量(197KB@gi=8 失败、160KB@gi=4 失败、
+     131KB@512 通过)—— 上限若在 131~160KB 之间,则 E7 的 FAULT 与 TPipe 一致,
+     而 E1b PASS 恰因 if(false) 让编译器把大缓冲的**消费者**全删(分配仍在!)——
+     注意 E1b 的 InitBuffer 仍在,若纯容量问题 E1b 也应炸 → 容量非唯一根因。
+下轮:①E9 = E1b + 仅复活 AllocTensor/FreeTensor(区分容量 vs 交互);
+②E10 = E1b + 仅复活三个 Set/WaitFlag(定位信用交互);
+③工具:dump pc 反查(需 ndk objdump,+0x188 偏移映射)。
+回退点:7f582dee(GREEN)。经验:两行调用的 stub 必须两行同注释;gen 目录取整删。

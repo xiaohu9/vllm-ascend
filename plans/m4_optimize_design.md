@@ -309,3 +309,15 @@ elementLengths 单位 = 对(8B;SortAll 内 src2 偏移 = 2*mrgElements 证实为
 剩余嫌疑(下轮顺序):①SortAll@1024 实际支持性(注释 vs arch22 实现差异,sort32Repeats=32
 与 MrgSort 合并树 512 对末段);②AIC mm1 tile 16×1024(FFTS 寄存器/cube 路径);
 ③DoScale/CopyIn 的 1024 跨距。定位工具:mssanitizer 完整跑(不截断)+ dump pc 反查。
+## s2=1024 强嫌疑终版(2026-10-10):MergeSort >3072 分支 MrgSort 输出总量溢出 tmpTensor
+分支逻辑:elementLengths=[mrgQuelen1*1024, quelen2*1024, quelen3*1024, mrgSrcNum](对),
+MrgSort 输出 = Σ队列(对)×8B 全量写 tmpTensor(=outQueue_,32768B)。
+s2=512:Σ=(2048+1024+1024+1024)=5120 对=40KB → 溢出 8KB 到相邻 UB(侥幸不炸,垃圾靠
+  -inf 沉底;DataCopy 回写只取前 mrgDstNum*2=8192 floats=32KB,故结果正确);
+s2=1024:Σ=6144 对=48KB → 溢出 16KB,踩坏相邻 TBuf → VEC 参数非法 507015(与
+  fftsplus aivector @ 奇 AIV 吻合:溢出点随 region/对齐落在 V 重活缓冲)。
+该理论同时解释:①512 侥幸正确;②1024 必炸;③src 减半证伪(5120 对仍 40KB>32KB)。
+修法方向(下轮):A. outQueue_ 扩到 Σ×8B(UB 预算 32→48KB,需重排 InitBuffer);
+B. MrgSort 前把 src 预剪枝(块最大值 < acc 第 4096 名则跳过合并——兼得算法收益);
+C. 拆两次 MrgSort(dst 三分 vs src 两半,中转缓冲)。A 最小,B 兼性能,C 最稳。
+简报达标线:256K-R4 coarse ≤240µs;失败退 5bd314b0(GREEN)。

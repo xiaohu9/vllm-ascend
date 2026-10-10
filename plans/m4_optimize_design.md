@@ -282,3 +282,14 @@ reduceOutBuf_ 20KB 均在预算内),是 SortAll/DoScale/CopyIn 链存在 s2=512 
 (段长/对齐/tile 形状)。已回退 1862c00a 并重建确认 BASELINE_GREEN。
 下周期入口:审计 SortAll(cuS2LenVecAlign=1024)的 MrgSort 段参数、mm1 tile
 16x1024 的 AIC 路径、mmUbStride 负值风险;逐段 printf 定位后改。
+
+## s2=1024 审计进展(2026-10-10 深夜二)
+异常 dump 实锤:**fftsplus aivector error, core 3(奇 AIV), vec error info 0xe311372a8a**
+= 纯 VEC 指令参数非法 → 嫌疑收敛至 Sort32/MrgSort 链 @1024:
+  a) SortAll:sort32Repeats=32、merge 末轮 MrgSort elementLengths=512,512(合法);
+  b) pair-merge v2 的 MergeSort(dst=virTopK, src=tmpSortBuf, s2Base*2=2048):
+     elementLengths = [1024,1024] = **恰在 v11 实证单 repeat 1024 对上限** ← 头号嫌疑;
+  c) 崩溃过快导致设备 printf 缓冲不冲刷(K10-K14 零输出),插桩法对此失效,
+     改用 mssanitizer --kernel-name=IndexerCoarseScreen 定位(注意其报告里
+     ReduceMean 的 VECTOR_MASK 告警是 caller torch op 的已知噪音,非我算子)。
+  下轮:①对 b) 把 MergeSort 拆两段或 elementLengths 减半验证;②sanitizer 精确定位。

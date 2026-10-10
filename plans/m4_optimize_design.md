@@ -305,3 +305,7 @@ elementLengths 单位 = 对(8B;SortAll 内 src2 偏移 = 2*mrgElements 证实为
 修法(下轮一刀):MergeSort 两分支的 elementLengths 统一改对数 ——
   que3 = mrgSrcNum/2(元素数→对数),if 分支同;或调用方改传 s2BaseSize_(对数)。
   改后阶梯+probe 全绿 → 热身 sweep → 达标(256K-R4 ≤200)→ 里程碑 commit。
+证伪更新:src 队列减半(元素数→对数)后 s2=1024 仍全形状 507015 → 源队列单位假设排除。
+剩余嫌疑(下轮顺序):①SortAll@1024 实际支持性(注释 vs arch22 实现差异,sort32Repeats=32
+与 MrgSort 合并树 512 对末段);②AIC mm1 tile 16×1024(FFTS 寄存器/cube 路径);
+③DoScale/CopyIn 的 1024 跨距。定位工具:mssanitizer 完整跑(不截断)+ dump pc 反查。

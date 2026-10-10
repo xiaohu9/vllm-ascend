@@ -342,3 +342,11 @@ groupInner_=8(197KB)后仍炸 → 还有第二个超限源未消:
   ②cube 侧 S2_BASIC_BLOCK 常量来源(若 =s2BaseSize 派生则 L1/L0 也超);
   ③TPipe 上限实测:构造半尺寸 InitBuffer 看 507015 是否消失。
 路线判定:DEBUG 轮不计放弃(纪律修订),s2=1024 保持活跃,直到有实测性能数据。
+## s2=1024 追加证伪(2026-10-10 深夜四)
+groupInner_=8(197KB)与 =4(160KB)均仍炸;cube 侧 S2_BASIC_BLOCK=256 固定,②排除。
+TPipe 容量理论动摇(160KB 仅比正常 512 态 131KB 高 30KB,若上限真在 131~160KB 之间
+则 A3 TPipe 上限异常小,更可能是别的超限源)。E1/E2/E3 stub 是在 groupInner_=16 态做的
+——下轮先在 groupInner_=4 态重跑 E1(块体 stub)复判:若块体 stub 现在能过,
+说明 16→4 后故障已移位回块内(DoScale/SortAll 的 groupInner 关联尺寸)。
+工具链:sanitizer --kernel-name 完整跑不截断;dump pc 反查。
+回退点:65e491c5(GREEN)。

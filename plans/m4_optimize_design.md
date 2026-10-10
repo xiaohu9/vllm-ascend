@@ -387,3 +387,19 @@ SetFlag(V_MTE2,MTE2_V)/WaitFlag(TMPUB)/InitSortOutBuf 脚手架)=仍炸。
 ②E10 = E1b + 仅复活三个 Set/WaitFlag(定位信用交互);
 ③工具:dump pc 反查(需 ndk objdump,+0x188 偏移映射)。
 回退点:7f582dee(GREEN)。经验:两行调用的 stub 必须两行同注释;gen 目录取整删。
+
+
+## s2=1024 片段二分进展(2026-10-10 深夜七)
+E9(E1b+AllocTensor/FreeTensor 复活)= PASS → 容量单独不触发(197KB TPipe 分配+释放无恙);
+E10(E9+MTE2_V/V_MTE2 旗往返)= PASS → 旗交互单独不触发。
+下一刀:E11 = E10 + 真实 DoScale 复活(python 补丁在 e9buf 段注入完整 DoScale 调用:
+rc=AllocTensor; SetFlag/WaitFlag(MTE2_V,0); DoScale(rc[64], tmpUb_[0], tmpUb_[4096],
+tmpUb_[4096].ReinterpretCast<W_T>(), brcBuf_.Get<float>(), 4, 1024, 0);
+SetFlag/WaitFlag(V_MTE2,0); FreeTensor)—— 读垃圾 UB 但指令参数合法,
+若炸即 DoScale 内部 1024 假设(fftsplus aivector 高度吻合 VEC 重活)。
+注意:sed 对两行调用注释必须两行同处理(已三次踩坑);E10 态树无 E5 stub,
+直接 sed 解注释会空转(已踩)。用 patch 脚本注入。
+若 DoScale 炸:读 DoScale 实现(vector.h)找 512 段假设;修之 → 全量再生(H28:
+删 gen 整目录)→ 阶梯+probe 7/7 → sweep → 256K-R4 ≤240µs → AIME 随门 → 里程碑 commit。
+当前树:E9+E10 态(已知 PASS 配置,s2=1024+gi=4+if(false)+alloc+flags,未 commit)。
+回退点:ba39c9f6(GREEN)。

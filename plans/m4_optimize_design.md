@@ -583,3 +583,18 @@ R16:2K 63.1/36.3(1.74× 落后)→ 20K 131.3/123.5(1.06×)→ 64K 285.6/327.5
   多块形状下 CopyOut 写垃圾索引会 GM 越界(单块 L512 是安全的测时点);
 - graph-replay K 渐近:K=20 已收敛(K=1 含 ~290µs 图机制固定成本)。
 - 环境状态:本判决后工作树 = eaa7203f 干净基线,probe 7/7。
+
+## M5-3 候选3关闭(2026-10-11 追加)
+
+epilogue SyncAll(L857,主 pass 后窗口段前)**不可移除**:读其历史注释,
+2026-09-24 P6 曾移除入口三件套(PIPE_ALL+MTE3_MTE2+SyncAll),生产 burst/gsm8k
+复现随机 AICORE fault(VEC 参数非法,IndexerRefine AIV 尾部),2026-09-28
+d7002bac 恢复为深度防御。该屏障是已知生产事故的对价,候选3正式关闭。
+若未来要移除,必须先重解 S7/SVEC 形态的窗口竞态(真因 SplitCore 分核 bug
+已根修,但 09-28 的 fault 在新循环结构下重现过,风险未清零)。
+
+剩余活跃候选:①小 L 路由 V-only 模式(结构性,预估 2K 档 63→~40µs);
+②批量握手(砍每块 C1V1/V1C1 往返,mm1 pingpong 2 槽约束需扩槽)。
+实施入口:Kernel.h L767-775 AIC/AIV 分支即握手点;V-only 路线在 over-2K
+路由(Host 侧 isSparseCountOver2K)旁增加小 L 分支,复用 DoScale 的
+DotProduct 化( weights·mm1 )替代 Cube。

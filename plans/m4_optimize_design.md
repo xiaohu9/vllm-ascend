@@ -544,3 +544,42 @@ iid 分数下,块(512 候选)最大值 < 全局第 K 名(保留率 K/L=4096/2621
 - sweep:256K-R16 coarse=964µs、256K-R32 coarse=1896µs(基线档)
 - 真实分数分布(局部性强)下剪枝率可能非零,但需先解决"无损验证只能靠逐位
   对拍"的验证成本;在有真实工作负载证据前不重启本方向。
+
+## M5-3 固定路径地板定界判决(2026-10-11,graph-replay K=50 渐近口径)
+
+**地板构成(单块 L=512,R=4,设备端 kernel 时长)**:
+- 完整 kernel(coarse L=512)= 42.3µs;L=2K = 51.6µs(边际 ~3.8µs/块);
+  L=64K = 116.8µs。profiler 实测设备端 kernel 时长 46.5-48.2µs(L=2K)——
+  **地板几乎全在 kernel 内部执行,非 launch/gap 空窗**。
+- 掏空 AIV 计算体(DoScale/DoReduce/SortAll/MrgSort/MergeSort,旗协议原样)=
+  43.8µs → **V 计算非关键路径**;
+- 再掏空 AIC ComputeMm1 = 40.8µs → **mm1 ≈ 3µs**;
+- E-FILL(InitSortOutBuf 预填掏空)= 40.2µs → **预填 ≈ 2µs**;
+- E-MISC(ArithProgression/双 SyncAll/Extract+CopyOut 掏空)撞协议墙
+  (SyncAll↔magic 互锁,stub 即 aicore fault)——剩余 ~35µs 归属:
+  **AIC↔AIV 跨核旗链(每块 C1V1/V1C1 往返)+ CopyIn/Extract/CopyOut MTE2/MTE3 +
+  双 SyncAll + 窗口组装**。
+
+**结构结论:LI 是纯 V 核(无 AIC、无跨核旗、无 SyncAll),天然地板 ~29µs;
+我们的 MIX 架构(24 AIC+48 AIV)地板 ~40µs 是协议结构成本,非计算成本。**
+
+### 差距结构(权威 CSV,coarse vs LI)
+R16:2K 63.1/36.3(1.74× 落后)→ 20K 131.3/123.5(1.06×)→ 64K 285.6/327.5
+(**1.14× 领先**)→ 128K 509.2/626.5(1.23×)→ 256K 964.0/1217.5(**1.26× 领先**)
+—— **≥64K 已反超 LI 且随 L 增大优势增大(1.14→1.23→1.26)**;落后仅 2K-20K
+(地板病)。整链(coarse+refine)vs LI 单算子:256K 1174 vs 1217(1.04×)。
+
+### 下一杠杆(地板刀的实施候选,按风险排序)
+1. **小 L 路由 V-only 模式**:块数 ≤ 阈值时 AIC 不参与(mm1 由 AIV 用
+   DotProduct/小 GEMM 替代),砍掉整条跨核旗链——结构性对齐 LI 地板。
+   预估:2K 档 63→~40µs,20K 131→~100µs,64K 285→~255µs。
+2. 批量握手:AIC 一次算全部块 mm1 再统一放行(砍每块旗往返);
+   约束:mm1 pingpong 仅 2 槽,需扩槽或分批。
+3. epilogue SyncAll(L857)若可证冗余则删(与 L323 magic 屏障不同源,
+   单独 stub 可测,注意与窗口组装的时序依赖)。
+
+### 工具记录
+- stub 消融教训:SyncAll(L323)是 magic 协议屏障,掏空即 fault;
+  多块形状下 CopyOut 写垃圾索引会 GM 越界(单块 L512 是安全的测时点);
+- graph-replay K 渐近:K=20 已收敛(K=1 含 ~290µs 图机制固定成本)。
+- 环境状态:本判决后工作树 = eaa7203f 干净基线,probe 7/7。

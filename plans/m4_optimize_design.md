@@ -766,3 +766,23 @@ pp=loop&1 区域键、merge scratch 本块区物化(LocalTensor 具名局部,非
 - 先 A1(零风险)验证流水收益方向,再评估 A2/A3。
 
 树已恢复绿基线,probe 7/7。
+
+## 方案A1 首版挂死复盘(2026-10-11 深夜二,编译全绿,运行期 507014 族)
+
+A1(行 0 预取版)全部机械件落地+编译通过,probe 全 case 运行期挂死(含 L512
+单块)。旗账纸面推导守恒(V_MTE2 种子×2/每 pp 每 block MTE2_V set1 wait1/
+V1C1 2+n=2+n),逐项检查未破——**需要设备端证据定位挂点**,下轮入口:
+1. ascend log / plog 找挂死核与 PC(offending pc 反查,ndk objdump);
+2. 或 msprof timeline 看卡在哪个旗(AIC Wait V1C1 / AIV Wait C1V1 /
+   AIV Wait MTE2_V / Wait V_MTE2);
+3. 逐段复活二分:E-A1a = 仅 KH 流水形+Load 原样全跑(不早退,验证 infoRing/
+   成员/epilogue 骨架);E-A1b = +早退(定位早退是否引入);
+4. 嫌疑清单:①Load(0) 早退跳过 row 循环后续——under-2K 路径的 CopyIn 段
+   结构是否与 over-2K 共用同一锚点段(若 under-2K 走别的分支,早退点语义
+   不同);②prevVecInfo_ 的 RunInfo 复制是否漏字段(引用型成员?);
+   ③Consume(n-1) 与 Load(n) 的 prologue 重置分支跨周期竞态(s2Idx==0 时
+   Load 先擦 acc/ pairFilled_,Consume(n-1) 后读——单周期形状不触发,多周期
+   才炸;但 L512 单块也挂 → 另有因);④TMPUB 旗与早退交互。
+5. 机械资产可复用:patch_m53a1.py(锚点级幂等)+ fix 系列;回退即绿。
+
+树已恢复绿基线,probe 7/7。AIME 门仍待卡协调。

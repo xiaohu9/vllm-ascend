@@ -741,3 +741,28 @@ mm1),而是逐块延迟链的流水化**:
    prevInfo=runInfo;Set(V1C1)。AIC 分支原样。尾块 Consume 在 AIV epilogue
    FreeEventID 前。Consume(n-1) 须完成于窗口/flush 读 acc 前(它在主循环内,
    flush 在其后 ✓)
+
+## 方案A 首版复盘(2026-10-11 深夜,fault 回退,重设计规格)
+
+**已落地并验证的机械部分**(重建+probe 全通过后才 fault 于运行期):
+prevVecInfo_/hasPrevVec_ 类成员(跨 ProcessBaseBlock 存活)、KH AIV 分支流水形、
+epilogue 尾块消费、ProcessVecLoad/Consume 包装器与 vecLoadStage_ 开关、
+pp=loop&1 区域键、merge scratch 本块区物化(LocalTensor 具名局部,非 const 引
+用不绑临时)。
+
+**运行期 fault 根因(设计级,非实现级)**:
+1. 早退用 return 跳过整函数 → 其余行的 CopyIn 从未发起(行循环内 Continue 才对);
+2. 更深:**块内多行共用一个 tmpUb_ 区**(每行 CopyIn 覆写前行数据,原串行下
+   DoScale 即时消费无害;流水下 Load 全行连发 = 行 0 数据被行 1 覆写)。
+   区容量=单行 g×512,UB 预算紧(2 区)装不下 4 行。
+
+**重设计方向(下轮入口)**:
+- A1:Load 只预取行 0,Consume 行 1..N-1 保持串行 CopyIn(收益=首行 CopyIn
+  延迟隐藏,~1-2µs/块,小但安全);
+- A2:CopyIn 改 per-row 区(需 tmpUb_ 扩 2×行数 区,TPipe 预算审计先行——
+  s2=1024 教训:TPipe 上限敏感);
+- A3:块内行合并:多行的 mm1 数据一次 CopyIn(连续 GM 布局?mm1ResGm 按行
+  分散,需 AIC 侧 mm1 输出重排——动 AIC)
+- 先 A1(零风险)验证流水收益方向,再评估 A2/A3。
+
+树已恢复绿基线,probe 7/7。

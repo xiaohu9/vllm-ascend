@@ -598,3 +598,21 @@ d7002bac 恢复为深度防御。该屏障是已知生产事故的对价,候选3
 实施入口:Kernel.h L767-775 AIC/AIV 分支即握手点;V-only 路线在 over-2K
 路由(Host 侧 isSparseCountOver2K)旁增加小 L 分支,复用 DoScale 的
 DotProduct 化( weights·mm1 )替代 Cube。
+
+## refine 地板定性(2026-10-11 追加,profiler 设备端口径)
+
+refine c512=45.2µs / c2048=49.0µs(wall 47.5/52.6)——**与 coarse 同病:地板
+几乎全在 kernel 内部**。结构确认:refine 也是 MIX(kernel.h 12 处 CrossCore/
+SyncAll,vector/cube service 0 处)→ 同一杠杆(批量握手)适用,同一实施模式
+(Kernel.h 握手分支 + GM 槽扩容)。
+
+**批量握手实施清单(两算子通用,下次会话入口)**:
+1. Host tiling:mm1ResGm/refine 中间 GM 槽 ×N(N=min(块数,8),需新 tiling 字段,
+   GM 预算小 L 下有裕量);
+2. Kernel AIC:小 N 时无 Wait 连发 N 块 mm1,统一 Set(C1V1) 一次;
+3. Kernel AIV:每 N 块 Wait 一次;V1C1 信用同批归还;
+4. 验证:bench_m53b 六点渐近 + probe 7/7 + 全阶梯 sweep + AIME 随门;
+5. 风险:批内槽覆盖序(读者=写者 + 槽位图,M3 同款模式)。
+
+预期:2K 档 coarse 63→~45µs、refine 116→~90µs;64K coarse 285→~255µs;
+对 LI 的落后档(2K-20K)收敛一半以上。

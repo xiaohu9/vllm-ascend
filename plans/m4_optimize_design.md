@@ -709,3 +709,19 @@ mm1),而是逐块延迟链的流水化**:
 - 验证链:bench_m53b 六点 + probe 7/7 + sweep + AIME 随门
 
 树已恢复绿基线,probe 7/7。
+
+## 方案A实施前置事实(2026-10-11 深夜)
+
+- 当前树 ProcessVec 为单函数(service_vector.h L419),无 Load/Consume 分裂
+  ——M4-5 实验 patch_m45.py 锚点全部基于其已回退的实验态,直接重放必然失配
+  (A-members 已误落 3 行成员,已 git checkout 恢复,树干净)
+- 方案A fresh 实施:①ProcessVec 竖切为 VecLoad(RunInfo 记账+发起 CopyIn,即
+  现 L419 函数的 CopyIn 段)与 VecConsume(DoScale→DoReduce→sort→merge→CopyOut);
+  ②KH 主循环改 {Consume(gloop-1); Load(gloop);} 尾部 ConsumeLast;③infoRing_[2]
+  存块 RunInfo 值拷贝;④信用:Load(N) 发起即 Set(V1C1)? 否——保持原 Wait(C1V1)
+  语义仅移位;旗账:种子×2 不变,drain 不变
+- 预期:小 L 延迟主导(每块 3µs=CopyIn MTE2 延迟+旗往返),流水后行内块串行
+  链 → max(CopyIn,计算) 交叠,2K 档 51.6→~40µs;256K 计算主导应持平(M4-5
+  实测 959→956 零回退)
+- 验证链:bench_m53b 六点(L512/L2K/L8K/L64K 逐点对比基线)+ probe 7/7 +
+  全阶梯 sweep + 64K/256K sum 逐位=基线 + AIME 随门

@@ -786,3 +786,22 @@ V1C1 2+n=2+n),逐项检查未破——**需要设备端证据定位挂点**,下�
 5. 机械资产可复用:patch_m53a1.py(锚点级幂等)+ fix 系列;回退即绿。
 
 树已恢复绿基线,probe 7/7。AIME 门仍待卡协调。
+
+## E-A1a 二分结果(2026-10-11 深夜三)
+
+**E-A1a(禁早退,Load/Consume 全量双跑)同样挂死** → 挂点在流水骨架而非早退
+语义。机制已找到:**双跑下每块每区 V_MTE2 wait×2 但 set×1(+种子1)→ 区域释
+放信用赤字 → 第二块起 Wait(V_MTE2) 饿死**(L512 即挂,与观测一致)。
+
+但真 A1(早退版)账面平衡(pp0:种子+1-Load0 wait-1+DoScale0 set+1=1;后续
+每块 set1wait1 交替恰平)仍挂 → **还有第二个未现形的原因,纸面推演已尽,
+下轮必须上设备端证据**:①plog/ascend log 挂死核+PC 反查(ndk objdump);
+②msprof timeline 卡点;③或 AIV 逐阶段 printf 心跳(单 aiv 定向)。
+
+备选假设(证据到手后按序验证):A)TMPUB 旗 EVENTID 值若 ∈{0,1} 与区域种子
+冲突(M53A1 种子用了 V_MTE2 ID0/1);B)under-2K 路径 CopyIn 段结构不同,
+probe 的 L2K case 走不同分支;C)prevVecInfo_ 复制漏字段;D)empty-range 核
+行为差异。
+
+树绿基线,probe 7/7。机械资产:patch_m53a1.py+fix_a1a.py 锚点级幂等可重放。
+嫌疑A 已排除:EVENTID_V_TO_MTE2_TMPUB=2,与 M53A1 种子 V_MTE2 ID0/1 无冲突(grep 实证)。

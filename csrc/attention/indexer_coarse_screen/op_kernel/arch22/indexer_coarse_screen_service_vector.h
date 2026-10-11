@@ -521,27 +521,7 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
             // 进 sort 前统一同步:reduceOutBuff 写(V/MTE)全部落定后才被排序读取。
             AscendC::PipeBarrier<PIPE_ALL>();
 
-            // E20D: 块级最大值剪枝(精确无损)。max 折叠用 reduceOutBuff 尾段裕量
-            // (5 段分配的 [4V,5V),与 sort/park 区无重叠)。泊车伙伴顺延,fragEnd 兜底。
-            bool e20Pruned = false;
-            if (cuS2Len > 0) {
-                LocalTensor<float> e20Max = reduceOutBuff[s2BaseSize_ * 4];
-                AscendC::Duplicate<float>(e20Max, IndexerCoarseScreenServiceVec::NEG_INF, 64);
-                PipeBarrier<PIPE_V>();
-                for (int32_t c20 = 0; c20 < cuS2Len; c20 += 64) {
-                    AscendC::Max<float>(e20Max, sortScoreUb[c20], e20Max,
-                                        c20 + 64 > cuS2Len ? cuS2Len - c20 : 64);
-                }
-                PipeBarrier<PIPE_V>();
-                float e20MaxV = e20Max.GetValue(0);
-                PipeBarrier<PIPE_V>(); // E20D-fix:等块内 max 折叠(V)落地
-                PipeBarrier<PIPE_MTE2>(); // E20D-fix2:等前块 acc 拷回(MTE2)落地再读阈值
-                float e20Thresh = globalTopkUb_[innerS1Idx * virTopK * 2].GetValue(0); // E20D-fix3:升序假设,头部=第K名
-                if (e20MaxV < e20Thresh) { // E20D-fix:严格小于,保留并列
-                    e20Pruned = true;
-                }
-            }
-            if (!e20Pruned) {
+            { // E20REVERT:块级剪枝已移除(精确版零收益,见 plans/m4_optimize_design.md)
                 LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
             // over-2K(host 拒绝 coarseCount≤2048)恒走 SortAll + 原生单次 MergeSort
             // (virTopK)= 原生 lightning_indexer 生产同款。actS1Size≡1(TND 每请求单
@@ -580,8 +560,8 @@ __aicore__ inline void IndexerCoarseScreenServiceVector<LIT>::ProcessVec(const I
             }
                 PipeBarrier<PIPE_V>();
                 outQueue_.FreeTensor(tmpSortBuf);
-            } // E20D end
-            SetFlag<HardEvent::V_MTE2>(EVENTID_V_TO_MTE2_TMPUB); // E20D-fix:无条件置位,pruned 亦供信用
+            }
+            SetFlag<HardEvent::V_MTE2>(EVENTID_V_TO_MTE2_TMPUB);
 
             bool fragEnd = info.isLastS2InnerLoop;
             if (fragEnd && pairFilled_[innerS1Idx]) {

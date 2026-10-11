@@ -725,3 +725,19 @@ mm1),而是逐块延迟链的流水化**:
   实测 959→956 零回退)
 - 验证链:bench_m53b 六点(L512/L2K/L8K/L64K 逐点对比基线)+ probe 7/7 +
   全阶梯 sweep + 64K/256K sum 逐位=基线 + AIME 随门
+
+## 方案A 流水险点补充(实施前必读)
+
+1. UB 区域乒乓键:Load(n) 的 dbTmpUb = tmpUb_[(loop&1)*(groupInner_*s2+ s2)]
+   (现 outerGidx%2 恒 0,改为 loop&1);区域释放事件已存在——现 CopyIn 前的
+   WaitFlag(V_MTE2, pingpong) 与 DoScale 后的 SetFlag(V_MTE2, pingpong) 按 pp
+   键控,跨流水自动闭环:DoScale(n) 放行 → Load(n+2) 才写同区 ✓
+2. 信用安全:Set(V1C1) 必须紧跟 Load(n+1) 且在 PIPE_MTE2 队列(MTE2 序保证
+   CopyIn(n) 已完成)→ AIC mm1(n+2) 写槽 n%2 时 CopyIn(n) 必已完成 ✓;
+   Consume 读 UB 拷贝,与 AIC 写 GM 槽无交叠 ✓
+3. Consume(n-1) 用 reduceOutBuff(分数/sort/park 区)与 Load(n) 的 MTE2 写
+   tmpUb_ 区不相交 ✓;TMPUB 旗逐块自序不变 ✓
+4. KH AIV 分支:Wait(C1V1)→Load(runInfo);if hasPrev Consume(prevInfo);
+   prevInfo=runInfo;Set(V1C1)。AIC 分支原样。尾块 Consume 在 AIV epilogue
+   FreeEventID 前。Consume(n-1) 须完成于窗口/flush 读 acc 前(它在主循环内,
+   flush 在其后 ✓)

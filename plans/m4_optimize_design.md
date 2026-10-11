@@ -821,3 +821,22 @@ workspace 尾部 4KB 计数器(stage id + loop + blockId,int32×3);超时后 hos
 workspaceSize += 4KB(对齐 512)。
 阶段表:S0=KH 分支进入 S1=得 C1V1 S2=Load row0 CopyIn 发起 S3=Load 的
 Set(MTE2_V) 后 S4=Consume row0 Wait(MTE2_V) 后 S5=DoScale 后 S6=行循环毕。
+
+## 方案A1 纯版长跑判决(2026-10-12 凌晨)
+
+**纯 A1(无任何心跳)900s:507014 实锤死锁**——非仪表假象、非慢。心跳版数据:
+流水真实在跑(P3=41 Loads/P4=40 Consumes 完成),在深度 ~40 块处停。
+
+**下轮第一刀:深度二分定阈值**(param202 逐 L,纯 A1 树+apply_a1full.py 去心
+跳):L=8K(16 块/行)→16K(32)→32K(64)→48K(96)→64K(128),找挂死深度
+阈值 d*。候选对齐资源:①pair 内 V1C1 广播计数的深度相关损耗;②M3 fragment
+槽 deferValid_[4]/窗口机制在流水下的时序;③outQueue/管道深度;④507014 若
+报 fault 而非 timeout 则换 mssanitizer。
+注意:L512(1 块/行)在 noseed 后可能已通过(此前挂是种子自锁)——二分从
+8K 起步有意义。
+
+若阈值 d* 落在 32-48:工程兜底 = 流水深度限制在 d*-2(超深块回退串行),
+小 L(≤2K,≤4 块)吃满流水收益,大 L 档不受影响——**保底可交付形态**。
+
+树绿基线 probe 7/7(SYNCED 00:14:03)。资产:apply_a1full.py 一体验证式
+应用脚本(15 子全部锚点级幂等,本夜已实证 15/15 ok)。

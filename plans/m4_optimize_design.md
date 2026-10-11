@@ -805,3 +805,19 @@ probe 的 L2K case 走不同分支;C)prevVecInfo_ 复制漏字段;D)empty-range 
 
 树绿基线,probe 7/7。机械资产:patch_m53a1.py+fix_a1a.py 锚点级幂等可重放。
 嫌疑A 已排除:EVENTID_V_TO_MTE2_TMPUB=2,与 M53A1 种子 V_MTE2 ID0/1 无冲突(grep 实证)。
+
+## 方案A1 调试第 4 层排除(2026-10-11 深夜七)
+
+- **TMPUB 自锁假设排除**(fix_a1tmpub.py:Load 段跳过 outQueue Alloc+TMPUB
+  Wait)→ 仍挂,K 恒 72(24 对×3)。
+- **区域越界假设排除**:tmpBuf_ = (groupInner_*s2BaseSize_+s2BaseSize_)×2×
+  4B = 68KB,恰好 2 区,pp=loop&1 界内(InitBuffer L184 实证)。
+- **心跳 printf 自身可疑**:P1=97≈printf 缓冲上限,缓冲满后 printf 阻塞/
+  丢行,P3/P4=0 可能是仪表假象(无心跳版同样挂,挂本身真实)。
+
+**下轮工具(定案):GM 心跳**——不走 printf:A1 树上在 5 个阶段各写一次
+workspace 尾部 4KB 计数器(stage id + loop + blockId,int32×3);超时后 host
+侧 torch 读 workspace 回来解析最后阶段。零缓冲阻塞,精确到旗。预留:tiling
+workspaceSize += 4KB(对齐 512)。
+阶段表:S0=KH 分支进入 S1=得 C1V1 S2=Load row0 CopyIn 发起 S3=Load 的
+Set(MTE2_V) 后 S4=Consume row0 Wait(MTE2_V) 后 S5=DoScale 后 S6=行循环毕。

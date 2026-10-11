@@ -664,3 +664,25 @@ SplitCore、CalcRunInfo/ProcessBaseBlock 逐块标量链、TPipe 结构),非任�
 
 **最终态势**:≥64K 反超 LI 且随 L 增大(1.14×→1.26×)达成;64K sum 5.3895e8、
 256K sum 8.6355e9 逐位=基线;probe 7/7;树=eaa7203f 绿基线。
+
+## M5-3 标量压缩三问判决(2026-10-11,E-RS 收官)
+
+问:if/else 分支对 AICPU 占比的影响?流程可否简化?标量怎么压缩?
+
+**①角色分支实测 ≈0**:ASCEND_IS_AIC = (g_coreType == AIC) 运行期分支,
+原版每块一次角色判断且 AIC/AIV 双路径共享指令流。E-RS 已实施:模板化
+ProcessBaseBlock<K_AIC> + if constexpr + 主循环按角色复制(编译期特化整条
+标量链),probe 7/7,实测 L512 44.1/L2K 53.2/L8K 74.4/L64K 117.6 vs 基线
+42.3/51.6/71.3/116.8 —— 噪声内零增益,已回退。**分支循环不变(g_coreType
+恒定),预测器完美学习,I-cache 双份未成可测项。**
+
+②流程简化:分解账本已穷尽(计算3/mm1 3/预填2/输出1/旗链0/窗口0),无可
+简化项 >3µs。
+
+③标量压缩:剩余 ~33µs 不在**逐块**标量链(CalcRunInfo ~40 标量 op × 少量块,
+L512 时几乎为零),而在 **once-per-launch 的标量骨架**:tiling ConstInfo 解析、
+SplitCore、ProcessGroupMean、GetActualSeqLen GM 标量读、InitBuffers 结构、
+kernel 启动 ramp。压缩它 = 重构 kernel 骨架(与 V-only 小 L 路由同属独立立项,
+且与 LI 的 29µs 同类税已相当接近)。
+
+树恢复绿基线,probe 7/7。本方向正式封账(2bba78a5 + 本判决)。
